@@ -1,8 +1,11 @@
 /**
  * 🎨 Watercolor Artist Studio — Real-Time 60 FPS Layer & Brush Engine
- * File 3 of 3: Frontend Logic (Lazy Mobile RAM Fix + Preset Mask Caching)
+ * File 3 of 3: Complete Mobile & Desktop Studio Engine
  */
 
+// ============================================================================
+// 1. PYTHON MERSENNE TWISTER (Exact match for Python random.Random(seed))
+// ============================================================================
 class PythonRandom {
   constructor(seed = 42) {
     this.MT = new Uint32Array(624);
@@ -72,6 +75,9 @@ class PythonRandom {
   }
 }
 
+// ============================================================================
+// 2. LAYER STACK DEFINITIONS
+// ============================================================================
 const LAYER_DEFINITIONS = [
   { id: "custom_detail", name: "✨ Eye Reflections & Detail Brush", group: "Over Subject", type: "custom", defaultVis: true },
   { id: "small_dots", name: "⚪ Small White Dots", group: "Over Subject", type: "brush_edge", seedOffset: 700, prefix: "SMALL_WHITE_DOTS" },
@@ -89,14 +95,17 @@ const LAYER_DEFINITIONS = [
   { id: "white_dots", name: "⚪ White Splatter Dots", group: "Under Subject", type: "brush_dots", seedOffset: 300, prefix: "WHITE_DOTS" },
   { id: "accent_strokes", name: "🔥 Accent Strokes (Smart)", group: "Under Subject", type: "accent", prefix: "ACCENT_STROKES" },
   { id: "color_brush", name: "🌈 Color Wash Brush (brush2)", group: "Under Subject", type: "brush_edge", seedOffset: 100, prefix: "COLOR_BRUSH" },
-  { id: "mask_blur", name: "🌫️ Blurred Aura + Square Mask", group: "Under Subject", type: "mask_blur", seedOffset: 0, prefix: "MASK_BRUSH" },
+  { id: "mask_blur", name: "🌫️ Blurred Aura + Brush Mask", group: "Under Subject", type: "mask_blur", seedOffset: 0, prefix: "MASK_BRUSH" },
   { id: "sharp_brush", name: "📐 Sharp Edge Brush", group: "Under Subject", type: "brush_edge", seedOffset: 150, prefix: "SHARP_BRUSH" },
   { id: "bg_brush", name: "🎨 Large Background Wash", group: "Under Subject", type: "brush_edge", seedOffset: 200, prefix: "BG_BRUSH" },
   { id: "bg_paper", name: "📜 Paper Texture / Canvas BG", group: "Canvas Base", type: "paper", prefix: "PAPER_TEXTURE" },
 ];
 
+// ============================================================================
+// 3. STUDIO STATE
+// ============================================================================
 const STATE = {
-  apiUrl: localStorage.getItem("wc_modal_api") || "https://autorauto--watercolor-studio-gpu-watercolorservice-api.modal.run",
+  apiUrl: "https://autorauto--watercolor-studio-gpu-watercolorservice-api.modal.run",
   uploadedFile: null,
   originalImg: null,
   payload: null,
@@ -120,15 +129,20 @@ const canvasContainer = document.getElementById("canvasContainer");
 const viewport = document.getElementById("viewport");
 const brushCursor = document.getElementById("brushCursor");
 
+// ============================================================================
+// 4. PRE-WARMER, PROGRESS BAR & BRUSH CACHE
+// ============================================================================
+let _pickerKeepAliveTimer = null;
+let _progressTimer = null;
+
 window.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("apiUrlInput").value = STATE.apiUrl;
   bindUIEvents();
   prewarmModalServer();
   loadCachedBrushes();
 });
 
 function prewarmModalServer() {
-  fetch(`${STATE.apiUrl.replace(/\/$/, "")}/health`, { mode: "cors" }).catch(() => {});
+  fetch(`${STATE.apiUrl}/health`, { mode: "cors" }).catch(() => {});
 }
 
 function startFilePickerPrewarm() {
@@ -142,12 +156,64 @@ function startFilePickerPrewarm() {
   }, 10000);
 }
 
-let _pickerKeepAliveTimer = null;
 function stopFilePickerPrewarm() {
   if (_pickerKeepAliveTimer) {
     clearInterval(_pickerKeepAliveTimer);
     _pickerKeepAliveTimer = null;
   }
+}
+
+function startProgressBar(isPresetSwitch = false) {
+  const overlay = document.getElementById("loadingOverlay");
+  const fill = document.getElementById("loadingBarFill");
+  const pctEl = document.getElementById("loadingPercent");
+  const textEl = document.getElementById("loadingText");
+  const subEl = document.getElementById("loadingSubtext");
+
+  overlay.classList.remove("hidden");
+  if (_progressTimer) clearInterval(_progressTimer);
+
+  let pct = 4;
+  fill.style.width = `${pct}%`;
+  pctEl.textContent = `${pct}%`;
+  textEl.textContent = isPresetSwitch ? "Switching style preset..." : "Removing background & analyzing edges...";
+  subEl.textContent = "Preparing high-resolution artist layers";
+
+  const startTime = performance.now();
+  _progressTimer = setInterval(() => {
+    const elapsed = (performance.now() - startTime) / 1000;
+    if (pct < 35) {
+      pct += isPresetSwitch ? 6 : 4;
+    } else if (pct < 72) {
+      pct += 2.5;
+      textEl.textContent = "Painting watercolor washes & accents...";
+    } else if (pct < 92) {
+      pct += 0.8;
+      textEl.textContent = "Applying oil paint & fine details...";
+    }
+    pct = Math.min(94, pct);
+    fill.style.width = `${Math.round(pct)}%`;
+    pctEl.textContent = `${Math.round(pct)}%`;
+    if (elapsed > 6 && pct > 80) {
+      subEl.textContent = "Waking cloud studio & downloading layers...";
+    }
+  }, 140);
+}
+
+function finishProgressBar() {
+  if (_progressTimer) {
+    clearInterval(_progressTimer);
+    _progressTimer = null;
+  }
+  const fill = document.getElementById("loadingBarFill");
+  const pctEl = document.getElementById("loadingPercent");
+  const textEl = document.getElementById("loadingText");
+  fill.style.width = "100%";
+  pctEl.textContent = "100%";
+  textEl.textContent = "Done!";
+  setTimeout(() => {
+    document.getElementById("loadingOverlay").classList.add("hidden");
+  }, 180);
 }
 
 async function loadCachedBrushes() {
@@ -159,21 +225,23 @@ async function loadCachedBrushes() {
       for (const [name, b64] of Object.entries(data)) {
         STATE.brushImages[name] = await loadImage(b64);
       }
+      return;
     }
   } catch (_) {}
+  fetchBrushTextures();
 }
 
 async function fetchBrushTextures() {
   if (Object.keys(STATE.brushImages).length >= 7) return;
   try {
-    const res = await fetch(`${STATE.apiUrl.replace(/\/$/, "")}/brushes`);
+    const res = await fetch(`${STATE.apiUrl}/brushes`);
     if (!res.ok) return;
     const data = await res.json();
     for (const [name, b64] of Object.entries(data)) {
       STATE.brushImages[name] = await loadImage(b64);
     }
     try { localStorage.setItem("wc_cached_brushes_v1", JSON.stringify(data)); } catch (_) {}
-  } catch (err) {}
+  } catch (_) {}
 }
 
 function loadImage(src) {
@@ -194,16 +262,17 @@ function createCanvas(w, h) {
   return c;
 }
 
+// ============================================================================
+// 5. UI EVENTS & MOBILE BOTTOM SHEETS
+// ============================================================================
 function bindUIEvents() {
   const fileInput = document.getElementById("fileInput");
-  const generateBtn = document.getElementById("generateBtn");
   const presetSelect = document.getElementById("presetSelect");
-  const uploadLabel = document.querySelector('label[for="fileInput"]');
 
-  if (uploadLabel) {
-    uploadLabel.addEventListener("mousedown", startFilePickerPrewarm);
-    uploadLabel.addEventListener("touchstart", startFilePickerPrewarm, { passive: true });
-  }
+  document.querySelectorAll('label[for="fileInput"]').forEach((lbl) => {
+    lbl.addEventListener("mousedown", startFilePickerPrewarm);
+    lbl.addEventListener("touchstart", startFilePickerPrewarm, { passive: true });
+  });
 
   fileInput.addEventListener("change", async (e) => {
     stopFilePickerPrewarm();
@@ -213,36 +282,21 @@ function bindUIEvents() {
     const url = URL.createObjectURL(file);
     STATE.originalImg = await loadImage(url);
     STATE.maskCanvas = null;
-    STATE.rawMaskBase64 = null; // New photo clears raw cutout cache
-    generateBtn.disabled = false;
+    STATE.rawMaskBase64 = null;
     runModalGeneration();
   });
 
   presetSelect.addEventListener("change", () => {
     if (STATE.uploadedFile) {
-      runModalGeneration(false, true); // Preset switch reuses cached raw mask!
+      runModalGeneration(false, true);
     }
   });
 
-  generateBtn.addEventListener("click", () => {
-    if (STATE.uploadedFile) runModalGeneration();
-  });
-
-  document.getElementById("apiConfigBtn").addEventListener("click", () => {
-    document.getElementById("apiBar").classList.toggle("hidden");
-  });
-
-  document.getElementById("saveApiBtn").addEventListener("click", async () => {
-    const val = document.getElementById("apiUrlInput").value.trim().replace(/\/$/, "");
-    STATE.apiUrl = val;
-    localStorage.setItem("wc_modal_api", val);
-    const statusEl = document.getElementById("apiStatusText");
-    statusEl.textContent = "✅ Connected!";
-    fetchBrushTextures();
-  });
-
   document.querySelectorAll(".tool-btn").forEach((btn) => {
-    btn.addEventListener("click", () => setActiveTool(btn.dataset.tool));
+    btn.addEventListener("click", () => {
+      if (btn.disabled) return;
+      setActiveTool(btn.dataset.tool);
+    });
   });
 
   const sizeSlider = document.getElementById("manualBrushSize");
@@ -262,26 +316,26 @@ function bindUIEvents() {
     });
   });
 
-  document.getElementById("maskModeBtn").addEventListener("click", () => {
-    setActiveTool(STATE.activeTool === "mask" ? "pan" : "mask");
-  });
   document.getElementById("maskKeepBtn").addEventListener("click", () => {
     STATE.maskModePaintKeep = true;
-    document.getElementById("maskKeepBtn").className = "btn btn-sm btn-primary";
-    document.getElementById("maskRemoveBtn").className = "btn btn-sm btn-outline";
+    document.getElementById("maskKeepBtn").className = "btn btn-sm btn-primary full-width";
+    document.getElementById("maskRemoveBtn").className = "btn btn-sm btn-outline full-width";
   });
+
   document.getElementById("maskRemoveBtn").addEventListener("click", () => {
     STATE.maskModePaintKeep = false;
-    document.getElementById("maskRemoveBtn").className = "btn btn-sm btn-primary";
-    document.getElementById("maskKeepBtn").className = "btn btn-sm btn-outline";
+    document.getElementById("maskRemoveBtn").className = "btn btn-sm btn-primary full-width";
+    document.getElementById("maskKeepBtn").className = "btn btn-sm btn-outline full-width";
   });
+
   document.getElementById("applyMaskRegenBtn").addEventListener("click", () => {
     setActiveTool("pan");
+    closeMobileSheets();
     runModalGeneration(true);
   });
 
-  document.getElementById("zoomInBtn").addEventListener("click", () => setZoom(STATE.zoom * 1.2));
-  document.getElementById("zoomOutBtn").addEventListener("click", () => setZoom(STATE.zoom / 1.2));
+  document.getElementById("zoomInBtn").addEventListener("click", () => setZoom(STATE.zoom * 1.25));
+  document.getElementById("zoomOutBtn").addEventListener("click", () => setZoom(STATE.zoom / 1.25));
   document.getElementById("zoomFitBtn").addEventListener("click", fitCanvasToViewport);
 
   document.getElementById("resetLayerBtn").addEventListener("click", () => {
@@ -291,9 +345,66 @@ function bindUIEvents() {
   document.getElementById("exportPngBtn").addEventListener("click", () => exportImage("png"));
   document.getElementById("exportJpgBtn").addEventListener("click", () => exportImage("jpeg"));
 
+  // Mobile Bottom Navigation & Sheet Controls
+  document.querySelectorAll("[data-mobile-panel]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      switchMobilePanel(btn.dataset.mobilePanel);
+    });
+  });
+
+  document.querySelectorAll("[data-close-sheet]").forEach((btn) => {
+    btn.addEventListener("click", closeMobileSheets);
+  });
+
+  window.addEventListener("resize", () => {
+    if (STATE.payload) fitCanvasToViewport();
+  });
+
   setupCanvasInteractions();
 }
 
+function switchMobilePanel(panel) {
+  const left = document.getElementById("leftToolbar");
+  const right = document.getElementById("rightInspector");
+  const slidersSec = document.getElementById("slidersSection");
+  const layersSec = document.getElementById("layersSection");
+
+  document.querySelectorAll(".mobile-nav-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mobilePanel === panel);
+  });
+
+  if (panel === "canvas") {
+    left.classList.remove("mobile-open");
+    right.classList.remove("mobile-open");
+  } else if (panel === "tools") {
+    right.classList.remove("mobile-open");
+    left.classList.add("mobile-open");
+  } else if (panel === "sliders") {
+    left.classList.remove("mobile-open");
+    right.classList.add("mobile-open");
+    slidersSec.classList.remove("hidden");
+    if (window.innerWidth <= 960) layersSec.classList.add("hidden");
+  } else if (panel === "layers") {
+    left.classList.remove("mobile-open");
+    right.classList.add("mobile-open");
+    layersSec.classList.remove("hidden");
+    if (window.innerWidth <= 960) slidersSec.classList.add("hidden");
+  }
+}
+
+function closeMobileSheets() {
+  document.getElementById("leftToolbar").classList.remove("mobile-open");
+  document.getElementById("rightInspector").classList.remove("mobile-open");
+  document.getElementById("slidersSection").classList.remove("hidden");
+  document.getElementById("layersSection").classList.remove("hidden");
+  document.querySelectorAll(".mobile-nav-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mobilePanel === "canvas");
+  });
+}
+
+// ============================================================================
+// 6. UPLOAD & GENERATION
+// ============================================================================
 async function prepareOptimizedUploadBlob(img, presetKey) {
   const isCar = presetKey.startsWith("cars");
   const maxW = isCar ? 1782 : 1260;
@@ -314,11 +425,7 @@ async function prepareOptimizedUploadBlob(img, presetKey) {
 async function runModalGeneration(useEditedMask = false, isPresetSwitch = false) {
   if (!STATE.uploadedFile || !STATE.originalImg) return;
   stopFilePickerPrewarm();
-
-  const loadingOverlay = document.getElementById("loadingOverlay");
-  const loadingText = document.getElementById("loadingText");
-  loadingOverlay.classList.remove("hidden");
-  loadingText.textContent = isPresetSwitch ? "Switching preset..." : "Generating multi-layer watercolor...";
+  startProgressBar(isPresetSwitch);
 
   try {
     const t0 = performance.now();
@@ -332,19 +439,17 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
     if (useEditedMask && STATE.maskCanvas) {
       formData.append("mask_base64", STATE.maskCanvas.toDataURL("image/webp", 0.95));
     } else if (isPresetSwitch && STATE.rawMaskBase64) {
-      formData.append("raw_mask_base64", STATE.rawMaskBase64); // Instant preset switch!
+      formData.append("raw_mask_base64", STATE.rawMaskBase64);
     }
 
-    const tFetchStart = performance.now();
-    const res = await fetch(`${STATE.apiUrl.replace(/\/$/, "")}/generate`, {
+    const res = await fetch(`${STATE.apiUrl}/generate`, {
       method: "POST",
       body: formData,
     });
 
-    if (!res.ok) throw new Error(`Modal API returned status ${res.status}`);
+    if (!res.ok) throw new Error(`Server returned status ${res.status}`);
 
     const rawText = await res.text();
-    const tBodyDownloaded = performance.now();
     const payloadMB = (rawText.length / (1024 * 1024)).toFixed(2);
     const payload = JSON.parse(rawText);
 
@@ -366,7 +471,7 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
     alert("Error generating painting: " + err.message);
     console.error(err);
   } finally {
-    loadingOverlay.classList.add("hidden");
+    finishProgressBar();
   }
 }
 
@@ -398,7 +503,7 @@ async function initializeStudioFromPayload(payload) {
   document.getElementById("exportPngBtn").disabled = false;
   document.getElementById("exportJpgBtn").disabled = false;
   document.getElementById("resetLayerBtn").disabled = false;
-  document.getElementById("renderTimeBadge").textContent = `⚡ ${payload.elapsed_sec}s Server`;
+  document.getElementById("renderTimeBadge").textContent = `⚡ ${payload.elapsed_sec}s`;
 
   if (payload.average_color) {
     const hex = rgbToHex(...payload.average_color);
@@ -454,7 +559,6 @@ async function initializeStudioFromPayload(payload) {
       if (rawImgs[def.id]) baseCtx.drawImage(rawImgs[def.id], 0, 0);
     }
 
-    // Lazy RAM allocation: paintCanvas and eraseCanvas are created empty and lightweight (~0 MB until edited)
     STATE.layers[def.id] = {
       def,
       vis: enabled,
@@ -508,9 +612,13 @@ function buildInitialLayerParams(def, cfg) {
   }
   if (def.type === "mask_blur") {
     return {
-      opacity: cfg.MASK_BRUSH_OPACITY ?? 0.5, baseOpacity: cfg.MASK_BRUSH_OPACITY ?? 0.5,
-      size: cfg.MASK_BRUSH_SIZE ?? 900, spacing: cfg.MASK_BRUSH_SPACING ?? 200,
-      jiggle: cfg.BRUSH_DIRECTION_JIGGLE ?? 0.8, brightness: 100, contrast: 100, saturation: 100, brushFile: "square.png",
+      opacity: cfg.MASK_BRUSH_OPACITY ?? 0.5,
+      baseOpacity: cfg.MASK_BRUSH_OPACITY ?? 0.5,
+      size: cfg.MASK_BRUSH_SIZE ?? 900,
+      spacing: cfg.MASK_BRUSH_SPACING ?? 200,
+      jiggle: cfg.BRUSH_DIRECTION_JIGGLE ?? 0.8,
+      brightness: 100, contrast: 100, saturation: 100,
+      brushFile: cfg.MASK_BRUSH_FILE && cfg.MASK_BRUSH_FILE !== "square.png" ? cfg.MASK_BRUSH_FILE : "brush2.png",
     };
   }
   if (def.type === "accent") {
@@ -536,6 +644,9 @@ function defaultBrushForLayer(id, cfg) {
   return map[id] || "bgbrush.png";
 }
 
+// ============================================================================
+// 7. REAL-TIME COMPOSITOR (60 FPS)
+// ============================================================================
 const _tempLayerCanvas = document.createElement("canvas");
 const _stack = { id: null, dirty: true, below: null, above: null };
 function invalidateStack() { _stack.dirty = true; }
@@ -606,6 +717,9 @@ function compositeAllLayers() {
   displayCtx.drawImage(_stack.above, 0, 0);
 }
 
+// ============================================================================
+// 8. PROCEDURAL BRUSH & OIL RE-RENDERERS
+// ============================================================================
 const _stampCanvas = document.createElement("canvas");
 const _stampCtx = _stampCanvas.getContext("2d");
 
@@ -859,6 +973,9 @@ function adjustBrightSatJS(rgb, brightness, saturation) {
   ];
 }
 
+// ============================================================================
+// 9. RIGHT INSPECTOR: LAYER STACK & LIVE SLIDERS UI
+// ============================================================================
 function renderLayerListUI() {
   const listEl = document.getElementById("layerList");
   listEl.innerHTML = "";
@@ -897,7 +1014,10 @@ function renderLayerListUI() {
 
     row.appendChild(visBtn);
     row.appendChild(nameSpan);
-    row.addEventListener("click", () => selectLayer(def.id));
+    row.addEventListener("click", () => {
+      selectLayer(def.id);
+      if (window.innerWidth <= 960) switchMobilePanel("sliders");
+    });
     listEl.appendChild(row);
   }
 }
@@ -1073,6 +1193,9 @@ function resetLayerToOriginal(layerId) {
   compositeAllLayers();
 }
 
+// ============================================================================
+// 10. DESKTOP MOUSE & MOBILE TOUCH / PINCH-ZOOM INTERACTIONS
+// ============================================================================
 function setActiveTool(tool) {
   STATE.activeTool = tool;
   document.querySelectorAll(".tool-btn").forEach((b) => {
@@ -1085,32 +1208,41 @@ function setActiveTool(tool) {
 
 function setupCanvasInteractions() {
   let isPickingColor = false;
+  let lastPinchDist = null;
+  let lastPinchCenter = null;
+
   document.getElementById("eyedropperBtn").addEventListener("click", () => {
-    isPickingColor = true; viewport.style.cursor = "crosshair";
+    isPickingColor = true;
+    viewport.style.cursor = "crosshair";
+    closeMobileSheets();
   });
 
+  // Accurate Mouse Wheel Zoom at Exact Cursor Position
   viewport.addEventListener("wheel", (e) => {
     e.preventDefault();
+    if (!STATE.payload) return;
     const factor = e.deltaY < 0 ? 1.12 : 0.89;
     setZoom(STATE.zoom * factor, e.clientX, e.clientY);
   }, { passive: false });
 
+  // Desktop Mouse Events
   viewport.addEventListener("mousedown", (e) => {
-    if (!STATE.payload) return;
+    if (!STATE.payload || e.target.closest(".floating-zoom")) return;
     if (isPickingColor) {
-      pickColorFromCanvas(e);
-      isPickingColor = false; viewport.style.cursor = "default";
+      pickColorFromCanvas(e.clientX, e.clientY);
+      isPickingColor = false;
+      viewport.style.cursor = "default";
       return;
     }
     STATE.isDragging = true;
     STATE.lastMouse = { x: e.clientX, y: e.clientY };
     if (["brush", "eraser", "mask"].includes(STATE.activeTool)) {
-      applyManualStrokeAtMouse(e);
+      applyManualStrokeAtPoint(e.clientX, e.clientY);
     }
   });
 
   window.addEventListener("mousemove", (e) => {
-    updateCursorPosition(e);
+    updateCursorPosition(e.clientX, e.clientY);
     if (!STATE.isDragging || !STATE.payload) return;
     if (STATE.activeTool === "pan") {
       STATE.panX += e.clientX - STATE.lastMouse.x;
@@ -1118,12 +1250,93 @@ function setupCanvasInteractions() {
       STATE.lastMouse = { x: e.clientX, y: e.clientY };
       updateCanvasTransform();
     } else {
-      applyManualStrokeAtMouse(e);
+      applyManualStrokeAtPoint(e.clientX, e.clientY);
       STATE.lastMouse = { x: e.clientX, y: e.clientY };
     }
   });
 
-  window.addEventListener("mouseup", () => { STATE.isDragging = false; });
+  window.addEventListener("mouseup", () => {
+    STATE.isDragging = false;
+  });
+
+  // Mobile & Tablet Touch Events (1-finger Paint/Pan + 2-finger Pinch-Zoom)
+  viewport.addEventListener("touchstart", (e) => {
+    if (!STATE.payload || e.target.closest(".floating-zoom")) return;
+    closeMobileSheets();
+
+    if (e.touches.length === 2) {
+      STATE.isDragging = false;
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      lastPinchDist = Math.hypot(dx, dy);
+      lastPinchCenter = {
+        x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+        y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+      };
+      return;
+    }
+
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      if (isPickingColor) {
+        pickColorFromCanvas(t.clientX, t.clientY);
+        isPickingColor = false;
+        return;
+      }
+      STATE.isDragging = true;
+      STATE.lastMouse = { x: t.clientX, y: t.clientY };
+      if (["brush", "eraser", "mask"].includes(STATE.activeTool)) {
+        applyManualStrokeAtPoint(t.clientX, t.clientY);
+      }
+    }
+  }, { passive: false });
+
+  viewport.addEventListener("touchmove", (e) => {
+    if (!STATE.payload) return;
+    e.preventDefault();
+
+    if (e.touches.length === 2 && lastPinchDist !== null) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      const center = {
+        x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+        y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+      };
+
+      const scaleFactor = dist / Math.max(1, lastPinchDist);
+      STATE.panX += center.x - lastPinchCenter.x;
+      STATE.panY += center.y - lastPinchCenter.y;
+      setZoom(STATE.zoom * scaleFactor, center.x, center.y);
+
+      lastPinchDist = dist;
+      lastPinchCenter = center;
+      return;
+    }
+
+    if (e.touches.length === 1 && STATE.isDragging) {
+      const t = e.touches[0];
+      if (STATE.activeTool === "pan") {
+        STATE.panX += t.clientX - STATE.lastMouse.x;
+        STATE.panY += t.clientY - STATE.lastMouse.y;
+        STATE.lastMouse = { x: t.clientX, y: t.clientY };
+        updateCanvasTransform();
+      } else {
+        applyManualStrokeAtPoint(t.clientX, t.clientY);
+        STATE.lastMouse = { x: t.clientX, y: t.clientY };
+      }
+    }
+  }, { passive: false });
+
+  viewport.addEventListener("touchend", (e) => {
+    if (e.touches.length < 2) {
+      lastPinchDist = null;
+      lastPinchCenter = null;
+    }
+    if (e.touches.length === 0) {
+      STATE.isDragging = false;
+    }
+  });
 }
 
 function screenToCanvasCoords(clientX, clientY) {
@@ -1133,8 +1346,8 @@ function screenToCanvasCoords(clientX, clientY) {
   return { x, y };
 }
 
-function applyManualStrokeAtMouse(e) {
-  const { x, y } = screenToCanvasCoords(e.clientX, e.clientY);
+function applyManualStrokeAtPoint(clientX, clientY) {
+  const { x, y } = screenToCanvasCoords(clientX, clientY);
   const size = Number(document.getElementById("manualBrushSize").value);
   const opacity = Number(document.getElementById("manualBrushOpacity").value) / 100;
   const colorHex = document.getElementById("manualBrushColor").value;
@@ -1214,48 +1427,65 @@ function renderMaskEditorView() {
   displayCtx.drawImage(overlay, offX, offY);
 }
 
-function pickColorFromCanvas(e) {
-  const { x, y } = screenToCanvasCoords(e.clientX, e.clientY);
+function pickColorFromCanvas(clientX, clientY) {
+  const { x, y } = screenToCanvasCoords(clientX, clientY);
   const pixel = displayCtx.getImageData(Math.floor(x), Math.floor(y), 1, 1).data;
   document.getElementById("manualBrushColor").value = rgbToHex(pixel[0], pixel[1], pixel[2]);
 }
 
+// ============================================================================
+// 11. ACCURATE CURSOR-ANCHORED ZOOM, PAN & EXPORT
+// ============================================================================
 function fitCanvasToViewport() {
   if (!STATE.payload) return;
   const [w, h] = STATE.payload.canvas_size;
-  const vw = viewport.clientWidth - 60, vh = viewport.clientHeight - 60;
+  const pad = window.innerWidth <= 960 ? 24 : 64;
+  const vw = Math.max(100, viewport.clientWidth - pad);
+  const vh = Math.max(100, viewport.clientHeight - pad - 36);
   STATE.zoom = Math.min(vw / w, vh / h);
-  STATE.panX = Math.floor((viewport.clientWidth - w * STATE.zoom) / 2);
-  STATE.panY = Math.floor((viewport.clientHeight - h * STATE.zoom) / 2);
+  STATE.panX = Math.round((viewport.clientWidth - w * STATE.zoom) / 2);
+  STATE.panY = Math.round((viewport.clientHeight - 20 - h * STATE.zoom) / 2);
   updateCanvasTransform();
 }
 
-function setZoom(newZoom, anchorX, anchorY) {
-  const clamped = Math.max(0.15, Math.min(3.5, newZoom));
-  if (anchorX !== undefined && anchorY !== undefined) {
-    const vRect = viewport.getBoundingClientRect();
-    const mx = anchorX - vRect.left, my = anchorY - vRect.top;
-    STATE.panX = mx - ((mx - STATE.panX) / STATE.zoom) * clamped;
-    STATE.panY = my - ((my - STATE.panY) / STATE.zoom) * clamped;
-  }
+function setZoom(newZoom, anchorClientX, anchorClientY) {
+  if (!STATE.payload) return;
+  const clamped = Math.max(0.12, Math.min(4.0, newZoom));
+  const vRect = viewport.getBoundingClientRect();
+
+  // If no cursor anchor is given (e.g., + / - buttons), zoom into the center of the viewport
+  const mx = (anchorClientX !== undefined ? anchorClientX : vRect.left + vRect.width / 2) - vRect.left;
+  const my = (anchorClientY !== undefined ? anchorClientY : vRect.top + vRect.height / 2) - vRect.top;
+
+  // Keep the exact canvas point under (mx, my) stationary during scale
+  const canvasX = (mx - STATE.panX) / STATE.zoom;
+  const canvasY = (my - STATE.panY) / STATE.zoom;
+
   STATE.zoom = clamped;
+  STATE.panX = mx - canvasX * clamped;
+  STATE.panY = my - canvasY * clamped;
   updateCanvasTransform();
 }
 
 function updateCanvasTransform() {
-  canvasContainer.style.transform = `translate(${STATE.panX}px, ${STATE.panY}px) scale(${STATE.zoom})`;
+  canvasContainer.style.transform = `translate3d(${STATE.panX}px, ${STATE.panY}px, 0) scale(${STATE.zoom})`;
   document.getElementById("zoomLabel").textContent = `${Math.round(STATE.zoom * 100)}%`;
   updateCursorPreview();
 }
 
-function updateCursorPosition(e) {
-  if (STATE.activeTool === "pan" || !STATE.payload) { brushCursor.classList.add("hidden"); return; }
+function updateCursorPosition(clientX, clientY) {
+  if (STATE.activeTool === "pan" || !STATE.payload) {
+    brushCursor.classList.add("hidden");
+    return;
+  }
   const vRect = viewport.getBoundingClientRect();
-  if (e.clientX < vRect.left || e.clientX > vRect.right || e.clientY < vRect.top || e.clientY > vRect.bottom) {
-    brushCursor.classList.add("hidden"); return;
+  if (clientX < vRect.left || clientX > vRect.right || clientY < vRect.top || clientY > vRect.bottom) {
+    brushCursor.classList.add("hidden");
+    return;
   }
   brushCursor.classList.remove("hidden");
-  brushCursor.style.left = `${e.clientX}px`; brushCursor.style.top = `${e.clientY}px`;
+  brushCursor.style.left = `${clientX}px`;
+  brushCursor.style.top = `${clientY}px`;
   updateCursorPreview();
 }
 
@@ -1274,7 +1504,8 @@ function exportImage(fmt = "jpeg") {
   const ext = fmt === "png" ? "png" : "jpg";
   const dataUrl = displayCanvas.toDataURL(mime, 0.96);
   const a = document.createElement("a");
-  a.href = dataUrl; a.download = `watercolor_${STATE.payload.preset_key}_${Date.now()}.${ext}`;
+  a.href = dataUrl;
+  a.download = `watercolor_${STATE.payload.preset_key}_${Date.now()}.${ext}`;
   a.click();
 }
 

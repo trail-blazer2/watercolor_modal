@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Watercolor Artist Studio</title>
   <link rel="stylesheet" href="studio.css" />
 </head>
 <body>
-  <!-- TOP BAR: Upload + Preset right next to it + Export -->
+  <!-- TOP BAR: Clean, single-line on PC & Mobile -->
   <header class="topbar">
     <div class="brand">
       <span class="brand-icon">🎨</span>
@@ -16,86 +16,70 @@
 
     <div class="upload-controls">
       <label class="btn btn-primary" for="fileInput">
-        📁 1. Upload Photo
+        📁 Upload Photo
       </label>
       <input type="file" id="fileInput" accept="image/*" hidden />
 
       <div class="preset-group">
-        <label for="presetSelect">Preset:</label>
+        <label for="presetSelect" class="preset-label">Style:</label>
         <select id="presetSelect" class="select-box">
-          <optgroup label="Portraits & Animals (Active)">
+          <optgroup label="Portraits & Animals">
             <option value="animals" selected>🦁 Animals (White BG)</option>
             <option value="animals_black">🦁 Animals (Black BG)</option>
             <option value="people">👤 People (White BG)</option>
           </optgroup>
-          <optgroup label="Vehicles (Ready)">
+          <optgroup label="Vehicles">
             <option value="cars">🚗 Cars (White BG)</option>
             <option value="cars_black">🚗 Cars (Black BG)</option>
             <option value="cars_color">🚗 Cars Color (White BG)</option>
           </optgroup>
           <optgroup label="Smart AI">
-            <option value="auto">✨ Auto-Detect Subject (AI Hook)</option>
+            <option value="auto">✨ Auto-Detect Subject</option>
           </optgroup>
         </select>
       </div>
-
-      <button id="generateBtn" class="btn btn-accent" disabled>
-        ⚡ Generate Painting
-      </button>
-
-      <button id="maskModeBtn" class="btn btn-outline" disabled title="Refine the AI background cutout">
-        ✂️ Edit Cutout Mask
-      </button>
     </div>
 
     <div class="export-controls">
-      <button id="apiConfigBtn" class="btn btn-subtle" title="Modal Server URL">
-        ☁️ GPU Connected
-      </button>
       <button id="exportPngBtn" class="btn btn-outline" disabled>
-        💾 Export PNG
+        💾 PNG
       </button>
       <button id="exportJpgBtn" class="btn btn-primary" disabled>
-        🖼️ Export High-Res JPG
+        🖼️ Export Print JPG
       </button>
     </div>
   </header>
 
-  <!-- MODAL API URL BAR (Collapsible) -->
-  <div id="apiBar" class="api-bar hidden">
-    <label for="apiUrlInput">Modal GPU Endpoint URL:</label>
-    <input
-      type="text"
-      id="apiUrlInput"
-      value="https://autorauto--watercolor-studio-gpu-watercolorservice-api.modal.run"
-    />
-    <button id="saveApiBtn" class="btn btn-primary btn-sm">Save & Test</button>
-    <span id="apiStatusText" class="api-status"></span>
-  </div>
-
   <!-- MAIN WORKSPACE -->
   <div class="workspace">
     <!-- LEFT TOOLBAR: Tools & Brush Settings -->
-    <aside class="left-toolbar">
+    <aside class="left-toolbar" id="leftToolbar">
+      <div class="mobile-sheet-header">
+        <span>Tools & Brush</span>
+        <button class="sheet-close-btn" data-close-sheet>×</button>
+      </div>
+
       <div class="tool-section-label">Tools</div>
-      <button class="tool-btn active" data-tool="pan" title="Pan & Zoom Canvas (Space / H)">
-        ✋<span>Pan / Zoom</span>
-      </button>
-      <button class="tool-btn" data-tool="brush" title="Add strokes to selected layer (B)">
-        🖌️<span>Add Brush</span>
-      </button>
-      <button class="tool-btn" data-tool="eraser" title="Erase strokes on selected layer (E)">
-        🧽<span>Eraser</span>
-      </button>
-      <button class="tool-btn" data-tool="mask" title="Paint Cutout Mask: White=Keep, Black=Remove (M)">
-        ✂️<span>Cutout Mask</span>
-      </button>
+      <div class="tools-grid">
+        <button class="tool-btn active" data-tool="pan" title="Pan & Zoom Canvas">
+          ✋<span>Pan / Zoom</span>
+        </button>
+        <button class="tool-btn" data-tool="brush" title="Add strokes to selected layer">
+          🖌️<span>Add Brush</span>
+        </button>
+        <button class="tool-btn" data-tool="eraser" title="Erase strokes on selected layer">
+          🧽<span>Eraser</span>
+        </button>
+        <button class="tool-btn" data-tool="mask" id="maskModeBtn" disabled title="Paint Cutout Mask: White=Keep, Black=Remove">
+          ✂️<span>Cutout Mask</span>
+        </button>
+      </div>
 
       <hr class="divider" />
 
       <!-- Context-sensitive Tool Options -->
       <div id="toolOptionsPanel" class="tool-options">
-        <div class="tool-section-label">Brush / Eraser Tool</div>
+        <div class="tool-section-label">Brush / Eraser Settings</div>
 
         <div class="control-row">
           <label>Brush Tip</label>
@@ -117,12 +101,12 @@
         </div>
 
         <div class="control-row">
-          <label>Size: <span id="manualSizeVal">60</span> px</label>
+          <label><span>Size</span><span><b id="manualSizeVal">60</b> px</span></label>
           <input type="range" id="manualBrushSize" min="3" max="800" value="60" />
         </div>
 
         <div class="control-row">
-          <label>Opacity: <span id="manualOpacityVal">90</span>%</label>
+          <label><span>Opacity</span><span><b id="manualOpacityVal">90</b>%</span></label>
           <input type="range" id="manualBrushOpacity" min="5" max="100" value="90" />
         </div>
 
@@ -130,7 +114,7 @@
           <label>Brush Color</label>
           <div class="color-picker-row">
             <input type="color" id="manualBrushColor" value="#ffffff" />
-            <button id="eyedropperBtn" class="btn btn-sm btn-outline" title="Pick color from canvas">
+            <button id="eyedropperBtn" class="btn btn-sm btn-outline full-width" title="Pick color from canvas">
               💧 Pick from Canvas
             </button>
           </div>
@@ -145,23 +129,15 @@
 
         <!-- Cutout Mask Mode Sub-panel -->
         <div id="maskEditControls" class="mask-controls hidden">
-          <div class="mask-badge">✂️ Mask Edit Mode</div>
+          <div class="mask-badge">✂️ Cutout Mask Mode</div>
           <p class="help-text">Red tint = Removed area. Paint <b>Keep</b> or <b>Remove</b>, then click Apply.</p>
           <div class="btn-group">
-            <button id="maskKeepBtn" class="btn btn-sm btn-primary">➕ Paint Keep</button>
-            <button id="maskRemoveBtn" class="btn btn-sm btn-outline">➖ Paint Remove</button>
+            <button id="maskKeepBtn" class="btn btn-sm btn-primary full-width">➕ Keep</button>
+            <button id="maskRemoveBtn" class="btn btn-sm btn-outline full-width">➖ Remove</button>
           </div>
-          <button id="applyMaskRegenBtn" class="btn btn-accent full-width" style="margin-top:8px;">
-            ✅ Apply Mask & Update Painting
+          <button id="applyMaskRegenBtn" class="btn btn-primary full-width" style="margin-top:8px;">
+            ✅ Apply Mask & Update
           </button>
-        </div>
-
-        <hr class="divider" />
-        <div class="zoom-controls">
-          <button id="zoomOutBtn" class="btn btn-sm btn-outline">➖</button>
-          <span id="zoomLabel">100%</span>
-          <button id="zoomInBtn" class="btn btn-sm btn-outline">➕</button>
-          <button id="zoomFitBtn" class="btn btn-sm btn-outline">Fit</button>
         </div>
       </div>
     </aside>
@@ -170,39 +146,65 @@
     <main class="canvas-viewport" id="viewport">
       <div id="emptyState" class="empty-state">
         <div class="empty-card">
-          <h2>🎨 Ready to Paint</h2>
-          <p>Select a photo and preset in the top bar. Your Modal GPU will generate the exact multi-layer watercolor painting in seconds.</p>
-          <p class="sub-note">Every brush layer (under and over the subject), oil paint effect, color correction, and eye highlight can then be edited in real time.</p>
+          <h2>🎨 Create Your Custom Painting</h2>
+          <p>Upload a photo in the top bar to generate a multi-layer watercolor artwork in seconds.</p>
+          <p class="sub-note">Fine-tune every brush layer, oil paint texture, color balance, and eye reflection in real time.</p>
+          <label class="btn btn-primary" for="fileInput" style="margin-top: 18px;">
+            📁 Choose Photo to Start
+          </label>
         </div>
       </div>
 
+      <!-- PROGRESS BAR LOADING OVERLAY -->
       <div id="loadingOverlay" class="loading-overlay hidden">
-        <div class="spinner"></div>
-        <div id="loadingText" class="loading-text">Generating on Modal GPU...</div>
+        <div class="loading-card">
+          <div class="loading-header">
+            <span id="loadingText" class="loading-text">Preparing photo...</span>
+            <span id="loadingPercent" class="loading-percent">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="loadingBarFill" class="progress-fill"></div>
+          </div>
+          <p id="loadingSubtext" class="loading-subtext">Building editable watercolor & oil layers</p>
+        </div>
       </div>
 
       <div id="canvasContainer" class="canvas-container hidden">
         <canvas id="displayCanvas"></canvas>
-        <div id="brushCursor" class="brush-cursor hidden"></div>
       </div>
+
+      <!-- Floating Zoom Pill on Canvas -->
+      <div class="floating-zoom" id="floatingZoom">
+        <button id="zoomOutBtn" class="zoom-btn" title="Zoom Out">−</button>
+        <span id="zoomLabel">100%</span>
+        <button id="zoomInBtn" class="zoom-btn" title="Zoom In">+</button>
+        <button id="zoomFitBtn" class="zoom-btn zoom-fit" title="Fit to Screen">Fit</button>
+      </div>
+
+      <div id="brushCursor" class="brush-cursor hidden"></div>
     </main>
 
     <!-- RIGHT SIDEBAR: Layer Stack + Selected Layer Live Sliders -->
-    <aside class="right-inspector">
+    <aside class="right-inspector" id="rightInspector">
+      <div class="mobile-sheet-header">
+        <span>Layers & Adjustments</span>
+        <button class="sheet-close-btn" data-close-sheet>×</button>
+      </div>
+
       <!-- Selected Layer Live Controls -->
-      <div class="inspector-panel">
+      <div class="inspector-panel" id="slidersSection">
         <div class="panel-header">
           <span id="activeLayerTitle">Layer Settings</span>
-          <button id="resetLayerBtn" class="btn btn-xs btn-outline" disabled>Reset Layer</button>
+          <button id="resetLayerBtn" class="btn btn-xs btn-outline" disabled>Reset</button>
         </div>
 
         <div id="layerSlidersContainer" class="sliders-container">
-          <p class="help-text">Generate a painting and click any layer below to edit its brush strokes, oil paint, or colors in real time.</p>
+          <p class="help-text">Upload a photo and select any layer below to adjust its brushes, oil paint, or colors in real time.</p>
         </div>
       </div>
 
       <!-- Full Layer Stack (Over Subject, Subject, Under Subject) -->
-      <div class="layers-panel">
+      <div class="layers-panel" id="layersSection">
         <div class="panel-header">
           <span>Layers (Top → Bottom)</span>
           <span id="renderTimeBadge" class="badge"></span>
@@ -213,6 +215,22 @@
       </div>
     </aside>
   </div>
+
+  <!-- MOBILE / TABLET BOTTOM NAVIGATION BAR -->
+  <nav class="mobile-nav" id="mobileNav">
+    <button class="mobile-nav-btn active" data-mobile-panel="canvas">
+      🖼️<span>Canvas</span>
+    </button>
+    <button class="mobile-nav-btn" data-mobile-panel="tools">
+      🖌️<span>Tools & Brush</span>
+    </button>
+    <button class="mobile-nav-btn" data-mobile-panel="sliders">
+      🎚️<span>Adjust Layer</span>
+    </button>
+    <button class="mobile-nav-btn" data-mobile-panel="layers">
+      📑<span>Layers</span>
+    </button>
+  </nav>
 
   <script src="studio.js"></script>
 </body>
