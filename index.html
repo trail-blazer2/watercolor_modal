@@ -181,6 +181,13 @@
         <button id="zoomFitBtn" class="zoom-btn zoom-fit" title="Fit to Screen">Fit</button>
       </div>
 
+      <!-- Floating Undo / Redo Pill -->
+      <div class="floating-history" id="floatingHistory">
+        <button id="undoBtn" class="zoom-btn" title="Nothing to undo" disabled>↶</button>
+        <span id="historyCount" class="history-count"></span>
+        <button id="redoBtn" class="zoom-btn" title="Nothing to redo" disabled>↷</button>
+      </div>
+
       <div id="brushCursor" class="brush-cursor hidden"></div>
     </main>
 
@@ -231,7 +238,10 @@
       📑<span>Layers</span>
     </button>
   </nav>
-
-  <script src="studio.js"></script>
+  <script src="studio_core.js"></script>
+  <script src="studio_history.js"></script>
+  <script src="studio_webgl.js"></script>
+  <script src="studio_layers.js"></script>
+  <script src="studio_ui.js"></script>
 </body>
 </html>
