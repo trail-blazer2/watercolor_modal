@@ -85,6 +85,9 @@
         <button class="tool-btn active" data-tool="pan" title="Pan & Zoom Canvas">
           ✋<span>Pan / Zoom</span>
         </button>
+        <button class="tool-btn" data-tool="move_subject" id="moveSubjectToolBtn" disabled title="Move Subject & Surrounding Brushes">
+          ✥<span>Move Subject</span>
+        </button>
         <button class="tool-btn" data-tool="brush" title="Add strokes to selected layer">
           🖌️<span>Add Brush</span>
         </button>
@@ -158,6 +161,28 @@
           </div>
           <button id="applyMaskRegenBtn" class="btn btn-primary full-width" style="margin-top:8px;">
             ✅ Apply Mask & Update
+          </button>
+        </div>
+        <!-- Reposition Subject & Surrounding Brushes Sub-panel -->
+        <div id="moveSubjectControls" class="mask-controls hidden">
+          <div class="mask-badge">✥ Move Subject & Brushes</div>
+          <p class="help-text" style="margin-bottom:8px;">
+            Drag directly on the canvas or use the sliders. Frame ovals & paper stay fixed.
+          </p>
+          <div class="control-row" style="margin-bottom:8px;">
+            <label><span>Horizontal (X)</span><span><b id="subMoveXVal">0</b> px</span></label>
+            <input type="range" id="subMoveXSlider" min="-600" max="600" step="1" value="0" />
+          </div>
+          <div class="control-row" style="margin-bottom:8px;">
+            <label><span>Vertical (Y)</span><span><b id="subMoveYVal">0</b> px</span></label>
+            <input type="range" id="subMoveYSlider" min="-600" max="600" step="1" value="0" />
+          </div>
+          <div class="control-row" style="margin-bottom:8px;">
+            <label><span>Scale</span><span><b id="subMoveScaleVal">100</b>%</span></label>
+            <input type="range" id="subMoveScaleSlider" min="65" max="135" step="1" value="100" />
+          </div>
+          <button type="button" id="resetSubjectMoveBtn" class="btn btn-sm btn-outline full-width">
+            ↺ Reset Subject Position
           </button>
         </div>
       </div>

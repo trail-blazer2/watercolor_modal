@@ -1,5 +1,5 @@
 /**
- * 🎨 Watercolor Studio — Part 4/5: Lightweight 60 FPS Scheduler, Compositor & Procedural Layers
+ * 🎨 Watercolor Studio — Part 4/5: 60 FPS Scheduler, Fast Subject-Move Compositor & Procedural Layers
  */
 
 // ============================================================================
@@ -36,6 +36,7 @@ function _ensureRaf() {
         rerenderProceduralLayer(id, true);
       }
       _pendingRerender.clear();
+      invalidateMoveFastStack();
       needsComp = true;
     }
     if (_pendingEdgeCurve) {
@@ -48,16 +49,19 @@ function _ensureRaf() {
         rerenderLiveEdgeCurveLayer(true);
         if (typeof freeEdgeCurveCpuUploadBuffers === "function") freeEdgeCurveCpuUploadBuffers();
       }
+      invalidateMoveFastStack();
       needsComp = true;
     }
     if (_pendingOil) {
       _pendingOil = false;
       rerenderLiveOilLayer(true);
+      invalidateMoveFastStack();
       needsComp = true;
     }
     if (_pendingGlow) {
       _pendingGlow = false;
       rerenderLiveGlowLayer(true);
+      invalidateMoveFastStack();
       needsComp = true;
     }
     if (needsComp) {
@@ -85,6 +89,7 @@ function scheduleOilRerender() {
   _ensureRaf();
 }
 function scheduleComposite() {
+  invalidateMoveFastStack();
   _pendingComposite = true;
   _ensureRaf();
 }
@@ -226,11 +231,33 @@ function defaultBrushForLayer(id, cfg) {
 }
 
 // ============================================================================
-// 7. REAL-TIME COMPOSITOR (VIEWPORT-SIZED, ZERO BLOAT)
+// 7. REAL-TIME COMPOSITOR + FAST SUBJECT-MOVE GROUP CACHE (_moveFastStack)
 // ============================================================================
 const _tempLayerCanvas = document.createElement("canvas");
 const _stack = { id: null, dirty: true, below: null, above: null };
+const _moveFastStack = {
+  dirty: true,
+  movableUnder: null,  // Layers 17..8 in Overscan Space
+  subjectGroup: null,  // Layers 7..5 (subject, oil_paint, edge_curve) un-faded in Overscan Space
+  fixedOvals: null,    // Layers 4..2 (dark_ellipse, white_ellipse, outer_white) in Viewport Space
+  movableOver: null,   // Layers 1..0 (small_dots, custom_detail) in Overscan Space
+};
+
 function invalidateStack() { _stack.dirty = true; }
+function invalidateMoveFastStack() { _moveFastStack.dirty = true; }
+
+const FIXED_CANVAS_LAYERS = new Set(["outer_white", "white_ellipse", "dark_ellipse", "bg_paper"]);
+
+function isSubjectMovableLayer(layerId) {
+  return !FIXED_CANVAS_LAYERS.has(layerId);
+}
+
+function getBaseSubjectCenter() {
+  if (!STATE.payload) return { cx: 870, cy: 1131 };
+  const [offX, offY] = STATE.payload.offset || [0, 0];
+  const [subW, subH] = STATE.payload.subject_size || [1260, 1782];
+  return { cx: offX + subW * 0.5, cy: offY + subH * 0.5 };
+}
 
 function drawBackdropWindowIfEnabled(ctx) {
   const subLyr = STATE.layers && STATE.layers.subject;
@@ -248,21 +275,30 @@ function drawBackdropWindowIfEnabled(ctx) {
 
 function applyBottomQuarterFade(tCtx, w, h, fadePercent) {
   const strength = Math.max(0, Math.min(1, (fadePercent ?? 0) / 100));
-  if (strength <= 0.001) return;
-  const fadeStartY = Math.round(h * 0.75);
-  if (h <= fadeStartY) return;
+  if (strength <= 0.001 || w <= 0 || h <= 0) return;
+
+  const rInner = 0.50;
+  const rOuter = 0.75;
 
   tCtx.save();
   tCtx.globalCompositeOperation = "destination-out";
-  const grad = tCtx.createLinearGradient(0, fadeStartY, 0, h);
+  tCtx.beginPath();
+  tCtx.rect(0, Math.floor(h * 0.50), w, Math.ceil(h * 0.50));
+  tCtx.clip();
+
+  tCtx.translate(w * 0.5, h * 0.25);
+  tCtx.scale(w * 1.32, h);
+
+  const grad = tCtx.createRadialGradient(0, 0, rInner, 0, 0, rOuter);
   grad.addColorStop(0, "rgba(0, 0, 0, 0)");
+  grad.addColorStop(0.5, `rgba(0, 0, 0, ${(strength * 0.45).toFixed(3)})`);
   grad.addColorStop(1, `rgba(0, 0, 0, ${strength})`);
+
   tCtx.fillStyle = grad;
-  tCtx.fillRect(0, fadeStartY, w, h - fadeStartY);
+  tCtx.fillRect(-1.5, 0, 3.0, 1.5);
   tCtx.restore();
 }
 
-// Ensures a newly toggled-on layer has its canvas rendered on demand
 function ensureLayerCanvasRendered(lyr) {
   const def = lyr.def;
   if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)) {
@@ -281,28 +317,57 @@ function ensureLayerCanvasRendered(lyr) {
   }
 }
 
-// Draws any layer source into Viewport Space (0, 0, vr.w, vr.h)
-function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
-  const [baseW, baseH] = STATE.payload.base_canvas_size || STATE.payload.canvas_size;
-
-  if (def.id === "bg_paper") {
-    const paperImg = STATE.serverImages.bg_paper;
-    if (!paperImg) return;
-    // Mirror-tile paper texture seamlessly into any expanded aspect ratio margins (zero extra canvas needed!)
-    for (let ty = -1; ty <= 1; ty++) {
-      for (let tx = -1; tx <= 1; tx++) {
-        const dx = -vr.x + tx * baseW;
-        const dy = -vr.y + ty * baseH;
-        if (dx + baseW <= 0 || dx >= vr.w || dy + baseH <= 0 || dy >= vr.h) continue;
-        targetCtx.save();
-        targetCtx.translate(dx + (tx !== 0 ? baseW : 0), dy + (ty !== 0 ? baseH : 0));
-        targetCtx.scale(tx !== 0 ? -1 : 1, ty !== 0 ? -1 : 1);
-        targetCtx.drawImage(paperImg, 0, 0, baseW, baseH);
-        targetCtx.restore();
-      }
-    }
+function applyOverscanToViewportTransform(targetCtx, vr, movable) {
+  if (!movable) {
+    targetCtx.translate(-vr.x, -vr.y);
     return;
   }
+  const st = STATE.subjectTransform || { dx: 0, dy: 0, scale: 1.0 };
+  const { cx, cy } = getBaseSubjectCenter();
+  targetCtx.translate(cx - vr.x + st.dx, cy - vr.y + st.dy);
+  if (st.scale !== 1.0) targetCtx.scale(st.scale, st.scale);
+  targetCtx.translate(-cx, -cy);
+}
+
+function drawPaperLayerInViewport(targetCtx, vr) {
+  const paperLyr = STATE.layers && STATE.layers.bg_paper;
+  if (!paperLyr || !paperLyr.vis) return;
+  const paperImg = STATE.serverImages.bg_paper;
+  if (!paperImg) return;
+
+  const [baseW, baseH] = STATE.payload.base_canvas_size || [paperImg.width, paperImg.height];
+  const [padX, padY] = STATE.payload.pad || [0, 0];
+  const p = paperLyr.params;
+  const hasFilter = p.brightness !== 100 || p.contrast !== 100 || p.saturation !== 100;
+
+  targetCtx.save();
+  targetCtx.globalAlpha = Math.min(1, p.opacity ?? 1.0);
+  if (hasFilter) {
+    targetCtx.filter = `brightness(${p.brightness}%) contrast(${p.contrast}%) saturate(${p.saturation}%)`;
+  }
+
+  for (let ty = -1; ty <= 1; ty++) {
+    for (let tx = -1; tx <= 1; tx++) {
+      const dx = padX - vr.x + tx * baseW;
+      const dy = padY - vr.y + ty * baseH;
+      if (dx + baseW <= 0 || dx >= vr.w || dy + baseH <= 0 || dy >= vr.h) continue;
+      targetCtx.save();
+      targetCtx.translate(dx + (tx !== 0 ? baseW : 0), dy + (ty !== 0 ? baseH : 0));
+      targetCtx.scale(tx !== 0 ? -1 : 1, ty !== 0 ? -1 : 1);
+      targetCtx.drawImage(paperImg, 0, 0, baseW, baseH);
+      targetCtx.restore();
+    }
+  }
+  targetCtx.restore();
+}
+
+function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
+  if (def.id === "bg_paper") {
+    drawPaperLayerInViewport(targetCtx, vr);
+    return;
+  }
+
+  const movable = isSubjectMovableLayer(def.id);
 
   if (def.id === "subject") {
     const p = lyr.params;
@@ -310,55 +375,28 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
       p.wcTexture && STATE.serverImages.subject_tex
         ? STATE.serverImages.subject_tex
         : STATE.serverImages.subject_cc;
-    const up = STATE.uncroppedPlacement;
 
-    // If viewport is wider than baseW, fill overscan side strips from the uncropped cutout first
-    if (up && up.cutoutCanvas && (vr.x < 0 || vr.x + vr.w > baseW)) {
-      if (vr.x < 0) {
-        targetCtx.save();
-        targetCtx.beginPath();
-        targetCtx.rect(0, 0, -vr.x + 2, vr.h);
-        targetCtx.clip();
-        targetCtx.drawImage(up.cutoutCanvas, up.px.x - vr.x, up.px.y - vr.y, up.px.w, up.px.h);
-        targetCtx.restore();
-      }
-      if (vr.x + vr.w > baseW) {
-        const rightStart = baseW - vr.x - 2;
-        targetCtx.save();
-        targetCtx.beginPath();
-        targetCtx.rect(rightStart, 0, vr.w - rightStart, vr.h);
-        targetCtx.clip();
-        targetCtx.drawImage(up.cutoutCanvas, up.px.x - vr.x, up.px.y - vr.y, up.px.w, up.px.h);
-        targetCtx.restore();
-      }
-    }
-
+    targetCtx.save();
+    applyOverscanToViewportTransform(targetCtx, vr, true);
     if (p.ccBlend < 100 && STATE.serverImages.subject_raw) {
-      targetCtx.drawImage(STATE.serverImages.subject_raw, -vr.x, -vr.y);
+      targetCtx.drawImage(STATE.serverImages.subject_raw, 0, 0);
       if (subMain) {
-        targetCtx.save();
         targetCtx.globalAlpha = p.ccBlend / 100;
-        targetCtx.drawImage(subMain, -vr.x, -vr.y);
-        targetCtx.restore();
+        targetCtx.drawImage(subMain, 0, 0);
       }
     } else if (subMain) {
-      targetCtx.drawImage(subMain, -vr.x, -vr.y);
+      targetCtx.drawImage(subMain, 0, 0);
     }
+    targetCtx.restore();
     return;
   }
 
-  // Static server layers (shadow, colordrop) draw directly from origImage without allocating a baseCanvas
-  if (!lyr.baseCanvas && lyr.origImage) {
-    targetCtx.drawImage(lyr.origImage, -vr.x, -vr.y);
-    return;
-  }
-
-  if (lyr.baseCanvas) {
-    if (lyr.isViewportSpace) {
-      targetCtx.drawImage(lyr.baseCanvas, 0, 0);
-    } else {
-      targetCtx.drawImage(lyr.baseCanvas, -vr.x, -vr.y);
-    }
+  const src = lyr.baseCanvas || lyr.origImage;
+  if (src) {
+    targetCtx.save();
+    applyOverscanToViewportTransform(targetCtx, vr, movable);
+    targetCtx.drawImage(src, 0, 0);
+    targetCtx.restore();
   }
 }
 
@@ -386,6 +424,7 @@ function drawLayerInto(ctx, def) {
   const hasSubjectBlend = isSubject && p.ccBlend < 100 && STATE.serverImages.subject_raw;
   const hasPaintOrErase = !!(lyr.paintCanvas || lyr.eraseCanvas);
   const hasBottomFade = bottomFadePct > 0.05;
+  const movable = isSubjectMovableLayer(def.id);
 
   if (!hasFilter && !hasSubjectBlend && !hasPaintOrErase && !hasBottomFade) {
     ctx.save();
@@ -409,11 +448,18 @@ function drawLayerInto(ctx, def) {
   drawLayerSourceInViewport(t, lyr, def, vr);
   t.filter = "none";
 
-  if (lyr.paintCanvas) t.drawImage(lyr.paintCanvas, -vr.x, -vr.y);
+  if (lyr.paintCanvas) {
+    t.save();
+    applyOverscanToViewportTransform(t, vr, movable);
+    t.drawImage(lyr.paintCanvas, 0, 0);
+    t.restore();
+  }
   if (lyr.eraseCanvas) {
+    t.save();
     t.globalCompositeOperation = "destination-out";
-    t.drawImage(lyr.eraseCanvas, -vr.x, -vr.y);
-    t.globalCompositeOperation = "source-over";
+    applyOverscanToViewportTransform(t, vr, movable);
+    t.drawImage(lyr.eraseCanvas, 0, 0);
+    t.restore();
   }
 
   if (hasBottomFade) {
@@ -428,6 +474,168 @@ function drawLayerInto(ctx, def) {
     ctx.drawImage(_tempLayerCanvas, 0, 0);
   }
   ctx.restore();
+}
+
+// Draws a single layer directly in Overscan Space (0..overW, 0..overH) without subjectTransform or bottomFade
+// Used once when building _moveFastStack so moving/scaling the subject is a 4-blit 60 FPS operation!
+function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
+  const lyr = STATE.layers[def.id];
+  if (!lyr || !lyr.vis) return;
+  const p = lyr.params;
+  const op = p.baseOpacity > 0 ? Math.min(2.5, p.opacity / p.baseOpacity) : p.opacity;
+  if (op <= 0.001) return;
+
+  ensureLayerCanvasRendered(lyr);
+
+  const [overW, overH] = STATE.payload.canvas_size;
+  const isSubject = def.id === "subject";
+  const hasFilter = p.brightness !== 100 || p.contrast !== 100 || p.saturation !== 100;
+  const hasSubjectBlend = isSubject && p.ccBlend < 100 && STATE.serverImages.subject_raw;
+  const hasPaintOrErase = !!(lyr.paintCanvas || lyr.eraseCanvas);
+
+  const subMain =
+    isSubject && p.wcTexture && STATE.serverImages.subject_tex
+      ? STATE.serverImages.subject_tex
+      : isSubject
+      ? STATE.serverImages.subject_cc
+      : lyr.baseCanvas || lyr.origImage;
+  if (!subMain) return;
+
+  if (!hasFilter && !hasSubjectBlend && !hasPaintOrErase) {
+    targetCtx.save();
+    targetCtx.globalAlpha = Math.min(1, op);
+    targetCtx.drawImage(subMain, 0, 0);
+    if (op > 1) {
+      targetCtx.globalAlpha = Math.min(1, op - 1);
+      targetCtx.drawImage(subMain, 0, 0);
+    }
+    targetCtx.restore();
+    return;
+  }
+
+  const tmp = createCanvas(overW, overH);
+  const t = tmp.getContext("2d");
+  t.filter = hasFilter ? `brightness(${p.brightness}%) contrast(${p.contrast}%) saturate(${p.saturation}%)` : "none";
+  if (hasSubjectBlend) {
+    t.drawImage(STATE.serverImages.subject_raw, 0, 0);
+    t.globalAlpha = p.ccBlend / 100;
+    t.drawImage(subMain, 0, 0);
+    t.globalAlpha = 1;
+  } else {
+    t.drawImage(subMain, 0, 0);
+  }
+  t.filter = "none";
+  if (lyr.paintCanvas) t.drawImage(lyr.paintCanvas, 0, 0);
+  if (lyr.eraseCanvas) {
+    t.globalCompositeOperation = "destination-out";
+    t.drawImage(lyr.eraseCanvas, 0, 0);
+    t.globalCompositeOperation = "source-over";
+  }
+
+  targetCtx.save();
+  targetCtx.globalAlpha = Math.min(1, op);
+  targetCtx.drawImage(tmp, 0, 0);
+  if (op > 1) {
+    targetCtx.globalAlpha = Math.min(1, op - 1);
+    targetCtx.drawImage(tmp, 0, 0);
+  }
+  targetCtx.restore();
+}
+
+function ensureMoveFastStackReady() {
+  if (!_moveFastStack.dirty && _moveFastStack.movableUnder) return;
+  const [overW, overH] = STATE.payload.canvas_size;
+  const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
+
+  if (!_moveFastStack.movableUnder || _moveFastStack.movableUnder.width !== overW || _moveFastStack.movableUnder.height !== overH) {
+    _moveFastStack.movableUnder = createCanvas(overW, overH);
+    _moveFastStack.subjectGroup = createCanvas(overW, overH);
+    _moveFastStack.movableOver = createCanvas(overW, overH);
+  }
+  if (!_moveFastStack.fixedOvals || _moveFastStack.fixedOvals.width !== vr.w || _moveFastStack.fixedOvals.height !== vr.h) {
+    _moveFastStack.fixedOvals = createCanvas(vr.w, vr.h);
+  }
+
+  const uCtx = _moveFastStack.movableUnder.getContext("2d");
+  const sCtx = _moveFastStack.subjectGroup.getContext("2d");
+  const fCtx = _moveFastStack.fixedOvals.getContext("2d");
+  const oCtx = _moveFastStack.movableOver.getContext("2d");
+
+  uCtx.clearRect(0, 0, overW, overH);
+  sCtx.clearRect(0, 0, overW, overH);
+  fCtx.clearRect(0, 0, vr.w, vr.h);
+  oCtx.clearRect(0, 0, overW, overH);
+
+  // 1. Movable Under Subject (indices 17..8: bg_brush .. shadow)
+  for (let i = 17; i >= 8; i--) {
+    drawLayerInOverscanSpaceUntransformed(uCtx, LAYER_DEFINITIONS[i]);
+  }
+  // 2. Subject + Oil + EdgeCurve un-faded (indices 7..5)
+  for (let i = 7; i >= 5; i--) {
+    drawLayerInOverscanSpaceUntransformed(sCtx, LAYER_DEFINITIONS[i]);
+  }
+  // 3. Fixed Ovals in Viewport Space (indices 4..2: dark_ellipse, white_ellipse, outer_white)
+  for (let i = 4; i >= 2; i--) {
+    drawLayerInto(fCtx, LAYER_DEFINITIONS[i]);
+  }
+  // 4. Movable Over Ovals (indices 1..0: small_dots, custom_detail)
+  for (let i = 1; i >= 0; i--) {
+    drawLayerInOverscanSpaceUntransformed(oCtx, LAYER_DEFINITIONS[i]);
+  }
+
+  _moveFastStack.dirty = false;
+}
+
+// Ultra-fast 4-blit compositor used when moving/scaling the subject (0.3 ms/frame on mobile & desktop)
+function compositeFastSubjectMove() {
+  ensureMoveFastStackReady();
+  const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
+
+  displayCtx.clearRect(0, 0, vr.w, vr.h);
+
+  // 1. Fixed Paper Base
+  drawPaperLayerInViewport(displayCtx, vr);
+
+  // 2. Movable Under-Subject Brushes + Glow + Drops + Shadow
+  displayCtx.save();
+  applyOverscanToViewportTransform(displayCtx, vr, true);
+  displayCtx.drawImage(_moveFastStack.movableUnder, 0, 0);
+  displayCtx.restore();
+
+  // 3. Optional Backdrop Window
+  drawBackdropWindowIfEnabled(displayCtx);
+
+  // 4. Movable Subject + Oil + EdgeCurve with Fixed Canvas Oval Bottom 25% Fade
+  const subParams = STATE.layers.subject ? ensureSubjectParams(STATE.layers.subject.params) : null;
+  const bottomFadePct = subParams ? (subParams.bottomFade ?? 100) : 0;
+  if (bottomFadePct > 0.05) {
+    if (_tempLayerCanvas.width !== vr.w || _tempLayerCanvas.height !== vr.h) {
+      _tempLayerCanvas.width = vr.w;
+      _tempLayerCanvas.height = vr.h;
+    }
+    const t = _tempLayerCanvas.getContext("2d");
+    t.clearRect(0, 0, vr.w, vr.h);
+    t.save();
+    applyOverscanToViewportTransform(t, vr, true);
+    t.drawImage(_moveFastStack.subjectGroup, 0, 0);
+    t.restore();
+    applyBottomQuarterFade(t, vr.w, vr.h, bottomFadePct);
+    displayCtx.drawImage(_tempLayerCanvas, 0, 0);
+  } else {
+    displayCtx.save();
+    applyOverscanToViewportTransform(displayCtx, vr, true);
+    displayCtx.drawImage(_moveFastStack.subjectGroup, 0, 0);
+    displayCtx.restore();
+  }
+
+  // 5. Fixed Frame Ovals
+  displayCtx.drawImage(_moveFastStack.fixedOvals, 0, 0);
+
+  // 6. Movable Over-Oval Details (small_dots + custom_detail)
+  displayCtx.save();
+  applyOverscanToViewportTransform(displayCtx, vr, true);
+  displayCtx.drawImage(_moveFastStack.movableOver, 0, 0);
+  displayCtx.restore();
 }
 
 function rebuildStack(selId) {
@@ -471,6 +679,10 @@ function compositeAllLayers() {
     renderMaskEditorView();
     return;
   }
+  if (STATE.activeTool === "move_subject") {
+    compositeFastSubjectMove();
+    return;
+  }
   const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
   const sel = STATE.selectedLayerId;
   if (_stack.dirty || _stack.id !== sel) rebuildStack(sel);
@@ -481,7 +693,7 @@ function compositeAllLayers() {
   displayCtx.drawImage(_stack.above, 0, 0);
 }
 
-// Fast O(1) Spatial Grid for Edge Sampling (supports negative overscan coordinates)
+// Fast O(1) Spatial Grid for Edge Sampling with fixed integer offset so overscan edges never shift grid buckets
 const _sampleCache = new Map();
 let _gridBuf = new Int32Array(0);
 
@@ -497,12 +709,9 @@ function sampleEdgePointsJS(edges, spacing) {
   const cell = spacing / Math.SQRT2;
   const invCell = 1.0 / cell;
 
-  const minX = (sd && sd.minX) || 0;
-  const minY = (sd && sd.minY) || 0;
-  const maxX = (sd && sd.maxX) || 2000;
-  const maxY = (sd && sd.maxY) || 2000;
-  const gW = Math.max(8, (((maxX - minX) * invCell) | 0) + 8);
-  const gH = Math.max(8, (((maxY - minY) * invCell) | 0) + 8);
+  const FIXED_OFF = 256;
+  const gW = 1024;
+  const gH = 1024;
   const gLen = gW * gH;
   if (_gridBuf.length < gLen) {
     _gridBuf = new Int32Array(gLen);
@@ -513,8 +722,8 @@ function sampleEdgePointsJS(edges, spacing) {
   for (let i = 0; i < n; i++) {
     const px = edgesX ? edgesX[i] : edges[i][0];
     const py = edgesY ? edgesY[i] : edges[i][1];
-    const gx = Math.max(2, Math.min(gW - 3, (((px - minX) * invCell) | 0) + 2));
-    const gy = Math.max(2, Math.min(gH - 3, (((py - minY) * invCell) | 0) + 2));
+    const gx = Math.max(2, Math.min(gW - 3, ((px * invCell) | 0) + FIXED_OFF));
+    const gy = Math.max(2, Math.min(gH - 3, ((py * invCell) | 0) + FIXED_OFF));
     const centerIdx = gy * gW + gx;
 
     const cNb = _gridBuf[centerIdx];
@@ -549,12 +758,12 @@ function getOrBuildOilDetailCache() {
   if (STATE.oilDetailCache) return STATE.oilDetailCache;
   if (!STATE.serverImages || !STATE.serverImages.oil_paint_full) return null;
   const [cw, ch] = STATE.payload.canvas_size;
-  const [offX, offY] = STATE.payload.offset;
-  const [subW, subH] = STATE.payload.subject_size;
-  const bx = Math.max(0, offX);
-  const by = Math.max(0, offY);
-  const bw = Math.min(cw - bx, subW);
-  const bh = Math.min(ch - by, subH);
+  const [bx, by, bw, bh] = STATE.payload.full_subject_box || [
+    Math.max(0, STATE.payload.offset[0]),
+    Math.max(0, STATE.payload.offset[1]),
+    STATE.payload.subject_size[0],
+    STATE.payload.subject_size[1],
+  ];
   if (bw <= 0 || bh <= 0) return null;
 
   const oilCrop = createCanvas(bw, bh);
@@ -605,7 +814,6 @@ function rerenderLiveOilLayer(skipComposite = false) {
   if (!lyr || !STATE.serverImages.oil_paint_full) return;
   const [w, h] = STATE.payload.canvas_size;
   if (!lyr.baseCanvas) lyr.baseCanvas = createCanvas(w, h);
-  lyr.isViewportSpace = false;
 
   const p = lyr.params;
   const ctx = lyr.baseCanvas.getContext("2d");
@@ -723,7 +931,6 @@ function rerenderLiveGlowLayer(skipComposite = false) {
   const p = ensureGlowParams(lyr.params);
   const [cw, ch] = STATE.payload.canvas_size;
   if (!lyr.baseCanvas) lyr.baseCanvas = createCanvas(cw, ch);
-  lyr.isViewportSpace = false;
 
   const ctx = lyr.baseCanvas.getContext("2d");
   ctx.clearRect(0, 0, cw, ch);
@@ -777,7 +984,7 @@ function rerenderLiveGlowLayer(skipComposite = false) {
 }
 
 // ============================================================================
-// 8C. CONTOUR SEARCH & DETERMINISTIC BASE-SPACE PROCEDURAL BRUSH ENGINE
+// 8C. CONTOUR SEARCH & OVERSCAN PROCEDURAL BRUSH ENGINE
 // ============================================================================
 function findNearestEdgePointJS(edges, subX, subY) {
   const sd = STATE.payload && STATE.payload.stroke_data;
@@ -841,7 +1048,9 @@ function getBottomOutlineCoordsJS(edges) {
 
 const _ellipseGeomCache = new Map();
 
-function getOrBuildEllipseGeometry(layerId, def, spacing, baseW, baseH, offX, offY, edges, cfg) {
+function getOrBuildEllipseGeometry(layerId, def, spacing, w, h, offX, offY, edges, cfg) {
+  const [baseW, baseH] = (STATE.payload && STATE.payload.base_canvas_size) || [w, h];
+  const [padX, padY] = (STATE.payload && STATE.payload.pad) || [0, 0];
   const key = `${layerId}_${spacing}_${baseW}x${baseH}`;
   let cached = _ellipseGeomCache.get(key);
   if (cached) return cached;
@@ -854,12 +1063,13 @@ function getOrBuildEllipseGeometry(layerId, def, spacing, baseW, baseH, offX, of
   const blendAmt = isDark ? 0 : cfg[`${prefix}_OUTLINE_BLEND`] ?? (isOuter ? 0.0 : 0.25);
   const rotOffset = cfg[`${prefix}_ROTATION_OFFSET`] ?? 180;
 
-  const cx = Math.trunc(baseW / 2), cy = Math.trunc(baseH / 2);
-  const maxDist = Math.hypot(cx, cy);
-  const rx = Math.max(10, cx - inset), ry = Math.max(10, cy - inset);
+  const halfW = Math.trunc(baseW / 2), halfH = Math.trunc(baseH / 2);
+  const cx = padX + halfW, cy = padY + halfH;
+  const maxDist = Math.hypot(halfW, halfH);
+  const rx = Math.max(10, halfW - inset), ry = Math.max(10, halfH - inset);
   const circum = 2 * Math.PI * Math.max(rx, ry);
   const numPts = Math.max(1, Math.trunc(circum / spacing));
-  const bottomThresh = baseH * (1 - (cfg.DARK_ELLIPSE_BOTTOM_PERCENT ?? 0.15));
+  const bottomThresh = padY + baseH * (1 - (cfg.DARK_ELLIPSE_BOTTOM_PERCENT ?? 0.15));
 
   cached = [];
   for (let i = 0; i < numPts; i++) {
@@ -936,10 +1146,12 @@ function adjustAccentColourJS(colour, isDark, isBright, accentPass, weightAdj) {
   ];
 }
 
-function bottomFadeMultJS(canvasY, baseH) {
+function bottomFadeMultJS(canvasY, canvasH) {
+  const [, baseH] = (STATE.payload && STATE.payload.base_canvas_size) || [canvasH, canvasH];
+  const [, padY] = (STATE.payload && STATE.payload.pad) || [0, 0];
   const start = 0.70;
   const minOp = 0.0;
-  const frac = canvasY / Math.max(1, baseH);
+  const frac = (canvasY - padY) / Math.max(1, baseH);
   if (frac <= start) return 1.0;
   if (frac >= 1.0) return minOp;
   const t = (frac - start) / (1.0 - start);
@@ -977,7 +1189,7 @@ function buildKeepMaskBySpacingJS(points, spacing) {
   return keep;
 }
 
-function buildAccentStrokesListJS(cands, spots, p, cfg, baseH) {
+function buildAccentStrokesListJS(cands, spots, p, cfg, h) {
   const strokes = [];
   const seed = cfg.RANDOM_SEED || 42;
   const jiggle = p.jiggle ?? 0.8;
@@ -1014,7 +1226,7 @@ function buildAccentStrokesListJS(cands, spots, p, cfg, baseH) {
       if (!keepCand[i]) continue;
 
       op = Math.max(0.05, Math.min(1.0, op));
-      op *= (pt.w_op ?? 1.0) * bottomFadeMultJS(pt.y, baseH);
+      op *= (pt.w_op ?? 1.0) * bottomFadeMultJS(pt.y, h);
       op = Math.max(0.02, Math.min(1.0, op));
 
       const rgb = adjustAccentColourJS(pt.color, pt.is_dark, pt.is_bright, pass.name, pt.w_bright ?? 0.0);
@@ -1040,7 +1252,7 @@ function buildAccentStrokesListJS(cands, spots, p, cfg, baseH) {
 
     if (!keepSpot[i]) continue;
 
-    op *= (sp.w_op ?? 1.0) * bottomFadeMultJS(sp.y, baseH);
+    op *= (sp.w_op ?? 1.0) * bottomFadeMultJS(sp.y, h);
     op = Math.max(0.02, Math.min(1.0, op));
 
     let r = sp.color[0] + 0.15 * 25;
@@ -1072,12 +1284,11 @@ function buildAccentStrokesListJS(cands, spots, p, cfg, baseH) {
   return strokes;
 }
 
-// Computes the deterministic stroke array in Base Reference Space (0..baseW, 0..baseH)
-function buildProceduralStrokesInBaseSpace(lyr) {
+function buildProceduralStrokesInOverscanSpace(lyr) {
   const def = lyr.def;
   const p = lyr.params;
   const cfg = STATE.payload.preset_settings;
-  const [baseW, baseH] = STATE.payload.base_canvas_size || STATE.payload.canvas_size;
+  const [overW, overH] = STATE.payload.canvas_size;
   const [offX, offY] = STATE.payload.offset;
   const edges = STATE.payload.stroke_data.edges;
   const strokes = [];
@@ -1167,10 +1378,10 @@ function buildProceduralStrokesInBaseSpace(lyr) {
   } else if (def.type === "accent") {
     const cands = STATE.payload.stroke_data.accent_candidates || [];
     const spots = STATE.payload.stroke_data.accent_spots || [];
-    return buildAccentStrokesListJS(cands, spots, p, cfg, baseH);
+    return buildAccentStrokesListJS(cands, spots, p, cfg, overH);
   } else if (def.type === "brush_ellipse" || def.type === "brush_ellipse_dark") {
     const rng = new PythonRandom((cfg.RANDOM_SEED || 42) + (def.seedOffset || 500));
-    const geom = getOrBuildEllipseGeometry(def.id, def, p.spacing, baseW, baseH, offX, offY, edges, cfg);
+    const geom = getOrBuildEllipseGeometry(def.id, def, p.spacing, overW, overH, offX, offY, edges, cfg);
 
     for (let i = 0; i < geom.length; i++) {
       const g = geom[i];
@@ -1186,17 +1397,6 @@ function buildProceduralStrokesInBaseSpace(lyr) {
   return strokes;
 }
 
-function shiftStrokesForViewport(strokes, dx, dy) {
-  if (dx === 0 && dy === 0) return strokes;
-  const n = strokes.length;
-  const out = new Array(n);
-  for (let i = 0; i < n; i++) {
-    const s = strokes[i];
-    out[i] = { x: s.x + dx, y: s.y + dy, size: s.size, rot: s.rot, rgb: s.rgb, op: s.op };
-  }
-  return out;
-}
-
 function rerenderProceduralLayer(layerId, skipComposite = false) {
   if (layerId === "glow") {
     rerenderLiveGlowLayer(skipComposite);
@@ -1207,13 +1407,11 @@ function rerenderProceduralLayer(layerId, skipComposite = false) {
   const def = lyr.def;
   const p = lyr.params;
 
-  // 1. Build deterministic Base-Space strokes ONLY if dirty (never on aspect ratio switch!)
   if (!lyr.cachedStrokes || lyr.strokesDirty) {
-    lyr.cachedStrokes = buildProceduralStrokesInBaseSpace(lyr);
+    lyr.cachedStrokes = buildProceduralStrokesInOverscanSpace(lyr);
     lyr.strokesDirty = false;
   }
 
-  // 2. If layer is hidden, do not allocate or hold a baseCanvas in memory!
   if (!lyr.vis) {
     lyr.baseCanvas = null;
     return;
@@ -1223,32 +1421,21 @@ function rerenderProceduralLayer(layerId, skipComposite = false) {
   const brushImg = STATE.brushImages[brushKey];
   if (!brushImg) return;
 
-  const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
-  const [baseW, baseH] = STATE.payload.base_canvas_size || STATE.payload.canvas_size;
-
+  const [overW, overH] = STATE.payload.canvas_size;
   if (!lyr.baseCanvas) {
-    lyr.baseCanvas = createCanvas(vr.w, vr.h);
-  } else if (lyr.baseCanvas.width !== vr.w || lyr.baseCanvas.height !== vr.h) {
-    lyr.baseCanvas.width = vr.w;
-    lyr.baseCanvas.height = vr.h;
+    lyr.baseCanvas = createCanvas(overW, overH);
+  } else if (lyr.baseCanvas.width !== overW || lyr.baseCanvas.height !== overH) {
+    lyr.baseCanvas.width = overW;
+    lyr.baseCanvas.height = overH;
   }
-  lyr.isViewportSpace = true;
 
   const ctx = lyr.baseCanvas.getContext("2d");
-  ctx.clearRect(0, 0, vr.w, vr.h);
-
-  const shiftedStrokes = shiftStrokesForViewport(lyr.cachedStrokes, -vr.x, -vr.y);
+  ctx.clearRect(0, 0, overW, overH);
+  const strokes = lyr.cachedStrokes;
 
   if (def.type === "mask_blur" && STATE.serverImages.blur_bg) {
-    const glCanvas = drawStrokesWebGL(vr.w, vr.h, brushKey, brushImg, shiftedStrokes);
-    // If viewport expands beyond baseW/baseH, fill expanded margins with blurred backdrop first
-    if (vr.x < 0 || vr.y < 0 || vr.x + vr.w > baseW || vr.y + vr.h > baseH) {
-      ctx.save();
-      ctx.filter = "blur(24px)";
-      ctx.drawImage(STATE.serverImages.blur_bg, 0, 0, vr.w, vr.h);
-      ctx.restore();
-    }
-    ctx.drawImage(STATE.serverImages.blur_bg, -vr.x, -vr.y);
+    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
+    ctx.drawImage(STATE.serverImages.blur_bg, 0, 0);
     if (glCanvas) {
       ctx.save();
       ctx.globalCompositeOperation = "destination-in";
@@ -1257,37 +1444,50 @@ function rerenderProceduralLayer(layerId, skipComposite = false) {
       ctx.restore();
     }
   } else if (def.type === "accent") {
-    const glCanvas = drawStrokesWebGL(vr.w, vr.h, brushKey, brushImg, shiftedStrokes);
+    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
     if (glCanvas) {
       ctx.drawImage(glCanvas, 0, 0);
     } else {
-      for (const s of shiftedStrokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
+      for (const s of strokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
     }
   } else {
-    const glCanvas = drawStrokesWebGL(vr.w, vr.h, brushKey, brushImg, shiftedStrokes);
+    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
     if (glCanvas) {
       ctx.save();
       ctx.globalAlpha = p.baseOpacity;
       ctx.drawImage(glCanvas, 0, 0);
       ctx.restore();
     } else {
-      for (const s of shiftedStrokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
+      for (const s of strokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
       if (p.baseOpacity < 1.0) {
         ctx.save();
         ctx.globalCompositeOperation = "destination-in";
         ctx.fillStyle = `rgba(0, 0, 0, ${p.baseOpacity})`;
-        ctx.fillRect(0, 0, vr.w, vr.h);
+        ctx.fillRect(0, 0, overW, overH);
         ctx.restore();
       }
     }
   }
 
+  invalidateMoveFastStack();
   if (_stack.id !== layerId) {
     invalidateStack();
   }
   if (!skipComposite) {
     compositeAllLayers();
   }
+}
+
+// Fast 60 FPS subject move/scale update: ZERO procedural re-renders!
+let _pendingSubjectMoveRaf = 0;
+function scheduleSubjectMoveUpdate() {
+  if (_pendingSubjectMoveRaf) return;
+  _pendingSubjectMoveRaf = requestAnimationFrame(() => {
+    _pendingSubjectMoveRaf = 0;
+    if (!STATE.payload) return;
+    invalidateStack();
+    compositeAllLayers();
+  });
 }
 
 function applyBrushWarmthJS(rgb, cfg) {

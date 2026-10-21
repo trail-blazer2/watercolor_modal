@@ -106,6 +106,10 @@ const IS_MOBILE =
   typeof window !== "undefined" &&
   (window.innerWidth <= 960 || /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent));
 
+const OVERSCAN_PAD = 400;
+const OVERSCAN_PAD_X = 500;
+const OVERSCAN_PAD_Y = 300;
+
 const STATE = {
   apiUrl: "https://autorauto--watercolor-studio-gpu-watercolorservice-api.modal.run",
   uploadedFile: null,
@@ -118,13 +122,16 @@ const STATE = {
   maskModePaintKeep: true,
   maskCanvas: null,
   rawMaskBase64: null,
-  presetCache: new Map(),
+  presetCache: new Map(),      // Lightweight compressed payload cache (~1.5 MB/preset)
+  presetUserEdits: new Map(),  // Remembers per-preset layer slider/visibility tweaks
   bgFetchPromises: new Map(),
   uploadSessionId: 0,
   aspectRatioKey: "a4",
   aspectOrientation: null,
   uncroppedPlacement: null,
-  viewRect: { x: 0, y: 0, w: 1260, h: 1782 },
+  viewRect: { x: OVERSCAN_PAD, y: OVERSCAN_PAD, w: 1260, h: 1782 },
+  subjectTransform: { dx: 0, dy: 0, scale: 1.0 },
+  hasViewportPosition: false,
   zoom: 0.45,
   panX: 40,
   panY: 20,
@@ -147,7 +154,6 @@ let _progressTimer = null;
 window.addEventListener("DOMContentLoaded", () => {
   bindUIEvents();
   if (window.Workflow) Workflow.init();
-  // Defer server ping & brush texture loading so initial page load on mobile is instant
   setTimeout(() => {
     prewarmModalServer();
     loadCachedBrushes();
@@ -263,28 +269,36 @@ async function fetchBrushTextures() {
   } catch (_) {}
 }
 
-// Decodes data: URLs via short-lived Blob ObjectURLs so multi-MB base64 strings aren't retained by DOM Images
+function dataUrlToBlob(dataUrl) {
+  if (!dataUrl || typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return null;
+  try {
+    const comma = dataUrl.indexOf(",");
+    const meta = dataUrl.slice(0, comma);
+    const b64 = dataUrl.slice(comma + 1);
+    const mime = (meta.match(/data:([^;]+)/) || [null, "image/webp"])[1];
+    const bin = atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  } catch (_) {
+    return null;
+  }
+}
+
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     if (!src) return reject(new Error("Empty image source"));
     let objectUrl = null;
     const img = new Image();
-    if (src.startsWith("http")) img.crossOrigin = "anonymous";
 
-    if (src.startsWith("data:")) {
-      try {
-        const comma = src.indexOf(",");
-        const meta = src.slice(0, comma);
-        const b64 = src.slice(comma + 1);
-        const mime = (meta.match(/data:([^;]+)/) || [null, "image/webp"])[1];
-        const bin = atob(b64);
-        const len = bin.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-        objectUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
-      } catch (_) {
-        objectUrl = null;
-      }
+    if (src instanceof Blob) {
+      objectUrl = URL.createObjectURL(src);
+    } else if (typeof src === "string" && src.startsWith("data:")) {
+      const blob = dataUrlToBlob(src);
+      if (blob) objectUrl = URL.createObjectURL(blob);
+    } else if (typeof src === "string" && src.startsWith("http")) {
+      img.crossOrigin = "anonymous";
     }
 
     img.onload = () => {
@@ -307,7 +321,7 @@ function createCanvas(w, h) {
 }
 
 // ============================================================================
-// 5. ASPECT RATIO PARSER & ZERO-RERENDER VIEWPORT CROP
+// 5. ASPECT RATIO PARSER & ZERO-JUMP VIEWPORT CROP
 // ============================================================================
 function resolveActiveProfileKey() {
   const presetEl = document.getElementById("presetSelect");
@@ -339,46 +353,102 @@ function parseAspectRatioToCm(ratioVal, profileKey, orientationOverride) {
     : { width: shortSide, height: longSide };
 }
 
-// Computes the active viewport rectangle in Base Reference Space [0..baseW, 0..baseH].
-// Note: x can be negative (e.g. -291) when a wider ratio expands the sides beyond baseW!
-function computeViewRectInBaseSpace(ratioVal, orientationOverride) {
+function resolveActiveProfileKey() {
+  const presetEl = document.getElementById("presetSelect");
+  let presetKey = presetEl ? presetEl.value : "animals";
+  if (presetKey === "auto" && STATE.payload && STATE.payload.preset_key) {
+    presetKey = STATE.payload.preset_key;
+  }
+  if (presetKey.startsWith("cars")) return "car";
+  if (presetKey === "people") return "person";
+  return "animal";
+}
+
+function parseAspectRatioToCm(ratioVal, profileKey, orientationOverride) {
+  const prof = profileKey || resolveActiveProfileKey();
+  const isDefaultLandscape = prof === "car";
+  const orient = orientationOverride || STATE.aspectOrientation || (isDefaultLandscape ? "landscape" : "portrait");
+  const v = String(ratioVal || "a4").trim().toLowerCase();
+
+  let longSide = 141.421356; // ISO A2/A3/A4 (sqrt(2) * 100)
+  let shortSide = 100;
+
+  if (v.includes("4:3") || v.includes("4_3") || v.includes("3:4")) {
+    longSide = 133.333333; shortSide = 100;
+  } else if (v.includes("3:2") || v.includes("3_2") || v.includes("2:3")) {
+    longSide = 150; shortSide = 100;
+  } else if (v.includes("16:9") || v.includes("16_9") || v.includes("9:16")) {
+    longSide = 177.777778; shortSide = 100;
+  }
+
+  return orient === "landscape"
+    ? { width: longSide, height: shortSide }
+    : { width: shortSide, height: longSide };
+}
+
+// Computes the exact viewport crop rectangle inside Overscan Space while strictly preserving aspect ratio R
+function computeViewRectInOverscanSpace(ratioVal, orientationOverride) {
   if (!STATE.payload || !STATE.payload.base_canvas_size) {
-    return { x: 0, y: 0, w: 1260, h: 1782 };
+    return { x: OVERSCAN_PAD_X, y: OVERSCAN_PAD_Y, w: 1260, h: 1782 };
   }
   const [baseW, baseH] = STATE.payload.base_canvas_size;
+  const [padX, padY] = STATE.payload.pad || [OVERSCAN_PAD_X, OVERSCAN_PAD_Y];
+  const [overW, overH] = STATE.payload.canvas_size;
+
   const prof = resolveActiveProfileKey();
   const cm = parseAspectRatioToCm(ratioVal || STATE.aspectRatioKey, prof, orientationOverride);
   const R = cm.width / cm.height;
 
-  let viewW, viewH, viewX, viewY;
-  if (prof === "car") {
-    if (R >= 1) {
-      viewH = baseH;
-      viewW = Math.min(2240, Math.round(viewH * R));
-    } else {
-      viewW = baseW;
-      viewH = Math.min(2240, Math.round(viewW / R));
-    }
-    viewX = Math.round((baseW - viewW) * 0.5);
-    viewY = Math.round((baseH - viewH) * 0.5);
+  const baseLong = Math.max(baseW, baseH);  // 1782
+  const baseShort = Math.min(baseW, baseH); // 1260
+
+  let viewW, viewH;
+  if (R >= 1) {
+    // Landscape: keep short side 1260, expand width by R (e.g. 2240x1260 for 16:9)
+    viewH = baseShort;
+    viewW = Math.round(viewH * R);
   } else {
-    if (R <= 1.35) {
-      viewH = baseH;
-      viewW = Math.min(2240, Math.round(viewH * R));
-    } else {
-      viewW = Math.min(2240, Math.round(baseH * R));
-      viewH = Math.min(2240, Math.round(viewW / R));
-    }
-    viewX = Math.round((baseW - viewW) * 0.5);
-    viewY = Math.round(baseH - viewH);
+    // Portrait: keep long side 1782, set width by R (e.g. 1002x1782 for 9:16) — never clamps into a square!
+    viewH = baseLong;
+    viewW = Math.round(viewH * R);
   }
 
+  // Uniform safety scale if ever needed so aspect ratio R is 100% preserved
+  const fitScale = Math.min(1, overW / Math.max(1, viewW), overH / Math.max(1, viewH));
+  if (fitScale < 1) {
+    viewW = Math.max(1, Math.round(viewW * fitScale));
+    viewH = Math.max(1, Math.round(viewH * fitScale));
+  }
+
+  let viewX = Math.round(padX + (baseW - viewW) * 0.5);
+  let viewY;
+  if (prof === "car") {
+    viewY = Math.round(padY + (baseH - viewH) * 0.5);
+  } else {
+    // Portrait bust: anchor bottom floor at padY + baseH
+    viewY = Math.round(padY + baseH - viewH);
+  }
+
+  viewX = Math.max(0, Math.min(overW - viewW, viewX));
+  viewY = Math.max(0, Math.min(overH - viewH, viewY));
   return { x: viewX, y: viewY, w: viewW, h: viewH };
 }
 
-// Instant, zero-delay aspect ratio switching in Step 3:
-// Replays precomputed lyr.cachedStrokes with (-viewRect.x, -viewRect.y) offset in WebGL (~1ms total).
-// PythonRandom is NEVER re-run, so brushes never shift!
+function resizeDisplayCanvasKeepViewportPosition(newW, newH) {
+  const oldW = displayCanvas.width || newW;
+  const oldH = displayCanvas.height || newH;
+  displayCanvas.width = newW;
+  displayCanvas.height = newH;
+
+  if (STATE.hasViewportPosition) {
+    STATE.panX = Math.round(STATE.panX + ((oldW - newW) * 0.5) * STATE.zoom);
+    STATE.panY = Math.round(STATE.panY + ((oldH - newH) * 0.5) * STATE.zoom);
+    updateCanvasTransform();
+  } else {
+    fitCanvasToViewport();
+  }
+}
+
 function applyStudioAspectRatio(ratioVal, orientationOverride) {
   if (ratioVal !== undefined && ratioVal !== null) {
     STATE.aspectRatioKey = ratioVal;
@@ -394,24 +464,11 @@ function applyStudioAspectRatio(ratioVal, orientationOverride) {
 
   if (!STATE.payload) return;
 
-  STATE.viewRect = computeViewRectInBaseSpace(STATE.aspectRatioKey, STATE.aspectOrientation);
-  displayCanvas.width = STATE.viewRect.w;
-  displayCanvas.height = STATE.viewRect.h;
+  STATE.viewRect = computeViewRectInOverscanSpace(STATE.aspectRatioKey, STATE.aspectOrientation);
+  resizeDisplayCanvasKeepViewportPosition(STATE.viewRect.w, STATE.viewRect.h);
 
-  // Rasterize only visible procedural layers from their precomputed cachedStrokes (no RNG/sampling!)
-  for (const def of LAYER_DEFINITIONS) {
-    const lyr = STATE.layers[def.id];
-    if (
-      lyr &&
-      lyr.vis &&
-      ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)
-    ) {
-      rerenderProceduralLayer(def.id, true);
-    }
-  }
-
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   invalidateStack();
-  fitCanvasToViewport();
   compositeAllLayers();
 }
 
@@ -420,7 +477,7 @@ window.changeStudioAspectRatio = applyStudioAspectRatio;
 window.parseAspectRatioToCm = parseAspectRatioToCm;
 
 // ============================================================================
-// 6. UPLOAD, GENERATION & FAST BOUNDING-BOX EDGE UNPACKING
+// 6. UPLOAD, LIGHTWEIGHT PRESET MEMORY CACHE & GENERATION
 // ============================================================================
 async function prepareOptimizedUploadBlob(img, presetKey) {
   const isCar = presetKey.startsWith("cars");
@@ -437,6 +494,66 @@ async function prepareOptimizedUploadBlob(img, presetKey) {
   const c = createCanvas(w, h);
   c.getContext("2d").drawImage(img, 0, 0, w, h);
   return new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.92));
+}
+
+function compactifyPayloadForCache(rawPayload) {
+  if (!rawPayload) return null;
+  if (rawPayload._isCompact) return rawPayload;
+
+  unpackEdgesIfNeeded(rawPayload.stroke_data);
+  const layerBlobs = {};
+  if (rawPayload.layers) {
+    for (const [k, b64] of Object.entries(rawPayload.layers)) {
+      if (b64) layerBlobs[k] = b64 instanceof Blob ? b64 : dataUrlToBlob(b64);
+    }
+  }
+  const maskBlob = rawPayload.mask_png
+    ? (rawPayload.mask_png instanceof Blob ? rawPayload.mask_png : dataUrlToBlob(rawPayload.mask_png))
+    : null;
+
+  return {
+    _isCompact: true,
+    preset_key: rawPayload.preset_key,
+    canvas_size: [...rawPayload.canvas_size],
+    offset: [...rawPayload.offset],
+    subject_size: [...rawPayload.subject_size],
+    preset_settings: { ...rawPayload.preset_settings },
+    average_color: rawPayload.average_color ? [...rawPayload.average_color] : null,
+    dominant_color: rawPayload.dominant_color ? [...rawPayload.dominant_color] : null,
+    elapsed_sec: rawPayload.elapsed_sec,
+    timings: rawPayload.timings || {},
+    maskBlob,
+    layerBlobs,
+    stroke_data: {
+      edges: (rawPayload.stroke_data.edges || []).map((e) => [...e]),
+      accent_candidates: (rawPayload.stroke_data.accent_candidates || []).map((c) => ({ ...c, color: [...c.color] })),
+      accent_spots: (rawPayload.stroke_data.accent_spots || []).map((s) => ({ ...s, color: [...s.color] })),
+    },
+  };
+}
+
+function storePresetInMemoryCache(presetKey, compactPayload) {
+  if (!presetKey || !compactPayload) return;
+  if (STATE.presetCache.has(presetKey)) STATE.presetCache.delete(presetKey);
+  STATE.presetCache.set(presetKey, compactPayload);
+  const maxCached = IS_MOBILE ? 3 : 6;
+  while (STATE.presetCache.size > maxCached) {
+    const oldestKey = STATE.presetCache.keys().next().value;
+    STATE.presetCache.delete(oldestKey);
+  }
+}
+
+function saveCurrentPresetUserEdits() {
+  if (!STATE.payload || !STATE.payload.preset_key || !STATE.layers) return;
+  const key = STATE.payload.preset_key;
+  const snapshot = {};
+  for (const [id, lyr] of Object.entries(STATE.layers)) {
+    snapshot[id] = {
+      vis: lyr.vis,
+      params: { ...lyr.params },
+    };
+  }
+  STATE.presetUserEdits.set(key, snapshot);
 }
 
 const SIBLING_PRESETS = {
@@ -465,22 +582,26 @@ async function fetchPresetPayloadFromServer(presetKey, useEditedMask) {
     body: formData,
   });
   if (!res.ok) throw new Error(`Server returned status ${res.status}`);
-  return JSON.parse(await res.text());
+  const rawPayload = JSON.parse(await res.text());
+  if (rawPayload.raw_mask_png) {
+    STATE.rawMaskBase64 = rawPayload.raw_mask_png;
+    delete rawPayload.raw_mask_png;
+  }
+  return compactifyPayloadForCache(rawPayload);
 }
 
 function pregenerateSiblingPresetsInBackground(activePresetKey, sessionId) {
-  // Never pre-fetch extra multi-MB presets in the background on mobile/iOS!
   if (IS_MOBILE) return;
   const siblings = (SIBLING_PRESETS[activePresetKey] || []).slice(0, 1);
   for (const sibKey of siblings) {
     if (STATE.presetCache.has(sibKey) || STATE.bgFetchPromises.has(sibKey)) continue;
 
     const p = fetchPresetPayloadFromServer(sibKey, Boolean(STATE.maskEditedByUser))
-      .then((sibPayload) => {
-        if (STATE.uploadSessionId === sessionId) {
-          STATE.presetCache.set(sibKey, sibPayload);
+      .then((compactSib) => {
+        if (STATE.uploadSessionId === sessionId && compactSib) {
+          storePresetInMemoryCache(sibKey, compactSib);
         }
-        return sibPayload;
+        return compactSib;
       })
       .catch(() => null)
       .finally(() => {
@@ -491,51 +612,59 @@ function pregenerateSiblingPresetsInBackground(activePresetKey, sessionId) {
   }
 }
 
-async function runModalGeneration(useEditedMask = false, isPresetSwitch = false) {
+async function runModalGeneration(useEditedMask = false, isPresetSwitch = false, isHistoryRestore = false) {
   if (!STATE.uploadedFile || !STATE.originalImg) return;
   stopFilePickerPrewarm();
 
   const presetKey = document.getElementById("presetSelect").value;
+  const prevPresetKey = STATE.payload ? STATE.payload.preset_key : null;
 
-  if (!isPresetSwitch || useEditedMask) {
+  if (isPresetSwitch && !useEditedMask) {
+    saveCurrentPresetUserEdits();
+    if (!isHistoryRestore && prevPresetKey && prevPresetKey !== presetKey && History.recordPresetSwitch) {
+      History.recordPresetSwitch(prevPresetKey, presetKey);
+    }
+  } else if (!isHistoryRestore) {
     STATE.uploadSessionId++;
     STATE.presetCache.clear();
+    STATE.presetUserEdits.clear();
     STATE.bgFetchPromises.clear();
     STATE.maskEditedByUser = !!useEditedMask;
   }
 
   const currentSessionId = STATE.uploadSessionId;
-  startProgressBar(isPresetSwitch);
+
+  // Always show loading popup (including fast cached preset switches & undo/redo preset switches)
+  startProgressBar(isPresetSwitch || isHistoryRestore);
+  // Yield 2 animation frames so the browser paints the loading popup before synchronous canvas work begins
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   try {
     const t0 = performance.now();
-    let payload = null;
+    let compactPayload = null;
 
-    if (isPresetSwitch && !useEditedMask) {
+    if ((isPresetSwitch || isHistoryRestore) && !useEditedMask) {
       if (STATE.presetCache.has(presetKey)) {
-        payload = STATE.presetCache.get(presetKey);
-        STATE.presetCache.delete(presetKey);
-        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        compactPayload = STATE.presetCache.get(presetKey);
       } else if (STATE.bgFetchPromises.has(presetKey)) {
-        payload = await STATE.bgFetchPromises.get(presetKey);
+        compactPayload = await STATE.bgFetchPromises.get(presetKey);
       }
     }
 
-    if (!payload) {
-      payload = await fetchPresetPayloadFromServer(presetKey, useEditedMask);
+    if (!compactPayload) {
+      compactPayload = await fetchPresetPayloadFromServer(presetKey, useEditedMask);
     }
 
-    if (payload.raw_mask_png) {
-      STATE.rawMaskBase64 = payload.raw_mask_png;
-      delete payload.raw_mask_png;
+    if (currentSessionId === STATE.uploadSessionId && compactPayload) {
+      storePresetInMemoryCache(compactPayload.preset_key || presetKey, compactPayload);
     }
 
-    await initializeStudioFromPayload(payload);
+    await initializeStudioFromPayload(compactPayload, isPresetSwitch || isHistoryRestore);
     const tDone = performance.now();
 
     console.table({
       "TOTAL_USER_WAIT_SEC": Number(((tDone - t0) / 1000).toFixed(2)),
-      ...(payload.timings || {}),
+      ...(compactPayload.timings || {}),
     });
 
     if (Object.keys(STATE.brushImages).length === 0) fetchBrushTextures();
@@ -543,7 +672,7 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
     if (!IS_MOBILE) {
       setTimeout(() => {
         if (currentSessionId === STATE.uploadSessionId) {
-          pregenerateSiblingPresetsInBackground(payload.preset_key || presetKey, currentSessionId);
+          pregenerateSiblingPresetsInBackground(compactPayload.preset_key || presetKey, currentSessionId);
         }
       }, 250);
     }
@@ -627,7 +756,6 @@ function unpackEdgesIfNeeded(strokeData) {
       flat[i + 7],
     ];
   }
-  // Free the flat array immediately so we don't keep two copies in RAM
   delete strokeData.edges_flat;
   strokeData.edges = out;
   rebuildEdgeSpatialIndex(strokeData);
@@ -636,12 +764,12 @@ function unpackEdgesIfNeeded(strokeData) {
 
 function buildCleanSubjectFromRawAndTextured(rawImg, texCcImg, payload) {
   const [cw, ch] = payload.canvas_size;
-  const [offX, offY] = payload.offset;
-  const [subW, subH] = payload.subject_size;
-  const bx = Math.max(0, offX);
-  const by = Math.max(0, offY);
-  const bw = Math.min(cw - bx, subW);
-  const bh = Math.min(ch - by, subH);
+  const [bx, by, bw, bh] = payload.full_subject_box || [
+    Math.max(0, payload.offset[0]),
+    Math.max(0, payload.offset[1]),
+    payload.subject_size[0],
+    payload.subject_size[1],
+  ];
 
   const outCanvas = createCanvas(cw, ch);
   if (bw <= 0 || bh <= 0) return outCanvas;
@@ -694,44 +822,455 @@ function buildCleanSubjectFromRawAndTextured(rawImg, texCcImg, payload) {
   return outCanvas;
 }
 
-// Appends extra contour edges in the overscan zone (outside [0..baseW, 0..baseH]) to the END
-// of stroke_data.edges using a tiny 560px scratch canvas (~1 MB) so original strokes never shift!
-function appendOverscanEdgesInBaseSpace(payload, baseW, baseH) {
+// ============================================================================
+// 6A. EXACT 256-BIN LUT + CRISP OIL RELIEF + SEAMLESS EFFECT OVERSCAN
+// ============================================================================
+
+// Computes an exact 256-entry per-channel cumulative histogram LUT from rawImg -> targetImg (~1.5 ms)
+function buildHistogramMatchLUT(rawImg, targetImg, baseW, baseH) {
+  const sw = 240, sh = 240;
+  const c1 = createCanvas(sw, sh);
+  const ctx1 = c1.getContext("2d");
+  ctx1.drawImage(rawImg, 0, 0, baseW, baseH, 0, 0, sw, sh);
+  const d1 = ctx1.getImageData(0, 0, sw, sh).data;
+
+  const c2 = createCanvas(sw, sh);
+  const ctx2 = c2.getContext("2d");
+  ctx2.drawImage(targetImg, 0, 0, baseW, baseH, 0, 0, sw, sh);
+  const d2 = ctx2.getImageData(0, 0, sw, sh).data;
+
+  const hist1R = new Uint32Array(256), hist1G = new Uint32Array(256), hist1B = new Uint32Array(256);
+  const hist2R = new Uint32Array(256), hist2G = new Uint32Array(256), hist2B = new Uint32Array(256);
+  let count = 0;
+
+  for (let i = 0; i < d1.length; i += 4) {
+    if (d1[i + 3] < 220 || d2[i + 3] < 220) continue;
+    hist1R[d1[i]]++; hist1G[d1[i + 1]]++; hist1B[d1[i + 2]]++;
+    hist2R[d2[i]]++; hist2G[d2[i + 1]]++; hist2B[d2[i + 2]]++;
+    count++;
+  }
+
+  const makeChannelLUT = (h1, h2) => {
+    const lut = new Uint8Array(256);
+    if (count < 30) {
+      for (let v = 0; v < 256; v++) lut[v] = v;
+      return lut;
+    }
+    const cdf1 = new Float64Array(256);
+    const cdf2 = new Float64Array(256);
+    let s1 = 0, s2 = 0;
+    for (let v = 0; v < 256; v++) {
+      s1 += h1[v];
+      s2 += h2[v];
+      cdf1[v] = s1 / count;
+      cdf2[v] = s2 / count;
+    }
+    let j = 0;
+    for (let v = 0; v < 256; v++) {
+      const p = cdf1[v];
+      while (j < 255 && cdf2[j] < p) j++;
+      lut[v] = j;
+    }
+    // Light 3-tap smoothing on LUT so quantization never bands
+    const sm = new Uint8Array(256);
+    sm[0] = lut[0];
+    sm[255] = lut[255];
+    for (let v = 1; v < 255; v++) {
+      sm[v] = (lut[v - 1] + lut[v] * 2 + lut[v + 1] + 2) >> 2;
+    }
+    return sm;
+  };
+
+  return {
+    r: makeChannelLUT(hist1R, hist2R),
+    g: makeChannelLUT(hist1G, hist2G),
+    b: makeChannelLUT(hist1B, hist2B),
+  };
+}
+
+function applyRGBLutToCutout(cutoutCanvas, lut) {
+  const w = cutoutCanvas.width, h = cutoutCanvas.height;
+  const outC = createCanvas(w, h);
+  const ctx = outC.getContext("2d");
+  ctx.drawImage(cutoutCanvas, 0, 0);
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const { r: lr, g: lg, b: lb } = lut;
+
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] === 0) continue;
+    d[i] = lr[d[i]];
+    d[i + 1] = lg[d[i + 1]];
+    d[i + 2] = lb[d[i + 2]];
+  }
+  ctx.putImageData(img, 0, 0);
+  return outC;
+}
+
+// Generates a true painterly oil finish (smooth base + zero-mean band-pass oil ridges + subtle directional relief)
+// without shifting shadow or midtone brightness by even 1 level
+function buildOilStyledUncroppedCutout(lutMatchedCutout) {
+  const w = lutMatchedCutout.width, h = lutMatchedCutout.height;
+  const outC = createCanvas(w, h);
+  const ctx = outC.getContext("2d");
+
+  // 1. Fine-feature canvas (1px smooth to remove sensor grain)
+  const fineC = createCanvas(w, h);
+  const fCtx = fineC.getContext("2d");
+  fCtx.filter = "blur(1px)";
+  fCtx.drawImage(lutMatchedCutout, 0, 0);
+  const fineData = fCtx.getImageData(0, 0, w, h).data;
+
+  // 2. Broad painterly base canvas (3.2px smooth for oil brush body)
+  const smoothC = createCanvas(w, h);
+  const sCtx = smoothC.getContext("2d");
+  sCtx.filter = "blur(3.2px)";
+  sCtx.drawImage(lutMatchedCutout, 0, 0);
+  const sImg = sCtx.getImageData(0, 0, w, h);
+  const sData = sImg.data;
+
+  // 3. Original alpha & pixel data so silhouette edges stay 100% crisp
+  const origC = createCanvas(w, h);
+  origC.getContext("2d").drawImage(lutMatchedCutout, 0, 0);
+  const origData = origC.getContext("2d").getImageData(0, 0, w, h).data;
+
+  const ridgeGain = 1.45;
+  const embossGain = 0.35;
+  const stride = w * 4;
+
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * stride;
+    for (let x = 1; x < w - 1; x++) {
+      const p = row + x * 4;
+      const a = origData[p + 3];
+      if (a === 0) {
+        sData[p + 3] = 0;
+        continue;
+      }
+
+      // If near transparent silhouette border, use unblurred LUT color so edge never halos
+      const aL = origData[p - 4 + 3], aR = origData[p + 4 + 3];
+      const aU = origData[p - stride + 3], aD = origData[p + stride + 3];
+      if (aL < 220 || aR < 220 || aU < 220 || aD < 220) {
+        sData[p] = origData[p];
+        sData[p + 1] = origData[p + 1];
+        sData[p + 2] = origData[p + 2];
+        sData[p + 3] = a;
+        continue;
+      }
+
+      // Zero-mean directional emboss + band-pass oil bristle ridge
+      const pNW = p - stride - 4;
+      const pSE = p + stride + 4;
+      const emboss =
+        ((fineData[pSE] - fineData[pNW]) +
+         (fineData[pSE + 1] - fineData[pNW + 1]) +
+         (fineData[pSE + 2] - fineData[pNW + 2])) * 0.333 * embossGain;
+
+      const r = sData[p] + (fineData[p] - sData[p]) * ridgeGain + emboss;
+      const g = sData[p + 1] + (fineData[p + 1] - sData[p + 1]) * ridgeGain + emboss;
+      const b = sData[p + 2] + (fineData[p + 2] - sData[p + 2]) * ridgeGain + emboss;
+
+      sData[p] = r < 0 ? 0 : r > 255 ? 255 : r | 0;
+      sData[p + 1] = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+      sData[p + 2] = b < 0 ? 0 : b > 255 ? 255 : b | 0;
+      sData[p + 3] = a;
+    }
+  }
+
+  ctx.putImageData(sImg, 0, 0);
+  return outC;
+}
+
+function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, baseH, overW, overH, padX, padY) {
   const up = STATE.uncroppedPlacement;
-  if (!up || !up.sourceCanvas || !up.maskCanvas) return;
-  if (up.refSize[0] !== baseW || up.refSize[1] !== baseH) return;
+  const hasUncropped = !!(
+    up &&
+    up.cutoutCanvas &&
+    up.sourceCanvas &&
+    up.refSize &&
+    up.refSize[0] > 0 &&
+    up.refSize[1] > 0
+  );
 
-  const sd = payload.stroke_data;
-  if (!sd || !sd.edges || sd._overscanAppended) return;
-  sd._overscanAppended = true;
+  const [origOffX, origOffY] = origOffset || [0, 0];
+  const [subW, subH] = workPayload.subject_size || [baseW, baseH];
 
-  const [offX, offY] = payload.offset;
-  const pad = 360;
+  // Where the server placed STATE.originalImg (`framedPhotoC`) in Overscan Space:
+  const imgBoxX = padX + origOffX;
+  const imgBoxY = padY + origOffY;
+  const imgBoxW = subW;
+  const imgBoxH = subH;
+
+  // Actual non-clipped bounding box of server images inside [padX, padY, baseW, baseH]:
+  const validX0 = Math.max(padX, imgBoxX);
+  const validY0 = Math.max(padY, imgBoxY);
+  const validX1 = Math.min(padX + baseW, imgBoxX + imgBoxW);
+  const validY1 = Math.min(padY + baseH, imgBoxY + imgBoxH);
+  const validW = Math.max(1, validX1 - validX0);
+  const validH = Math.max(1, validY1 - validY0);
+
+  // Exact mapping of the uncropped subject `up.cutoutCanvas` into Overscan Space:
+  const scaleX = hasUncropped ? imgBoxW / up.refSize[0] : 1;
+  const scaleY = hasUncropped ? imgBoxH / up.refSize[1] : 1;
+  const fullX = hasUncropped ? Math.round(imgBoxX + up.px.x * scaleX) : imgBoxX;
+  const fullY = hasUncropped ? Math.round(imgBoxY + up.px.y * scaleY) : imgBoxY;
+  const fullW = hasUncropped ? Math.round(up.px.w * scaleX) : imgBoxW;
+  const fullH = hasUncropped ? Math.round(up.px.h * scaleY) : imgBoxH;
+
+  workPayload._overscanFullRect = {
+    fullX, fullY, fullW, fullH,
+    serverBoxX: validX0,
+    serverBoxY: validY0,
+    serverBoxW: validW,
+    serverBoxH: validH,
+  };
+
+  const extX0 = Math.max(0, Math.min(validX0, fullX));
+  const extY0 = Math.max(0, Math.min(validY0, fullY));
+  const extX1 = Math.min(overW, Math.max(validX1, fullX + fullW));
+  const extY1 = Math.min(overH, Math.max(validY1, fullY + fullH));
+  workPayload.full_subject_box = [extX0, extY0, Math.max(1, extX1 - extX0), Math.max(1, extY1 - extY0)];
+
+  let ccUncropped = null;
+  let oilUncropped = null;
+  if (hasUncropped && decodedImgs.subject_raw && decodedImgs.subject_cc) {
+    const ccLut = buildHistogramMatchLUT(decodedImgs.subject_raw, decodedImgs.subject_cc, baseW, baseH);
+    ccUncropped = applyRGBLutToCutout(up.cutoutCanvas, ccLut);
+  }
+  if (hasUncropped && decodedImgs.subject_raw && decodedImgs.oil_paint_full) {
+    const oilLut = buildHistogramMatchLUT(decodedImgs.subject_raw, decodedImgs.oil_paint_full, baseW, baseH);
+    const oilToned = applyRGBLutToCutout(up.cutoutCanvas, oilLut);
+    oilUncropped = buildOilStyledUncroppedCutout(oilToned);
+  } else if (ccUncropped) {
+    oilUncropped = buildOilStyledUncroppedCutout(ccUncropped);
+  }
+
+  const liftSubjectLayer = (serverImg, overscanFillCanvas) => {
+    if (!serverImg) return null;
+    const c = createCanvas(overW, overH);
+    const ctx = c.getContext("2d");
+
+    ctx.drawImage(serverImg, padX, padY, baseW, baseH);
+
+    if (overscanFillCanvas && hasUncropped) {
+      // Wide 80px smooth feather at the exact clipped boundaries [validX0, validY0, validX1, validY1]
+      const feather = 80;
+      const trim = 4;
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-out";
+
+      if (fullX < validX0 - 1) {
+        const g = ctx.createLinearGradient(validX0 + trim, 0, validX0 + trim + feather, 0);
+        g.addColorStop(0, "rgba(0,0,0,1)");
+        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, validX0 + trim + feather, overH);
+      }
+      if (fullX + fullW > validX1 + 1) {
+        const rx = validX1 - trim;
+        const g = ctx.createLinearGradient(rx - feather, 0, rx, 0);
+        g.addColorStop(0, "rgba(0,0,0,0)");
+        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
+        g.addColorStop(1, "rgba(0,0,0,1)");
+        ctx.fillStyle = g;
+        ctx.fillRect(rx - feather, 0, overW - (rx - feather), overH);
+      }
+      if (fullY < validY0 - 1) {
+        const g = ctx.createLinearGradient(0, validY0 + trim, 0, validY0 + trim + feather);
+        g.addColorStop(0, "rgba(0,0,0,1)");
+        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, overW, validY0 + trim + feather);
+      }
+      if (fullY + fullH > validY1 + 1) {
+        const by = validY1 - trim;
+        const g = ctx.createLinearGradient(0, by - feather, 0, by);
+        g.addColorStop(0, "rgba(0,0,0,0)");
+        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
+        g.addColorStop(1, "rgba(0,0,0,1)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, by - feather, overW, overH - (by - feather));
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-over";
+      ctx.drawImage(overscanFillCanvas, fullX, fullY, fullW, fullH);
+      ctx.restore();
+    }
+    return c;
+  };
+
+  const out = {};
+  for (const [key, img] of Object.entries(decodedImgs)) {
+    if (!img) continue;
+    if (key === "bg_paper") {
+      out[key] = img;
+    } else if (key === "subject_raw") {
+      out[key] = liftSubjectLayer(img, hasUncropped ? up.cutoutCanvas : null);
+    } else if (key === "subject_cc") {
+      out[key] = liftSubjectLayer(img, ccUncropped || (hasUncropped ? up.cutoutCanvas : null));
+    } else if (key === "oil_paint_full") {
+      out[key] = liftSubjectLayer(img, oilUncropped || ccUncropped || (hasUncropped ? up.cutoutCanvas : null));
+    } else if (key === "edge_curve") {
+      out[key] = liftSubjectLayer(img, ccUncropped || (hasUncropped ? up.cutoutCanvas : null));
+    } else if (key === "blur_bg") {
+      out[key] = buildSeamlessOverscanBlurBg(img, baseW, baseH, overW, overH, padX, padY);
+    } else if (key === "shadow" || key === "colordrop") {
+      out[key] = buildSeamlessOverscanEffectLayer(img, baseW, baseH, overW, overH, padX, padY, key);
+    } else {
+      const c = createCanvas(overW, overH);
+      c.getContext("2d").drawImage(img, padX, padY, baseW, baseH);
+      out[key] = c;
+    }
+  }
+  return out;
+}
+
+function buildSeamlessOverscanBlurBg(blurImg, baseW, baseH, overW, overH, padX, padY) {
+  const rawC = createCanvas(overW, overH);
+  const rCtx = rawC.getContext("2d");
+  const edgeStrip = 4;
+
+  rCtx.drawImage(blurImg, 0, 0, edgeStrip, edgeStrip, 0, 0, padX + 2, padY + 2);
+  rCtx.drawImage(blurImg, baseW - edgeStrip, 0, edgeStrip, edgeStrip, padX + baseW - 2, 0, padX + 2, padY + 2);
+  rCtx.drawImage(blurImg, 0, baseH - edgeStrip, edgeStrip, edgeStrip, 0, padY + baseH - 2, padX + 2, padY + 2);
+  rCtx.drawImage(blurImg, baseW - edgeStrip, baseH - edgeStrip, edgeStrip, edgeStrip, padX + baseW - 2, padY + baseH - 2, padX + 2, padY + 2);
+
+  rCtx.drawImage(blurImg, 0, 0, baseW, edgeStrip, padX, 0, baseW, padY + 2);
+  rCtx.drawImage(blurImg, 0, baseH - edgeStrip, baseW, edgeStrip, padX, padY + baseH - 2, baseW, padY + 2);
+  rCtx.drawImage(blurImg, 0, 0, edgeStrip, baseH, 0, padY, padX + 2, baseH);
+  rCtx.drawImage(blurImg, baseW - edgeStrip, 0, edgeStrip, baseH, padX + baseW - 2, padY, padX + 2, baseH);
+  rCtx.drawImage(blurImg, padX, padY, baseW, baseH);
+
+  const outC = createCanvas(overW, overH);
+  const oCtx = outC.getContext("2d");
+  oCtx.drawImage(rawC, 0, 0);
+  oCtx.save();
+  oCtx.filter = "blur(36px)";
+  oCtx.drawImage(rawC, 0, 0);
+  oCtx.restore();
+
+  oCtx.drawImage(blurImg, padX, padY, baseW, baseH);
+  return outC;
+}
+
+// Seamlessly extends `shadow` and `colordrop` beyond [padX, padY, baseW, baseH] if they touch the frame edges
+function buildSeamlessOverscanEffectLayer(effectImg, baseW, baseH, overW, overH, padX, padY, kind) {
+  const outC = createCanvas(overW, overH);
+  const ctx = outC.getContext("2d");
+
+  const extC = createCanvas(overW, overH);
+  const eCtx = extC.getContext("2d");
+  const reach = kind === "shadow" ? 260 : 190;
+  const strip = kind === "shadow" ? 18 : 96;
+
+  // Left & Right extensions
+  eCtx.save();
+  eCtx.translate(padX + 2, padY);
+  eCtx.scale(-1, 1);
+  eCtx.drawImage(effectImg, 0, 0, strip, baseH, 0, 0, reach, baseH);
+  eCtx.restore();
+
+  eCtx.save();
+  eCtx.translate(padX + baseW - 2 + reach, padY);
+  eCtx.scale(-1, 1);
+  eCtx.drawImage(effectImg, baseW - strip, 0, strip, baseH, 0, 0, reach, baseH);
+  eCtx.restore();
+
+  // Bottom extension
+  eCtx.save();
+  eCtx.translate(padX, padY + baseH - 2 + reach);
+  eCtx.scale(1, -1);
+  eCtx.drawImage(effectImg, 0, baseH - strip, baseW, strip, 0, 0, baseW, reach);
+  eCtx.restore();
+
+  // Soften and fade the extended margins outward from the [padX, padY, baseW, baseH] box
+  const blurredExt = createCanvas(overW, overH);
+  const bCtx = blurredExt.getContext("2d");
+  bCtx.save();
+  bCtx.filter = kind === "shadow" ? "blur(18px)" : "blur(4px)";
+  bCtx.drawImage(extC, 0, 0);
+  bCtx.restore();
+
+  // Fade outer edges of the extension to 0% alpha so it tapers off naturally
+  bCtx.save();
+  bCtx.globalCompositeOperation = "destination-in";
+  // Horizontal fade mask
+  const hMask = createCanvas(overW, overH);
+  const hmCtx = hMask.getContext("2d");
+  const gL = hmCtx.createLinearGradient(Math.max(0, padX - reach), 0, padX, 0);
+  gL.addColorStop(0, "rgba(0,0,0,0)");
+  gL.addColorStop(1, "rgba(0,0,0,1)");
+  hmCtx.fillStyle = gL;
+  hmCtx.fillRect(0, 0, padX, overH);
+
+  hmCtx.fillStyle = "rgba(0,0,0,1)";
+  hmCtx.fillRect(padX, 0, baseW, overH);
+
+  const gR = hmCtx.createLinearGradient(padX + baseW, 0, Math.min(overW, padX + baseW + reach), 0);
+  gR.addColorStop(0, "rgba(0,0,0,1)");
+  gR.addColorStop(1, "rgba(0,0,0,0)");
+  hmCtx.fillStyle = gR;
+  hmCtx.fillRect(padX + baseW, 0, overW - (padX + baseW), overH);
+
+  // Vertical bottom fade mask
+  const gB = hmCtx.createLinearGradient(0, padY + baseH, 0, Math.min(overH, padY + baseH + reach));
+  gB.addColorStop(0, "rgba(0,0,0,1)");
+  gB.addColorStop(1, "rgba(0,0,0,0)");
+  hmCtx.globalCompositeOperation = "destination-in";
+  const vMask = createCanvas(overW, overH);
+  const vmCtx = vMask.getContext("2d");
+  vmCtx.fillStyle = "rgba(0,0,0,1)";
+  vmCtx.fillRect(0, 0, overW, padY + baseH);
+  vmCtx.fillStyle = gB;
+  vmCtx.fillRect(0, padY + baseH, overW, overH - (padY + baseH));
+  hmCtx.drawImage(vMask, 0, 0);
+
+  bCtx.drawImage(hMask, 0, 0);
+  bCtx.restore();
+
+  // Clear interior of blurredExt so original [padX, padY, baseW, baseH] stays 100% untouched
+  bCtx.clearRect(padX + 2, padY + 2, baseW - 4, baseH - 4);
+
+  ctx.drawImage(blurredExt, 0, 0);
+  ctx.drawImage(effectImg, padX, padY, baseW, baseH);
+  return outC;
+}
+
+function appendOverscanEdges(workPayload, overW, overH) {
+  const up = STATE.uncroppedPlacement;
+  const rect = workPayload._overscanFullRect;
+  if (!up || !up.sourceCanvas || !up.maskCanvas || !rect) return;
+
+  const sd = workPayload.stroke_data;
+  if (!sd || !sd.edges) return;
+
+  const { fullX, fullY, fullW, fullH, serverBoxX, serverBoxY, serverBoxW, serverBoxH } = rect;
+  const [offX, offY] = workPayload.offset;
   const scaleDown = 4;
-  const gw = Math.round((baseW + pad * 2) / scaleDown);
-  const gh = Math.round((baseH + pad * 2) / scaleDown);
-
-  const fullX = (pad + up.px.x) / scaleDown;
-  const fullY = (pad + up.px.y) / scaleDown;
-  const fullW = up.px.w / scaleDown;
-  const fullH = up.px.h / scaleDown;
+  const gw = Math.round(overW / scaleDown);
+  const gh = Math.round(overH / scaleDown);
 
   const mC = createCanvas(gw, gh);
   const mCtx = mC.getContext("2d");
   mCtx.fillStyle = "#000";
   mCtx.fillRect(0, 0, gw, gh);
-  mCtx.drawImage(up.maskCanvas, fullX, fullY, fullW, fullH);
+  mCtx.drawImage(up.maskCanvas, fullX / scaleDown, fullY / scaleDown, fullW / scaleDown, fullH / scaleDown);
   const mData = mCtx.getImageData(0, 0, gw, gh).data;
 
   const pC = createCanvas(gw, gh);
   const pCtx = pC.getContext("2d");
-  pCtx.drawImage(up.sourceCanvas, fullX, fullY, fullW, fullH);
+  pCtx.drawImage(up.sourceCanvas, fullX / scaleDown, fullY / scaleDown, fullW / scaleDown, fullH / scaleDown);
   const pData = pCtx.getImageData(0, 0, gw, gh).data;
 
-  const ix0 = Math.floor(pad / scaleDown);
-  const ix1 = Math.ceil((pad + baseW) / scaleDown);
-  const iy0 = Math.floor(pad / scaleDown);
-  const iy1 = Math.ceil((pad + baseH) / scaleDown);
+  const ix0 = Math.floor(serverBoxX / scaleDown);
+  const ix1 = Math.ceil((serverBoxX + serverBoxW) / scaleDown);
+  const iy0 = Math.floor(serverBoxY / scaleDown);
+  const iy1 = Math.ceil((serverBoxY + serverBoxH) / scaleDown);
 
   for (let y = 2; y < gh - 2; y++) {
     for (let x = 2; x < gw - 2; x++) {
@@ -750,16 +1289,20 @@ function appendOverscanEdgesInBaseSpace(payload, baseW, baseH) {
       const nx = -gx / len;
       const ny = -gy / len;
 
-      const baseX = x * scaleDown - pad;
-      const baseY = y * scaleDown - pad;
-      sd.edges.push([baseX - offX, baseY - offY, nx, ny, pData[idx], pData[idx + 1], pData[idx + 2], 1]);
+      const canvasX = x * scaleDown;
+      const canvasY = y * scaleDown;
+      sd.edges.push([canvasX - offX, canvasY - offY, nx, ny, pData[idx], pData[idx + 1], pData[idx + 2], 1]);
     }
   }
 }
 
-async function initializeStudioFromPayload(payload) {
+async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false) {
   cancelPendingSchedules();
-  History.clear();
+  if (!isPresetSwitch) {
+    History.clear();
+    STATE.subjectTransform = { dx: 0, dy: 0, scale: 1.0 };
+  }
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   invalidateStack();
   _sampleCache.clear();
   _ellipseGeomCache.clear();
@@ -767,68 +1310,108 @@ async function initializeStudioFromPayload(payload) {
   STATE.edgeCurveCache = null;
   STATE.glowCache = null;
   destroyGLEdgeCurveResources();
-  // Release temporary blur buffers
   _blurTmpA = new Float32Array(0);
   _colSumA = new Float32Array(0);
 
-  unpackEdgesIfNeeded(payload.stroke_data);
-  const [baseW, baseH] = payload.canvas_size;
-  payload.base_canvas_size = [baseW, baseH];
-  STATE.payload = payload;
+  const compact = compactifyPayloadForCache(sourcePayload);
+  const [baseW, baseH] = compact.canvas_size;
+  const padX = OVERSCAN_PAD_X;
+  const padY = OVERSCAN_PAD_Y;
+  const overW = baseW + padX * 2;
+  const overH = baseH + padY * 2;
+
+  const workPayload = {
+    preset_key: compact.preset_key,
+    base_canvas_size: [baseW, baseH],
+    pad: [padX, padY],
+    canvas_size: [overW, overH],
+    offset: [compact.offset[0] + padX, compact.offset[1] + padY],
+    subject_size: [...compact.subject_size],
+    preset_settings: { ...compact.preset_settings },
+    average_color: compact.average_color ? [...compact.average_color] : null,
+    dominant_color: compact.dominant_color ? [...compact.dominant_color] : null,
+    elapsed_sec: compact.elapsed_sec,
+    stroke_data: {
+      edges: compact.stroke_data.edges.map((e) => [...e]),
+      accent_candidates: compact.stroke_data.accent_candidates.map((c) => ({
+        ...c,
+        x: c.x + padX,
+        y: c.y + padY,
+        color: [...c.color],
+      })),
+      accent_spots: compact.stroke_data.accent_spots.map((s) => ({
+        ...s,
+        x: s.x + padX,
+        y: s.y + padY,
+        color: [...s.color],
+      })),
+    },
+  };
+
+  STATE.payload = workPayload;
 
   document.getElementById("emptyState").classList.add("hidden");
   canvasContainer.classList.remove("hidden");
   document.getElementById("maskModeBtn").disabled = false;
+  const moveSubBtn = document.getElementById("moveSubjectToolBtn");
+  if (moveSubBtn) moveSubBtn.disabled = false;
+  if (typeof syncMoveSubjectUI === "function") syncMoveSubjectUI();
   document.getElementById("exportPngBtn").disabled = false;
   document.getElementById("exportJpgBtn").disabled = false;
   document.getElementById("resetLayerBtn").disabled = false;
-  document.getElementById("renderTimeBadge").textContent = `⚡ ${payload.elapsed_sec}s`;
+  document.getElementById("renderTimeBadge").textContent = `⚡ ${compact.elapsed_sec}s`;
 
-  if (payload.average_color) {
-    const hex = rgbToHex(...payload.average_color);
+  if (compact.average_color) {
+    const hex = rgbToHex(...compact.average_color);
     const sw = document.getElementById("avgColorSwatch");
     sw.style.background = hex; sw.dataset.color = hex;
   }
-  if (payload.dominant_color) {
-    const hex = rgbToHex(...payload.dominant_color);
+  if (compact.dominant_color) {
+    const hex = rgbToHex(...compact.dominant_color);
     const sw = document.getElementById("domColorSwatch");
     sw.style.background = hex; sw.dataset.color = hex;
   }
 
-  if (payload.mask_png) {
-    const maskImg = await loadImage(payload.mask_png);
-    delete payload.mask_png;
+  if (compact.maskBlob) {
+    const maskImg = await loadImage(compact.maskBlob);
     STATE.maskCanvas = createCanvas(maskImg.width, maskImg.height);
     STATE.maskCanvas.getContext("2d", { willReadFrequently: true }).drawImage(maskImg, 0, 0);
     markMaskOverlayDirty();
   }
 
-  const rawImgs = {};
-  if (payload.layers) {
-    const entries = Object.entries(payload.layers);
-    for (const [key, b64] of entries) {
-      if (b64) {
-        rawImgs[key] = await loadImage(b64);
-        delete payload.layers[key]; // Free multi-MB base64 strings immediately!
-      }
+  const decodedImgs = {};
+  if (compact.layerBlobs) {
+    for (const [key, blob] of Object.entries(compact.layerBlobs)) {
+      if (blob) decodedImgs[key] = await loadImage(blob);
     }
-    delete payload.layers;
   }
 
-  const cfg = payload.preset_settings;
+const rawImgs = buildOverscanServerImages(
+    decodedImgs,
+    workPayload,
+    compact.offset,
+    baseW,
+    baseH,
+    overW,
+    overH,
+    padX,
+    padY
+  );
+  
+  const cfg = workPayload.preset_settings;
   if (cfg.WATERCOLOR_TEXTURE_ENABLED && !rawImgs.subject_tex && rawImgs.subject_cc && rawImgs.subject_raw) {
     rawImgs.subject_tex = rawImgs.subject_cc;
-    rawImgs.subject_cc = buildCleanSubjectFromRawAndTextured(rawImgs.subject_raw, rawImgs.subject_tex, payload);
+    rawImgs.subject_cc = buildCleanSubjectFromRawAndTextured(rawImgs.subject_raw, rawImgs.subject_tex, workPayload);
   }
 
-  appendOverscanEdgesInBaseSpace(payload, baseW, baseH);
-  rebuildEdgeSpatialIndex(payload.stroke_data);
+  appendOverscanEdges(workPayload, overW, overH);
+  rebuildEdgeSpatialIndex(workPayload.stroke_data);
 
   STATE.serverImages = rawImgs;
-  STATE.viewRect = computeViewRectInBaseSpace(STATE.aspectRatioKey, STATE.aspectOrientation);
-  displayCanvas.width = STATE.viewRect.w;
-  displayCanvas.height = STATE.viewRect.h;
+  STATE.viewRect = computeViewRectInOverscanSpace(STATE.aspectRatioKey, STATE.aspectOrientation);
+  resizeDisplayCanvasKeepViewportPosition(STATE.viewRect.w, STATE.viewRect.h);
 
+  const savedEdits = STATE.presetUserEdits.get(compact.preset_key);
   STATE.layers = {};
 
   for (const def of LAYER_DEFINITIONS) {
@@ -846,10 +1429,15 @@ async function initializeStudioFromPayload(payload) {
       enabled = cfg[enKey] !== undefined ? !!cfg[enKey] : true;
     }
 
-    // Only allocate baseCanvas when needed (static layers & hidden layers allocate 0 canvases!)
+    const defaultParams = buildInitialLayerParams(def, cfg);
+    if (savedEdits && savedEdits[def.id]) {
+      enabled = savedEdits[def.id].vis;
+      Object.assign(defaultParams, savedEdits[def.id].params);
+    }
+
     let baseCanvas = null;
     if (enabled && ["edge_curve", "oil_paint", "glow"].includes(def.id)) {
-      baseCanvas = createCanvas(baseW, baseH);
+      baseCanvas = createCanvas(overW, overH);
     }
 
     STATE.layers[def.id] = {
@@ -857,18 +1445,16 @@ async function initializeStudioFromPayload(payload) {
       vis: enabled,
       origImage: rawImgs[def.id] || null,
       baseCanvas,
-      isViewportSpace: false,
       cachedStrokes: null,
       strokesDirty: true,
       paintCanvas: null,
       eraseCanvas: null,
-      params: buildInitialLayerParams(def, cfg),
+      params: defaultParams,
     };
   }
 
   await loadCachedBrushes();
 
-  // Precompute deterministic stroke lists & render ONLY visible layers
   for (const def of LAYER_DEFINITIONS) {
     if (
       ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(
@@ -889,14 +1475,13 @@ async function initializeStudioFromPayload(payload) {
     rerenderLiveGlowLayer(true);
   }
 
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   invalidateStack();
   renderLayerListUI();
   selectLayer(STATE.selectedLayerId || "bg_brush");
-  fitCanvasToViewport();
   compositeAllLayers();
 }
 
-// Frees ~35MB of temporary CPU upload buffers after WebGL textures are created for edge_curve
 function freeEdgeCurveCpuUploadBuffers() {
   if (typeof _glEC !== "undefined" && _glEC && STATE.edgeCurveCache && _glEC.uploadedCache === STATE.edgeCurveCache) {
     STATE.edgeCurveCache.smoothRgba = null;

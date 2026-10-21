@@ -25,6 +25,11 @@ const Workflow = (() => {
     maskEditMode: false,
     maskPaintKeep: true,
     maskBrushSize: 48,
+    maskViewZoom: 1.0,
+    maskViewPanX: 0,
+    maskViewPanY: 0,
+    isPanningMaskView: false,
+    spacePressed: false,
     isDragging: false,
     lastMaskPt: null,
     dragStart: { x: 0, y: 0, dxPct: 0, dyPct: 0 },
@@ -402,6 +407,20 @@ const Workflow = (() => {
     if (yVal) yVal.textContent = `${Math.round(CROP.dyPct)}%`;
   }
 
+  function clampMaskViewPan(cvW, cvH) {
+    const z = CROP.maskViewZoom || 1.0;
+    if (z <= 1.001) {
+      CROP.maskViewZoom = 1.0;
+      CROP.maskViewPanX = 0;
+      CROP.maskViewPanY = 0;
+      return;
+    }
+    const minX = cvW - cvW * z;
+    const minY = cvH - cvH * z;
+    CROP.maskViewPanX = Math.max(minX, Math.min(0, CROP.maskViewPanX));
+    CROP.maskViewPanY = Math.max(minY, Math.min(0, CROP.maskViewPanY));
+  }
+
   function renderCropPreview() {
     if (!CROP.analysis || CROP.analysis.empty) return;
     const F = window.WatercolorFraming;
@@ -412,15 +431,20 @@ const Workflow = (() => {
     const cm = getTargetCanvasCm();
     const profileKey = getActiveProfileKey();
     const stageEl = document.getElementById("cropStage");
-    const availW = stageEl && stageEl.clientWidth > 100 ? stageEl.clientWidth - 380 : 520;
-    const availH = stageEl && stageEl.clientHeight > 100 ? stageEl.clientHeight - 80 : 520;
-    const maxW = Math.max(280, Math.min(560, availW));
-    const maxH = Math.max(300, Math.min(540, availH));
-    const k = Math.max(1.5, Math.min(maxW / cm.width, maxH / cm.height));
+    const isNarrow = window.innerWidth <= 960;
+    const availW = stageEl && stageEl.clientWidth > 100 ? (isNarrow ? stageEl.clientWidth - 32 : stageEl.clientWidth - 380) : 520;
+    const availH = stageEl && stageEl.clientHeight > 100 ? (isNarrow ? stageEl.clientHeight * 0.48 : stageEl.clientHeight - 80) : 520;
+    const maxW = Math.max(240, Math.min(580, availW));
+    const maxH = Math.max(240, Math.min(560, availH));
+    // Never force a minimum k that exceeds maxW or maxH so wide/tall 16:9 ratios stay 100% proportional
+    const k = Math.min(maxW / cm.width, maxH / cm.height);
 
-    cv.width = Math.round(cm.width * k);
-    cv.height = Math.round(cm.height * k);
-    cv.style.cursor = CROP.maskEditMode ? "none" : "grab";
+    cv.width = Math.max(120, Math.round(cm.width * k));
+    cv.height = Math.max(120, Math.round(cm.height * k));
+    cv.style.width = `${cv.width}px`;
+    cv.style.height = `${cv.height}px`;
+    clampMaskViewPan(cv.width, cv.height);
+    cv.style.cursor = CROP.maskEditMode ? (CROP.spacePressed || CROP.isPanningMaskView ? "grab" : "none") : "grab";
 
     const presetKey = document.getElementById("presetSelect").value;
     const isDarkBg = presetKey.endsWith("_black");
@@ -441,8 +465,12 @@ const Workflow = (() => {
     const r = fr.rectUnits;
 
     g.save();
+    if (CROP.maskEditMode && CROP.maskViewZoom > 1.0) {
+      g.translate(CROP.maskViewPanX, CROP.maskViewPanY);
+      g.scale(CROP.maskViewZoom, CROP.maskViewZoom);
+    }
+
     if (CROP.maskEditMode) {
-      // Full original photo + 50% black tint over removed areas
       g.drawImage(CROP.sourceCanvas, px(r.x), px(r.y), px(r.w), px(r.h));
       if (CROP.maskTintCanvas) {
         g.globalAlpha = 0.5;
@@ -494,7 +522,8 @@ const Workflow = (() => {
     const badge = document.getElementById("cropInfoBadge");
     if (badge) {
       if (CROP.maskEditMode) {
-        badge.textContent = `✂️ Mask Brush (${CROP.maskPaintKeep ? "➕ Keep" : "➖ Remove"}) · Paint on canvas`;
+        const zTxt = Math.round(CROP.maskViewZoom * 100);
+        badge.textContent = `✂️ Mask Brush (${CROP.maskPaintKeep ? "➕ Keep" : "➖ Remove"}) · View ${zTxt}% (Wheel to zoom${zTxt > 100 ? ", Space+Drag to pan" : ""})`;
       } else if (fr.mode === "bleed") {
         const eyeCount = (fr.eyes || []).length;
         const subInfo = CROP.analysis.subjects && CROP.analysis.subjects.faces > 1
@@ -507,24 +536,28 @@ const Workflow = (() => {
     }
   }
 
-  // Returns screen-space brush diameter when hovering over #cropPreviewCanvas in maskEditMode
   function getCropMaskCursorDiameter(clientX, clientY) {
-    if (currentStep !== "crop" || !CROP.maskEditMode) return 0;
+    if (currentStep !== "crop" || !CROP.maskEditMode || CROP.spacePressed || CROP.isPanningMaskView) return 0;
     const cv = document.getElementById("cropPreviewCanvas");
     if (!cv) return 0;
     const rect = cv.getBoundingClientRect();
     if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
       return 0;
     }
-    return CROP.maskBrushSize * (rect.width / Math.max(1, cv.width));
+    return CROP.maskBrushSize * (rect.width / Math.max(1, cv.width)) * (CROP.maskViewZoom || 1.0);
   }
 
   function paintCropMaskAtClientPoint(clientX, clientY) {
     const cv = document.getElementById("cropPreviewCanvas");
     if (!cv || !CROP.lastFraming || !CROP.maskCanvas) return;
     const rect = cv.getBoundingClientRect();
-    const cx = (clientX - rect.left) * (cv.width / Math.max(1, rect.width));
-    const cy = (clientY - rect.top) * (cv.height / Math.max(1, rect.height));
+    const rawCx = (clientX - rect.left) * (cv.width / Math.max(1, rect.width));
+    const rawCy = (clientY - rect.top) * (cv.height / Math.max(1, rect.height));
+
+    // Map inverse of maskViewZoom & maskViewPan so zoomed-in painting hits the exact pixel under cursor
+    const z = CROP.maskViewZoom || 1.0;
+    const cx = (rawCx - (CROP.maskViewPanX || 0)) / z;
+    const cy = (rawCy - (CROP.maskViewPanY || 0)) / z;
 
     const r = CROP.lastFraming.rect;
     const subX = r.x * cv.width;
@@ -543,7 +576,6 @@ const Workflow = (() => {
     const py = hasPrev ? CROP.lastMaskPt.y : my;
     const keep = CROP.maskPaintKeep;
 
-    // Record pre-stroke 128px tiles for Undo/Redo
     History.touch(
       CROP.maskCanvas,
       Math.min(px, mx) - radius - 2,
@@ -567,7 +599,6 @@ const Workflow = (() => {
       ctx.fill();
     };
 
-    // 1. Update grayscale maskCanvas (White = Keep, Black = Remove)
     const mCtx = CROP.maskCanvas.getContext("2d");
     mCtx.save();
     mCtx.globalCompositeOperation = "source-over";
@@ -575,7 +606,6 @@ const Workflow = (() => {
     drawStroke(mCtx);
     mCtx.restore();
 
-    // 2. Update maskTintCanvas (Keep = erase tint via destination-out; Remove = paint solid black tint)
     if (CROP.maskTintCanvas) {
       const tCtx = CROP.maskTintCanvas.getContext("2d");
       tCtx.save();
@@ -659,6 +689,7 @@ const Workflow = (() => {
       await window.SubjectVision.releaseMemory();
     }
 
+    STATE.hasViewportPosition = false;
     goTo("studio");
     await runModalGeneration(false, false);
   }
@@ -673,6 +704,9 @@ const Workflow = (() => {
     }
     if (sub) sub.classList.toggle("hidden", !CROP.maskEditMode);
     if (!CROP.maskEditMode) {
+      CROP.maskViewZoom = 1.0;
+      CROP.maskViewPanX = 0;
+      CROP.maskViewPanY = 0;
       brushCursor.classList.add("hidden");
       if (CROP.maskCanvas) {
         rebuildCutoutAndTintFromMaskCanvas();
@@ -767,9 +801,47 @@ const Workflow = (() => {
       genBtn.addEventListener("click", confirmCropAndGenerate);
     }
 
+    window.addEventListener("keydown", (e) => {
+      if (e.code === "Space" && currentStep === "crop" && CROP.maskEditMode && !CROP.spacePressed) {
+        CROP.spacePressed = true;
+        brushCursor.classList.add("hidden");
+        renderCropPreview();
+      }
+    });
+    window.addEventListener("keyup", (e) => {
+      if (e.code === "Space" && CROP.spacePressed) {
+        CROP.spacePressed = false;
+        renderCropPreview();
+      }
+    });
+
     if (cv) {
+      cv.addEventListener("contextmenu", (e) => {
+        if (CROP.maskEditMode) e.preventDefault();
+      });
+
       cv.addEventListener("wheel", (e) => {
         e.preventDefault();
+        // While editing the cutout mask, mouse wheel zooms the USER VIEW (not the subject!)
+        if (CROP.maskEditMode) {
+          const rect = cv.getBoundingClientRect();
+          const mx = (e.clientX - rect.left) * (cv.width / Math.max(1, rect.width));
+          const my = (e.clientY - rect.top) * (cv.height / Math.max(1, rect.height));
+          const oldZ = CROP.maskViewZoom || 1.0;
+          const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
+          const newZ = Math.max(1.0, Math.min(6.0, oldZ * factor));
+
+          const worldX = (mx - CROP.maskViewPanX) / oldZ;
+          const worldY = (my - CROP.maskViewPanY) / oldZ;
+          CROP.maskViewZoom = newZ;
+          CROP.maskViewPanX = mx - worldX * newZ;
+          CROP.maskViewPanY = my - worldY * newZ;
+          clampMaskViewPan(cv.width, cv.height);
+          renderCropPreview();
+          if (typeof updateCursorPosition === "function") updateCursorPosition(e.clientX, e.clientY);
+          return;
+        }
+
         const delta = e.deltaY < 0 ? 2 : -2;
         CROP.zoomPct = Math.max(65, Math.min(145, CROP.zoomPct + delta));
         syncCropSlidersUI();
@@ -780,6 +852,18 @@ const Workflow = (() => {
         CROP.isDragging = true;
         try { cv.setPointerCapture(e.pointerId); } catch (_) {}
         if (CROP.maskEditMode) {
+          // Space+drag, middle-click, or right-click pans the zoomed mask view
+          if (CROP.spacePressed || e.button === 1 || e.button === 2) {
+            CROP.isPanningMaskView = true;
+            CROP.dragStart = {
+              x: e.clientX,
+              y: e.clientY,
+              panX: CROP.maskViewPanX,
+              panY: CROP.maskViewPanY,
+            };
+            return;
+          }
+          CROP.isPanningMaskView = false;
           CROP.lastMaskPt = null;
           History.beginStroke("crop_mask", null);
           paintCropMaskAtClientPoint(e.clientX, e.clientY);
@@ -790,11 +874,20 @@ const Workflow = (() => {
 
       cv.addEventListener("pointermove", (e) => {
         if (!CROP.isDragging) return;
+        const rect = cv.getBoundingClientRect();
         if (CROP.maskEditMode) {
+          if (CROP.isPanningMaskView) {
+            const scaleX = cv.width / Math.max(1, rect.width);
+            const scaleY = cv.height / Math.max(1, rect.height);
+            CROP.maskViewPanX = CROP.dragStart.panX + (e.clientX - CROP.dragStart.x) * scaleX;
+            CROP.maskViewPanY = CROP.dragStart.panY + (e.clientY - CROP.dragStart.y) * scaleY;
+            clampMaskViewPan(cv.width, cv.height);
+            renderCropPreview();
+            return;
+          }
           paintCropMaskAtClientPoint(e.clientX, e.clientY);
           return;
         }
-        const rect = cv.getBoundingClientRect();
         const dX = ((e.clientX - CROP.dragStart.x) / Math.max(1, rect.width)) * 100;
         const dY = ((e.clientY - CROP.dragStart.y) / Math.max(1, rect.height)) * 100;
         CROP.dxPct = Math.max(-35, Math.min(35, CROP.dragStart.dxPct + dX));
@@ -804,12 +897,13 @@ const Workflow = (() => {
       });
 
       const stopDrag = () => {
-        if (CROP.isDragging && CROP.maskEditMode) {
+        if (CROP.isDragging && CROP.maskEditMode && !CROP.isPanningMaskView) {
           CROP.lastMaskPt = null;
           History.endStroke();
           rebuildCutoutAndTintFromMaskCanvas();
           renderCropPreview();
         }
+        CROP.isPanningMaskView = false;
         CROP.isDragging = false;
       };
       cv.addEventListener("pointerup", stopDrag);
@@ -822,7 +916,7 @@ const Workflow = (() => {
           const dx = e.touches[0].clientX - e.touches[1].clientX;
           const dy = e.touches[0].clientY - e.touches[1].clientY;
           CROP.pinchStartDist = Math.hypot(dx, dy);
-          CROP.pinchStartZoom = CROP.zoomPct;
+          CROP.pinchStartZoom = CROP.maskEditMode ? CROP.maskViewZoom : CROP.zoomPct;
         }
       }, { passive: true });
 
@@ -832,8 +926,13 @@ const Workflow = (() => {
           const dx = e.touches[0].clientX - e.touches[1].clientX;
           const dy = e.touches[0].clientY - e.touches[1].clientY;
           const scale = Math.hypot(dx, dy) / Math.max(1, CROP.pinchStartDist);
-          CROP.zoomPct = Math.max(65, Math.min(145, CROP.pinchStartZoom * scale));
-          syncCropSlidersUI();
+          if (CROP.maskEditMode) {
+            CROP.maskViewZoom = Math.max(1.0, Math.min(6.0, CROP.pinchStartZoom * scale));
+            clampMaskViewPan(cv.width, cv.height);
+          } else {
+            CROP.zoomPct = Math.max(65, Math.min(145, CROP.pinchStartZoom * scale));
+            syncCropSlidersUI();
+          }
           renderCropPreview();
         }
       }, { passive: false });
@@ -842,9 +941,15 @@ const Workflow = (() => {
     }
   }
 
+  let _lastProfileCategory = null;
+
   function onPresetChangedInUI() {
     const profKey = getActiveProfileKey();
-    STATE.aspectOrientation = profKey === "car" ? "landscape" : "portrait";
+    const newCat = profKey === "car" ? "car" : "portrait";
+    if (_lastProfileCategory !== newCat || !STATE.aspectOrientation) {
+      STATE.aspectOrientation = newCat === "car" ? "landscape" : "portrait";
+    }
+    _lastProfileCategory = newCat;
     syncOrientationButtonsUI();
 
     if (currentStep === "crop" && CROP.maskArr) {

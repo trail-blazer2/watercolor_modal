@@ -121,6 +121,55 @@ function bindUIEvents() {
     if (STATE.payload) fitCanvasToViewport();
   });
 
+  const subXSlider = document.getElementById("subMoveXSlider");
+  const subYSlider = document.getElementById("subMoveYSlider");
+  const subScaleSlider = document.getElementById("subMoveScaleSlider");
+  const resetSubMoveBtn = document.getElementById("resetSubjectMoveBtn");
+
+  if (subXSlider) {
+    subXSlider.addEventListener("input", () => {
+      if (History.transformBegin) History.transformBegin();
+      STATE.subjectTransform.dx = Number(subXSlider.value);
+      syncMoveSubjectUI();
+      scheduleSubjectMoveUpdate();
+    });
+    subXSlider.addEventListener("change", () => {
+      if (History.transformCommit) History.transformCommit();
+    });
+  }
+  if (subYSlider) {
+    subYSlider.addEventListener("input", () => {
+      if (History.transformBegin) History.transformBegin();
+      STATE.subjectTransform.dy = Number(subYSlider.value);
+      syncMoveSubjectUI();
+      scheduleSubjectMoveUpdate();
+    });
+    subYSlider.addEventListener("change", () => {
+      if (History.transformCommit) History.transformCommit();
+    });
+  }
+  if (subScaleSlider) {
+    subScaleSlider.addEventListener("input", () => {
+      if (History.transformBegin) History.transformBegin();
+      STATE.subjectTransform.scale = Number(subScaleSlider.value) / 100;
+      syncMoveSubjectUI();
+      scheduleSubjectMoveUpdate();
+    });
+    subScaleSlider.addEventListener("change", () => {
+      if (History.transformCommit) History.transformCommit();
+    });
+  }
+  if (resetSubMoveBtn) {
+    resetSubMoveBtn.addEventListener("click", () => {
+      if (History.transformBegin) History.transformBegin();
+      STATE.subjectTransform = { dx: 0, dy: 0, scale: 1.0 };
+      syncMoveSubjectUI();
+      scheduleSubjectMoveUpdate();
+      if (History.transformCommit) History.transformCommit();
+    });
+  }
+
+
   History.bindUI();
   setupCanvasInteractions();
 }
@@ -447,6 +496,29 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
 
   winRow.appendChild(subPanel);
   container.appendChild(winRow);
+
+  const moveRow = document.createElement("div");
+  moveRow.className = "control-row";
+  const moveLbl = document.createElement("label");
+  moveLbl.innerHTML = `<span>Reposition Subject & Surrounding Brushes</span>`;
+  moveRow.appendChild(moveLbl);
+
+  const moveToggleBtn = document.createElement("button");
+  moveToggleBtn.id = "inspectorMoveSubBtn";
+  const syncMoveBtn = () => {
+    const active = STATE.activeTool === "move_subject";
+    moveToggleBtn.className = active ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+    moveToggleBtn.textContent = active
+      ? "✅ Moving Subject & Brushes (Click to Lock)"
+      : "✥ Move Subject & Brushes: OFF";
+  };
+  syncMoveBtn();
+  moveToggleBtn.addEventListener("click", () => {
+    setActiveTool(STATE.activeTool === "move_subject" ? "pan" : "move_subject");
+    syncMoveBtn();
+  });
+  moveRow.appendChild(moveToggleBtn);
+  container.appendChild(moveRow);
 }
 
 function addGlowColorModeControls(container, p) {
@@ -640,12 +712,46 @@ function resetLayerToOriginal(layerId) {
 // ============================================================================
 // 10. DESKTOP MOUSE & MOBILE TOUCH / PINCH-ZOOM INTERACTIONS
 // ============================================================================
+function syncMoveSubjectUI() {
+  const st = STATE.subjectTransform || { dx: 0, dy: 0, scale: 1.0 };
+  const xS = document.getElementById("subMoveXSlider");
+  const yS = document.getElementById("subMoveYSlider");
+  const sS = document.getElementById("subMoveScaleSlider");
+  const xV = document.getElementById("subMoveXVal");
+  const yV = document.getElementById("subMoveYVal");
+  const sV = document.getElementById("subMoveScaleVal");
+
+  if (xS) xS.value = Math.round(st.dx);
+  if (yS) yS.value = Math.round(st.dy);
+  if (sS) sS.value = Math.round(st.scale * 100);
+  if (xV) xV.textContent = Math.round(st.dx);
+  if (yV) yV.textContent = Math.round(st.dy);
+  if (sV) sV.textContent = Math.round(st.scale * 100);
+
+  const inspBtn = document.getElementById("inspectorMoveSubBtn");
+  if (inspBtn) {
+    const active = STATE.activeTool === "move_subject";
+    inspBtn.className = active ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+    inspBtn.textContent = active
+      ? "✅ Moving Subject & Brushes (Click to Lock)"
+      : "✥ Move Subject & Brushes: OFF";
+  }
+}
+
 function setActiveTool(tool) {
+  // Clicking "Move Subject" again toggles it off back to Pan
+  if (tool === "move_subject" && STATE.activeTool === "move_subject") {
+    tool = "pan";
+  }
   STATE.activeTool = tool;
   document.querySelectorAll(".tool-btn").forEach((b) => {
     b.classList.toggle("active", b.dataset.tool === tool);
   });
   document.getElementById("maskEditControls").classList.toggle("hidden", tool !== "mask");
+  const moveSubCtrl = document.getElementById("moveSubjectControls");
+  if (moveSubCtrl) moveSubCtrl.classList.toggle("hidden", tool !== "move_subject");
+  viewport.style.cursor = tool === "move_subject" ? "move" : "default";
+  syncMoveSubjectUI();
   updateCursorPreview();
   compositeAllLayers();
 }
@@ -661,9 +767,30 @@ function setupCanvasInteractions() {
     closeMobileSheets();
   });
 
+  let _wheelTransformTimer = 0;
+
   viewport.addEventListener("wheel", (e) => {
     e.preventDefault();
     if (!STATE.payload) return;
+
+    // When "Move Subject" is active, mouse wheel scales the subject + surrounding brushes!
+    if (STATE.activeTool === "move_subject" && !e.ctrlKey && !e.altKey) {
+      if (History.transformBegin) History.transformBegin();
+      const step = e.deltaY < 0 ? 0.02 : -0.02;
+      STATE.subjectTransform.scale = Math.max(
+        0.65,
+        Math.min(1.35, Number((STATE.subjectTransform.scale + step).toFixed(3)))
+      );
+      syncMoveSubjectUI();
+      scheduleSubjectMoveUpdate();
+
+      clearTimeout(_wheelTransformTimer);
+      _wheelTransformTimer = setTimeout(() => {
+        if (History.transformCommit) History.transformCommit();
+      }, 220);
+      return;
+    }
+
     const factor = e.deltaY < 0 ? 1.12 : 0.89;
     setZoom(STATE.zoom * factor, e.clientX, e.clientY);
   }, { passive: false });
@@ -673,11 +800,15 @@ function setupCanvasInteractions() {
     if (isPickingColor) {
       pickColorFromCanvas(e.clientX, e.clientY);
       isPickingColor = false;
-      viewport.style.cursor = "default";
+      viewport.style.cursor = STATE.activeTool === "move_subject" ? "move" : "default";
       return;
     }
     STATE.isDragging = true;
     STATE.lastMouse = { x: e.clientX, y: e.clientY };
+    if (STATE.activeTool === "move_subject") {
+      if (History.transformBegin) History.transformBegin();
+      return;
+    }
     if (["brush", "eraser", "mask"].includes(STATE.activeTool)) {
       beginEditStroke();
       applyManualStrokeAtPoint(e.clientX, e.clientY);
@@ -692,6 +823,13 @@ function setupCanvasInteractions() {
       STATE.panY += e.clientY - STATE.lastMouse.y;
       STATE.lastMouse = { x: e.clientX, y: e.clientY };
       updateCanvasTransform();
+    } else if (STATE.activeTool === "move_subject") {
+      const invZoom = 1 / Math.max(0.05, STATE.zoom);
+      STATE.subjectTransform.dx = Math.max(-600, Math.min(600, STATE.subjectTransform.dx + (e.clientX - STATE.lastMouse.x) * invZoom));
+      STATE.subjectTransform.dy = Math.max(-600, Math.min(600, STATE.subjectTransform.dy + (e.clientY - STATE.lastMouse.y) * invZoom));
+      STATE.lastMouse = { x: e.clientX, y: e.clientY };
+      syncMoveSubjectUI();
+      scheduleSubjectMoveUpdate();
     } else {
       applyManualStrokeAtPoint(e.clientX, e.clientY);
       STATE.lastMouse = { x: e.clientX, y: e.clientY };
@@ -699,6 +837,9 @@ function setupCanvasInteractions() {
   });
 
   window.addEventListener("mouseup", () => {
+    if (STATE.isDragging && STATE.activeTool === "move_subject") {
+      if (History.transformCommit) History.transformCommit();
+    }
     STATE.isDragging = false;
     endEditStroke();
   });
@@ -729,6 +870,10 @@ function setupCanvasInteractions() {
       }
       STATE.isDragging = true;
       STATE.lastMouse = { x: t.clientX, y: t.clientY };
+      if (STATE.activeTool === "move_subject") {
+        if (History.transformBegin) History.transformBegin();
+        return;
+      }
       if (["brush", "eraser", "mask"].includes(STATE.activeTool)) {
         beginEditStroke();
         applyManualStrokeAtPoint(t.clientX, t.clientY);
@@ -766,6 +911,13 @@ function setupCanvasInteractions() {
         STATE.panY += t.clientY - STATE.lastMouse.y;
         STATE.lastMouse = { x: t.clientX, y: t.clientY };
         updateCanvasTransform();
+      } else if (STATE.activeTool === "move_subject") {
+        const invZoom = 1 / Math.max(0.05, STATE.zoom);
+        STATE.subjectTransform.dx = Math.max(-600, Math.min(600, STATE.subjectTransform.dx + (t.clientX - STATE.lastMouse.x) * invZoom));
+        STATE.subjectTransform.dy = Math.max(-600, Math.min(600, STATE.subjectTransform.dy + (t.clientY - STATE.lastMouse.y) * invZoom));
+        STATE.lastMouse = { x: t.clientX, y: t.clientY };
+        syncMoveSubjectUI();
+        scheduleSubjectMoveUpdate();
       } else {
         applyManualStrokeAtPoint(t.clientX, t.clientY);
         STATE.lastMouse = { x: t.clientX, y: t.clientY };
@@ -779,6 +931,9 @@ function setupCanvasInteractions() {
       lastPinchCenter = null;
     }
     if (e.touches.length === 0) {
+      if (STATE.isDragging && STATE.activeTool === "move_subject") {
+        if (History.transformCommit) History.transformCommit();
+      }
       STATE.isDragging = false;
       endEditStroke();
     }
@@ -794,9 +949,52 @@ function setupCanvasInteractions() {
 
 function screenToCanvasCoords(clientX, clientY) {
   const rect = displayCanvas.getBoundingClientRect();
-  const x = (clientX - rect.left) * (displayCanvas.width / rect.width);
-  const y = (clientY - rect.top) * (displayCanvas.height / rect.height);
-  return { x, y };
+  const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
+  const viewX = (clientX - rect.left) * (displayCanvas.width / Math.max(1, rect.width));
+  const viewY = (clientY - rect.top) * (displayCanvas.height / Math.max(1, rect.height));
+
+  // If painting/erasing on a movable layer (or editing cutout mask), map inverse of subjectTransform
+  const movable = STATE.activeTool === "mask" || isSubjectMovableLayer(STATE.selectedLayerId);
+  if (movable && STATE.subjectTransform) {
+    const st = STATE.subjectTransform;
+    const s = st.scale || 1.0;
+    const { cx, cy } = getBaseSubjectCenter();
+    const x = cx + (viewX - (cx - vr.x + st.dx)) / s;
+    const y = cy + (viewY - (cy - vr.y + st.dy)) / s;
+    return { x, y, viewX, viewY };
+  }
+
+  return { x: viewX + vr.x, y: viewY + vr.y, viewX, viewY };
+}
+
+function updateCursorPosition(clientX, clientY) {
+  if (window.Workflow && Workflow.getStep && Workflow.getStep() === "crop") {
+    const d = Workflow.getCropMaskCursorDiameter ? Workflow.getCropMaskCursorDiameter(clientX, clientY) : 0;
+    if (d > 0) {
+      brushCursor.classList.remove("hidden");
+      brushCursor.style.left = `${clientX}px`;
+      brushCursor.style.top = `${clientY}px`;
+      brushCursor.style.width = `${Math.max(4, d)}px`;
+      brushCursor.style.height = `${Math.max(4, d)}px`;
+    } else {
+      brushCursor.classList.add("hidden");
+    }
+    return;
+  }
+
+  if (STATE.activeTool === "pan" || STATE.activeTool === "move_subject" || !STATE.payload) {
+    brushCursor.classList.add("hidden");
+    return;
+  }
+  const vRect = viewport.getBoundingClientRect();
+  if (clientX < vRect.left || clientX > vRect.right || clientY < vRect.top || clientY > vRect.bottom) {
+    brushCursor.classList.add("hidden");
+    return;
+  }
+  brushCursor.classList.remove("hidden");
+  brushCursor.style.left = `${clientX}px`;
+  brushCursor.style.top = `${clientY}px`;
+  updateCursorPreview();
 }
 
 let _maskLastPt = null;
@@ -817,6 +1015,7 @@ function beginEditStroke() {
 function endEditStroke() {
   History.endStroke();
   _maskLastPt = null;
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
 }
 
 function applyManualStrokeAtPoint(clientX, clientY) {
@@ -935,6 +1134,7 @@ function fitCanvasToViewport() {
   STATE.zoom = Math.min(vw / w, vh / h);
   STATE.panX = Math.round((viewport.clientWidth - w * STATE.zoom) / 2);
   STATE.panY = Math.round((viewport.clientHeight - 20 - h * STATE.zoom) / 2);
+  STATE.hasViewportPosition = true;
   updateCanvasTransform();
 }
 
@@ -952,43 +1152,13 @@ function setZoom(newZoom, anchorClientX, anchorClientY) {
   STATE.zoom = clamped;
   STATE.panX = mx - canvasX * clamped;
   STATE.panY = my - canvasY * clamped;
+  STATE.hasViewportPosition = true;
   updateCanvasTransform();
 }
 
 function updateCanvasTransform() {
   canvasContainer.style.transform = `translate3d(${STATE.panX}px, ${STATE.panY}px, 0) scale(${STATE.zoom})`;
   document.getElementById("zoomLabel").textContent = `${Math.round(STATE.zoom * 100)}%`;
-  updateCursorPreview();
-}
-
-function updateCursorPosition(clientX, clientY) {
-  // Step 2: Show hover brush circle on #cropPreviewCanvas when editing cutout mask
-  if (window.Workflow && Workflow.getStep && Workflow.getStep() === "crop") {
-    const d = Workflow.getCropMaskCursorDiameter ? Workflow.getCropMaskCursorDiameter(clientX, clientY) : 0;
-    if (d > 0) {
-      brushCursor.classList.remove("hidden");
-      brushCursor.style.left = `${clientX}px`;
-      brushCursor.style.top = `${clientY}px`;
-      brushCursor.style.width = `${Math.max(4, d)}px`;
-      brushCursor.style.height = `${Math.max(4, d)}px`;
-    } else {
-      brushCursor.classList.add("hidden");
-    }
-    return;
-  }
-
-  if (STATE.activeTool === "pan" || !STATE.payload) {
-    brushCursor.classList.add("hidden");
-    return;
-  }
-  const vRect = viewport.getBoundingClientRect();
-  if (clientX < vRect.left || clientX > vRect.right || clientY < vRect.top || clientY > vRect.bottom) {
-    brushCursor.classList.add("hidden");
-    return;
-  }
-  brushCursor.classList.remove("hidden");
-  brushCursor.style.left = `${clientX}px`;
-  brushCursor.style.top = `${clientY}px`;
   updateCursorPreview();
 }
 

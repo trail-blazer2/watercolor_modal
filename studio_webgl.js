@@ -296,13 +296,14 @@ function getOrBuildEdgeCurveCache() {
   const subImg = STATE.serverImages.subject_cc;
   if (!subImg) return null;
 
+
   const [cw, ch] = STATE.payload.canvas_size;
-  const [offX, offY] = STATE.payload.offset;
-  const [subW, subH] = STATE.payload.subject_size;
-  const bx = Math.max(0, offX);
-  const by = Math.max(0, offY);
-  const bw = Math.min(cw - bx, subW);
-  const bh = Math.min(ch - by, subH);
+  const [bx, by, bw, bh] = STATE.payload.full_subject_box || [
+    Math.max(0, STATE.payload.offset[0]), 
+    Math.max(0, STATE.payload.offset[1]), 
+    STATE.payload.subject_size[0], 
+    STATE.payload.subject_size[1]
+  ];
   if (bw <= 0 || bh <= 0) return null;
 
   const subC = createCanvas(bw, bh);

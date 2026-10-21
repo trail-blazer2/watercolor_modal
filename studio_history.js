@@ -25,6 +25,29 @@ const History = (() => {
   let stroke = null;        // pixel stroke currently being recorded
   let paramGesture = null;  // slider drag currently being recorded
 
+let transformGesture = null;
+
+  function transformBegin() {
+    if (!STATE.subjectTransform) return;
+    if (!transformGesture) {
+      transformGesture = { ...STATE.subjectTransform };
+    }
+  }
+
+  function transformCommit() {
+    const before = transformGesture;
+    transformGesture = null;
+    if (!before || !STATE.subjectTransform) return;
+    const cur = STATE.subjectTransform;
+    if (before.dx === cur.dx && before.dy === cur.dy && before.scale === cur.scale) return;
+    push({
+      type: "subject_transform",
+      snap: before,
+      label: "subject reposition",
+    });
+  }
+
+
   function entryBytes(e) {
     if (e.type === "tiles") return e.bytes;
     if (e.type === "reset") {
@@ -135,6 +158,16 @@ const History = (() => {
     });
   }
 
+  function recordPresetSwitch(fromPreset, toPreset) {
+    if (!fromPreset || !toPreset || fromPreset === toPreset) return;
+    commitParams();
+    push({
+      type: "preset",
+      presetKey: fromPreset,
+      label: `style preset (${fromPreset} → ${toPreset})`,
+    });
+  }
+
   // Call BEFORE resetLayerToOriginal mutates the layer.
   function recordReset(layerId, lyr) {
     commitParams();
@@ -200,6 +233,25 @@ const History = (() => {
       return true;
     }
 
+    if (e.type === "preset") {
+      const sel = document.getElementById("presetSelect");
+      const currentPreset = (STATE.payload && STATE.payload.preset_key) || (sel ? sel.value : "animals");
+      const targetPreset = e.presetKey;
+      e.presetKey = currentPreset;
+      if (sel) sel.value = targetPreset;
+      runModalGeneration(false, true, true);
+      return true;
+    }
+
+    if (e.type === "subject_transform") {
+      const current = { ...STATE.subjectTransform };
+      STATE.subjectTransform = { ...e.snap };
+      e.snap = current;
+      if (typeof syncMoveSubjectUI === "function") syncMoveSubjectUI();
+      if (typeof scheduleSubjectMoveUpdate === "function") scheduleSubjectMoveUpdate();
+      return true;
+    }
+    
     const lyr = STATE.layers[e.layerId];
     if (!lyr) return false;
 
@@ -234,6 +286,7 @@ const History = (() => {
   }
 
   function showResult(e) {
+    if (e.type === "preset" || e.type === "subject_transform") return;
     if (e.type === "tiles" && e.key === "crop_mask") {
       if (window.Workflow && Workflow.onCropMaskHistorySwap) {
         Workflow.onCropMaskHistorySwap();
@@ -328,7 +381,8 @@ const History = (() => {
   return {
     beginStroke, touch, endStroke,
     paramBegin, paramCommit: commitParams,
-    recordVis, recordReset,
+    transformBegin, transformCommit,
+    recordVis,recordPresetSwitch, recordReset,
     undo, redo, clear, bindUI,
   };
 })();
