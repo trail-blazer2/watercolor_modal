@@ -14,6 +14,14 @@
       <span class="brand-title">Watercolor Studio</span>
     </div>
 
+    <div class="workflow-steps" id="workflowSteps">
+      <button class="step-pill active" data-step-btn="upload">1. Upload</button>
+      <span class="step-arrow">›</span>
+      <button class="step-pill" data-step-btn="crop" disabled>2. Move & Zoom</button>
+      <span class="step-arrow">›</span>
+      <button class="step-pill" data-step-btn="studio" disabled>3. Studio</button>
+    </div>
+
     <div class="upload-controls">
       <label class="btn btn-primary" for="fileInput">
         📁 Upload Photo
@@ -37,6 +45,19 @@
             <option value="auto">✨ Auto-Detect Subject</option>
           </optgroup>
         </select>
+      </div>
+
+      <div class="preset-group" id="studioAspectGroup">
+        <label for="studioAspectRatio" class="preset-label">Ratio:</label>
+        <select id="studioAspectRatio" class="select-box" title="Canvas Aspect Ratio">
+          <option value="a4" selected>📄 A2 / A3 / A4 (1:√2)</option>
+          <option value="4:3">🖼️ 4:3 Standard</option>
+          <option value="3:2">📷 3:2 Classic</option>
+          <option value="16:9">🎬 16:9 Widescreen</option>
+        </select>
+        <button type="button" id="topOrientBtn" class="btn btn-xs btn-outline" style="margin-left:4px;" title="Switch Portrait / Landscape">
+          ↕️ Portrait
+        </button>
       </div>
     </div>
 
@@ -130,7 +151,7 @@
         <!-- Cutout Mask Mode Sub-panel -->
         <div id="maskEditControls" class="mask-controls hidden">
           <div class="mask-badge">✂️ Cutout Mask Mode</div>
-          <p class="help-text">Red tint = Removed area. Paint <b>Keep</b> or <b>Remove</b>, then click Apply.</p>
+          <p class="help-text">50% black tint = Removed area. Paint <b>Keep</b> or <b>Remove</b>, then click Apply.</p>
           <div class="btn-group">
             <button id="maskKeepBtn" class="btn btn-sm btn-primary full-width">➕ Keep</button>
             <button id="maskRemoveBtn" class="btn btn-sm btn-outline full-width">➖ Remove</button>
@@ -152,6 +173,81 @@
           <label class="btn btn-primary" for="fileInput" style="margin-top: 18px;">
             📁 Choose Photo to Start
           </label>
+        </div>
+      </div>
+
+      <!-- STEP 2: SMART MOVE & ZOOM CROP STAGE -->
+      <div id="cropStage" class="crop-stage hidden">
+        <div class="crop-Preview-col">
+          <canvas id="cropPreviewCanvas" width="420" height="560"></canvas>
+          <div id="cropInfoBadge" class="badge" style="margin-top:8px;">Smart Framing Ready</div>
+        </div>
+
+        <div class="crop-controls-card">
+          <h3>🎯 Position & Size Your Subject</h3>
+          <p class="help-text" style="margin-bottom:12px;">
+            Drag directly on the canvas to move, or fine-tune with the sliders below before generating your painting.
+          </p>
+
+          <div class="control-row">
+            <label><span>Canvas Aspect Ratio</span></label>
+            <select id="cropCanvasRatio" class="select-box full-width">
+              <option value="a4" selected>📄 A2 / A3 / A4 (1:√2)</option>
+              <option value="4:3">🖼️ 4:3 Standard</option>
+              <option value="3:2">📷 3:2 Classic</option>
+              <option value="16:9">🎬 16:9 Widescreen</option>
+            </select>
+            <div id="cropOrientToggleGroup" class="btn-group" style="margin-top:8px;">
+              <button type="button" id="cropOrientPortraitBtn" class="btn btn-sm btn-primary full-width">↕️ Portrait</button>
+              <button type="button" id="cropOrientLandscapeBtn" class="btn btn-sm btn-outline full-width">↔️ Landscape</button>
+            </div>
+          </div>
+
+          <div class="control-row">
+            <label><span>Subject Zoom</span><span id="cropZoomVal">97%</span></label>
+            <input type="range" id="cropZoomSlider" min="65" max="145" value="97" />
+          </div>
+
+          <div class="control-row">
+            <label><span>Horizontal Shift (Left ↔ Right)</span><span id="cropDxVal">0%</span></label>
+            <input type="range" id="cropDxSlider" min="-35" max="35" value="0" />
+          </div>
+
+          <div class="control-row">
+            <label><span>Vertical Shift (Up ↔ Down)</span><span id="cropDyVal">0%</span></label>
+            <input type="range" id="cropDySlider" min="-35" max="35" value="0" />
+          </div>
+
+          <label class="crop-guides-toggle">
+            <input type="checkbox" id="cropGuidesChk" checked />
+            <span>Show head & eye alignment guides</span>
+          </label>
+
+          <!-- Single Cutout Mask Editor in Step 2 -->
+          <div id="cropMaskEditSection" style="margin-top:12px;">
+            <button type="button" id="cropMaskToggleBtn" class="btn btn-sm btn-outline full-width">
+              ✂️ Edit Cutout Mask
+            </button>
+            <div id="cropMaskSubPanel" class="mask-controls hidden" style="margin-top:8px;">
+              <p class="help-text" style="margin-bottom:6px;">50% black tint = Removed area. Paint directly on preview:</p>
+              <div class="btn-group" style="margin-bottom:8px;">
+                <button type="button" id="cropMaskKeepBtn" class="btn btn-sm btn-primary full-width">➕ Keep</button>
+                <button type="button" id="cropMaskRemoveBtn" class="btn btn-sm btn-outline full-width">➖ Remove</button>
+              </div>
+              <div class="control-row" style="margin-bottom:4px;">
+                <label><span>Mask Brush Size</span><span><b id="cropMaskSizeVal">48</b> px</span></label>
+                <input type="range" id="cropMaskSizeSlider" min="5" max="220" value="48" />
+              </div>
+            </div>
+          </div>
+
+          <div class="btn-group" style="margin-top:10px;">
+            <button type="button" id="cropResetBtn" class="btn btn-sm btn-outline full-width">↺ Reset to Smart Auto</button>
+          </div>
+
+          <button type="button" id="cropGenerateBtn" class="btn btn-primary full-width" style="margin-top:10px; height:42px; font-size:14px;">
+            ✨ Generate Painting →
+          </button>
         </div>
       </div>
 
@@ -217,7 +313,7 @@
           <span id="renderTimeBadge" class="badge"></span>
         </div>
         <div id="layerList" class="layer-list">
-          <!-- Populated dynamically by studio.js -->
+          <!-- Populated dynamically -->
         </div>
       </div>
     </aside>
@@ -238,10 +334,14 @@
       📑<span>Layers</span>
     </button>
   </nav>
+  <script src="studio_config.js"></script>
+  <script src="framing.js"></script>
+  <script src="subject_vision.js"></script>
   <script src="studio_core.js"></script>
   <script src="studio_history.js"></script>
   <script src="studio_webgl.js"></script>
   <script src="studio_layers.js"></script>
   <script src="studio_ui.js"></script>
+  <script src="studio_workflow.js"></script>
 </body>
 </html>

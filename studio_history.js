@@ -155,6 +155,9 @@ const History = (() => {
 
   // ---------- applying (undo and redo are the same swap) ----------
   function resolveCanvas(e) {
+    if (e.key === "crop_mask") {
+      return window.Workflow && Workflow.getCropMaskCanvas ? Workflow.getCropMaskCanvas() : null;
+    }
     if (e.key === "mask") return STATE.maskCanvas;
     const lyr = STATE.layers[e.layerId];
     if (!lyr || !STATE.payload) return null;
@@ -169,17 +172,11 @@ const History = (() => {
     return out;
   }
 
-  // Re-render exactly what the matching slider would have re-rendered.
   function applyParamEffects(layerId, keys) {
     const has = (...names) => keys.some((k) => names.includes(k));
-    if (layerId === "glow") {
-      if (has("size", "colorMode", "glowColor")) rerenderLiveGlowLayer(true);
-      return;
-    }
     if (has("brushFile", "spacing", "size", "jiggle")) rerenderProceduralLayer(layerId, true);
     if (layerId === "oil_paint" && has("thickness", "detailPop")) rerenderLiveOilLayer(true);
     if (layerId === "edge_curve" && has("maskDetail", "edgeThickness")) rerenderLiveEdgeCurveLayer(true);
-    if (layerId === "subject" && has("wcTexture")) rerenderLiveEdgeCurveLayer(true);
   }
 
   function swapEntry(e) {
@@ -237,8 +234,14 @@ const History = (() => {
   }
 
   function showResult(e) {
+    if (e.type === "tiles" && e.key === "crop_mask") {
+      if (window.Workflow && Workflow.onCropMaskHistorySwap) {
+        Workflow.onCropMaskHistorySwap();
+      }
+      return;
+    }
     if (e.type === "tiles" && e.key === "mask") {
-      if (STATE.activeTool !== "mask") setActiveTool("mask"); // also repaints
+      if (STATE.activeTool !== "mask") setActiveTool("mask");
       else compositeAllLayers();
       return;
     }
@@ -251,7 +254,9 @@ const History = (() => {
   }
 
   function step(from, to) {
-    if (stroke || !STATE.payload) return false;
+    if (stroke) return false;
+    const isCropStep = window.Workflow && Workflow.getStep && Workflow.getStep() === "crop";
+    if (!isCropStep && !STATE.payload) return false;
     commitParams();
     while (from.length) {
       const e = from.pop();
@@ -263,7 +268,7 @@ const History = (() => {
         updateUI();
         return true;
       }
-      bytes -= before; // entry no longer applicable (layer/canvas gone): drop it
+      bytes -= before;
     }
     updateUI();
     return false;

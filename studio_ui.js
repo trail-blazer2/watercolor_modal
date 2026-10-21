@@ -3,9 +3,37 @@
  */
 
 // ============================================================================
-// 5. UI EVENTS & MOBILE BOTTOM SHEETS
+// 5. UI EVENTS, ASPECT RATIO BAR & MOBILE BOTTOM SHEETS
 // ============================================================================
+function ensureAspectRatioSelectors() {
+  const studioSel = document.getElementById("studioAspectRatio");
+  const topOrientBtn = document.getElementById("topOrientBtn");
+
+  if (studioSel && !studioSel.dataset.bound) {
+    studioSel.dataset.bound = "1";
+    studioSel.addEventListener("change", () => {
+      const val = studioSel.value;
+      if (window.Workflow) {
+        Workflow.setAspectRatio(val);
+      } else {
+        applyStudioAspectRatio(val);
+      }
+    });
+  }
+
+  if (topOrientBtn && !topOrientBtn.dataset.bound) {
+    topOrientBtn.dataset.bound = "1";
+    topOrientBtn.addEventListener("click", () => {
+      const cur = STATE.aspectOrientation || (resolveActiveProfileKey() === "car" ? "landscape" : "portrait");
+      const next = cur === "landscape" ? "portrait" : "landscape";
+      if (window.Workflow) Workflow.setOrientation(next);
+    });
+  }
+}
+
 function bindUIEvents() {
+  ensureAspectRatioSelectors();
+
   const fileInput = document.getElementById("fileInput");
   const presetSelect = document.getElementById("presetSelect");
 
@@ -18,18 +46,12 @@ function bindUIEvents() {
     stopFilePickerPrewarm();
     const file = e.target.files[0];
     if (!file) return;
-    STATE.uploadedFile = file;
-    const url = URL.createObjectURL(file);
-    STATE.originalImg = await loadImage(url);
-    STATE.maskCanvas = null;
-    STATE.rawMaskBase64 = null;
-    runModalGeneration();
+    await Workflow.startFromUploadedFile(file);
+    fileInput.value = "";
   });
 
   presetSelect.addEventListener("change", () => {
-    if (STATE.uploadedFile) {
-      runModalGeneration(false, true);
-    }
+    Workflow.onPresetChangedInUI();
   });
 
   document.querySelectorAll(".tool-btn").forEach((btn) => {
@@ -249,19 +271,24 @@ function renderSlidersForLayer(lyr) {
     }
   }
 
-  // Nahrazený blok pro typ "subject" s novým ovládáním prvků vedle sebe
   if (def.type === "subject") {
+    ensureSubjectParams(p);
+    addSlider(container, "Fade Out Bottom (Lower 25%)", p.bottomFade, 0, 100, "%", (val) => {
+      p.bottomFade = val;
+      invalidateStack();
+      scheduleComposite();
+    });
+
     addSlider(container, "Color Correction Strength", p.ccBlend, 0, 100, "%", (val) => {
       p.ccBlend = val;
       scheduleComposite();
     });
 
-    // Side-by-side buttons: Watercolor Overlay & Under-Subject Window
     addSubjectOverlayAndWindowControls(container, def, p);
   }
 
-  // Nově přidaný blok pro záři (Glow vrstvu)
   if (def.type === "glow") {
+    ensureGlowParams(p);
     addSlider(container, "Glow Size (Thickness & Blur)", p.size, 1, 55, "px", (val) => {
       p.size = val;
       scheduleGlowRerender();
@@ -297,7 +324,6 @@ function renderSlidersForLayer(lyr) {
     scheduleComposite();
   });
 
-  // Kontrast a Saturace jsou nyní vynechány, pokud se jedná o typ "glow"
   if (def.type !== "glow") {
     addSlider(container, "Contrast", p.contrast, 30, 200, "%", (val) => {
       p.contrast = val;
@@ -314,20 +340,19 @@ function renderSlidersForLayer(lyr) {
 function addSubjectOverlayAndWindowControls(container, def, p) {
   const hasWcTex = !!(STATE.serverImages && (STATE.serverImages.subject_tex || STATE.serverImages.edge_curve));
 
-  const row = document.createElement("div");
-  row.className = "control-row";
-  const lbl = document.createElement("label");
-  lbl.innerHTML = `<span>Subject Texture & Backdrop Window</span>`;
-  row.appendChild(lbl);
-
-  const btnGroup = document.createElement("div");
-  btnGroup.className = "btn-group";
-
   if (hasWcTex) {
+    const wcRow = document.createElement("div");
+    wcRow.className = "control-row";
+    const wcLbl = document.createElement("label");
+    wcLbl.innerHTML = `<span>Subject Watercolor Texture</span>`;
+    wcRow.appendChild(wcLbl);
+
     const wcBtn = document.createElement("button");
     const syncWc = () => {
       wcBtn.className = p.wcTexture ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
-      wcBtn.textContent = p.wcTexture ? "🎨 WC Overlay: ON" : "🎨 WC Overlay: OFF";
+      wcBtn.textContent = p.wcTexture
+        ? "🎨 Subject Watercolor Texture: ON"
+        : "🎨 Subject Watercolor Texture: OFF";
     };
     syncWc();
     wcBtn.addEventListener("click", () => {
@@ -339,19 +364,26 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
       scheduleComposite();
       History.paramCommit();
     });
-    btnGroup.appendChild(wcBtn);
+    wcRow.appendChild(wcBtn);
+    container.appendChild(wcRow);
   }
+
+  const winRow = document.createElement("div");
+  winRow.className = "control-row";
+  const winLbl = document.createElement("label");
+  winLbl.innerHTML = `<span>Under-Subject Backdrop Window</span>`;
+  winRow.appendChild(winLbl);
 
   const winBtn = document.createElement("button");
   const syncWin = () => {
     winBtn.className = p.underWindowEnabled ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
-    winBtn.textContent = p.underWindowEnabled ? "🪟 BG Window: ON" : "🪟 BG Window: OFF";
+    winBtn.textContent = p.underWindowEnabled
+      ? "🪟 Backdrop Window: ON"
+      : "🪟 Backdrop Window: OFF";
   };
   syncWin();
-  btnGroup.appendChild(winBtn);
-  row.appendChild(btnGroup);
+  winRow.appendChild(winBtn);
 
-  // Sub-panel for Under-Subject Window (Black / White + Opacity slider)
   const subPanel = document.createElement("div");
   subPanel.className = `mask-controls ${p.underWindowEnabled ? "" : "hidden"}`;
   subPanel.style.marginTop = "10px";
@@ -365,9 +397,9 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
   const syncColorBtns = () => {
     const isBlack = p.underWindowColor === "black";
     whiteBtn.className = !isBlack ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
-    whiteBtn.textContent = "⬜ White Window";
+    whiteBtn.textContent = "⬜ White";
     blackBtn.className = isBlack ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
-    blackBtn.textContent = "⬛ Black Window";
+    blackBtn.textContent = "⬛ Black";
   };
   syncColorBtns();
 
@@ -375,7 +407,7 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
     History.paramBegin();
     p.underWindowColor = "white";
     syncColorBtns();
-    if (_stack.id !== def.id) invalidateStack();
+    invalidateStack();
     scheduleComposite();
     History.paramCommit();
   });
@@ -383,7 +415,7 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
     History.paramBegin();
     p.underWindowColor = "black";
     syncColorBtns();
-    if (_stack.id !== def.id) invalidateStack();
+    invalidateStack();
     scheduleComposite();
     History.paramCommit();
   });
@@ -392,9 +424,9 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
   colorGroup.appendChild(blackBtn);
   subPanel.appendChild(colorGroup);
 
-  addSlider(subPanel, "Window Opacity (Covers Under-Layers)", p.underWindowOpacity, 0, 100, "%", (val) => {
+  addSlider(subPanel, "Window Opacity", p.underWindowOpacity, 0, 100, "%", (val) => {
     p.underWindowOpacity = val;
-    if (_stack.id !== def.id) invalidateStack();
+    invalidateStack();
     scheduleComposite();
   });
 
@@ -403,13 +435,13 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
     p.underWindowEnabled = !p.underWindowEnabled;
     syncWin();
     subPanel.classList.toggle("hidden", !p.underWindowEnabled);
-    if (_stack.id !== def.id) invalidateStack();
+    invalidateStack();
     scheduleComposite();
     History.paramCommit();
   });
 
-  row.appendChild(subPanel);
-  container.appendChild(row);
+  winRow.appendChild(subPanel);
+  container.appendChild(winRow);
 }
 
 function addGlowColorModeControls(container, p) {
@@ -465,7 +497,6 @@ function addGlowColorModeControls(container, p) {
   pickerRow.appendChild(resetColBtn);
   subMenu.appendChild(pickerRow);
 
-  // Quick Swatches inside the Color Glow Submenu (including Subject Average & Dominant Colors!)
   const swatchRow = document.createElement("div");
   swatchRow.className = "quick-swatches";
   const avgHex = STATE.payload && STATE.payload.average_color ? rgbToHex(...STATE.payload.average_color) : "#888888";
@@ -504,33 +535,6 @@ function addGlowColorModeControls(container, p) {
 
   row.appendChild(subMenu);
   container.appendChild(row);
-}
-
-function addToggleRow(parent, labelText, initialValue, onToggle) {
-  const row = document.createElement("div");
-  row.className = "control-row";
-  const lbl = document.createElement("label");
-  lbl.innerHTML = `<span>${labelText}</span>`;
-
-  const btn = document.createElement("button");
-  const syncBtn = (on) => {
-    btn.className = on ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
-    btn.textContent = on ? "✅ Enabled (Click to Turn Off)" : "🚫 Disabled (Click to Turn On)";
-  };
-  let state = initialValue;
-  syncBtn(state);
-
-  btn.addEventListener("click", () => {
-    History.paramBegin();
-    state = !state;
-    syncBtn(state);
-    onToggle(state);
-    History.paramCommit();
-  });
-
-  row.appendChild(lbl);
-  row.appendChild(btn);
-  parent.appendChild(row);
 }
 
 function addSlider(parent, labelText, value, min, max, unit, onInput) {
@@ -593,7 +597,7 @@ function addBrushFileDropdown(parent, currentFile, onChange) {
 
 function resetLayerToOriginal(layerId) {
   cancelPendingSchedules();
-  if (_stack.id !== layerId) invalidateStack();
+  invalidateStack();
   const lyr = STATE.layers[layerId];
   if (!lyr || !STATE.payload) return;
   const [w, h] = STATE.payload.canvas_size;
@@ -606,7 +610,7 @@ function resetLayerToOriginal(layerId) {
 
   const bCtx = lyr.baseCanvas.getContext("2d");
   bCtx.clearRect(0, 0, w, h);
-  
+
   if (
     ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(
       lyr.def.type
@@ -615,7 +619,7 @@ function resetLayerToOriginal(layerId) {
     rerenderProceduralLayer(layerId, true);
   } else if (layerId === "edge_curve") {
     rerenderLiveEdgeCurveLayer(true);
-  } else if (layerId === "glow") { // Přidaná podmínka pro glow vrstvu
+  } else if (layerId === "glow") {
     rerenderLiveGlowLayer(true);
   } else if (layerId === "subject" && STATE.serverImages.subject_cc) {
     bCtx.drawImage(STATE.serverImages.subject_cc, 0, 0);
@@ -891,26 +895,27 @@ function applyManualStrokeAtPoint(clientX, clientY) {
 }
 
 function renderMaskEditorView() {
-  const [w, h] = STATE.payload.canvas_size;
+  const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
   const [offX, offY] = STATE.payload.offset;
   const [subW, subH] = STATE.payload.subject_size;
-  displayCtx.clearRect(0, 0, w, h);
+  displayCtx.clearRect(0, 0, vr.w, vr.h);
   displayCtx.fillStyle = "#121212";
-  displayCtx.fillRect(0, 0, w, h);
+  displayCtx.fillRect(0, 0, vr.w, vr.h);
+
+  displayCtx.save();
+  displayCtx.translate(-vr.x, -vr.y);
   displayCtx.drawImage(STATE.originalImg, offX, offY, subW, subH);
   const overlay = ensureMaskOverlay();
   if (overlay) {
-    // 88% opaque black over removed areas so the cutout is crystal clear
-    displayCtx.save();
-    displayCtx.globalAlpha = 0.88;
+    displayCtx.globalAlpha = 0.5;
     displayCtx.drawImage(overlay, offX, offY, subW, subH);
-    displayCtx.restore();
   }
+  displayCtx.restore();
 }
 
 function pickColorFromCanvas(clientX, clientY) {
-  const { x, y } = screenToCanvasCoords(clientX, clientY);
-  const pixel = displayCtx.getImageData(Math.floor(x), Math.floor(y), 1, 1).data;
+  const { viewX, viewY } = screenToCanvasCoords(clientX, clientY);
+  const pixel = displayCtx.getImageData(Math.floor(viewX), Math.floor(viewY), 1, 1).data;
   document.getElementById("manualBrushColor").value = rgbToHex(pixel[0], pixel[1], pixel[2]);
 }
 
@@ -919,7 +924,8 @@ function pickColorFromCanvas(clientX, clientY) {
 // ============================================================================
 function fitCanvasToViewport() {
   if (!STATE.payload) return;
-  const [w, h] = STATE.payload.canvas_size;
+  const w = displayCanvas.width;
+  const h = displayCanvas.height;
   const pad = window.innerWidth <= 960 ? 24 : 64;
   const vw = Math.max(100, viewport.clientWidth - pad);
   const vh = Math.max(100, viewport.clientHeight - pad - 36);
@@ -953,6 +959,21 @@ function updateCanvasTransform() {
 }
 
 function updateCursorPosition(clientX, clientY) {
+  // Step 2: Show hover brush circle on #cropPreviewCanvas when editing cutout mask
+  if (window.Workflow && Workflow.getStep && Workflow.getStep() === "crop") {
+    const d = Workflow.getCropMaskCursorDiameter ? Workflow.getCropMaskCursorDiameter(clientX, clientY) : 0;
+    if (d > 0) {
+      brushCursor.classList.remove("hidden");
+      brushCursor.style.left = `${clientX}px`;
+      brushCursor.style.top = `${clientY}px`;
+      brushCursor.style.width = `${Math.max(4, d)}px`;
+      brushCursor.style.height = `${Math.max(4, d)}px`;
+    } else {
+      brushCursor.classList.add("hidden");
+    }
+    return;
+  }
+
   if (STATE.activeTool === "pan" || !STATE.payload) {
     brushCursor.classList.add("hidden");
     return;
@@ -969,6 +990,7 @@ function updateCursorPosition(clientX, clientY) {
 }
 
 function updateCursorPreview() {
+  if (window.Workflow && Workflow.getStep && Workflow.getStep() === "crop") return;
   const size = Number(document.getElementById("manualBrushSize").value) * STATE.zoom;
   brushCursor.style.width = `${Math.max(4, size)}px`;
   brushCursor.style.height = `${Math.max(4, size)}px`;

@@ -110,6 +110,19 @@ body {
 
 .select-box:focus { border-color: var(--gold); }
 
+.ratio-select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ratio-flip-pill {
+  height: 28px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
 /* BUTTONS (Never wrap text into 2 lines) */
 .btn {
   border: 1px solid transparent;
@@ -329,7 +342,7 @@ input[type="range"]::-moz-range-thumb {
   position: relative;
   background: radial-gradient(circle at center, #f3efe7 0%, #ebe5d9 100%);
   overflow: hidden;
-  touch-action: none; /* Prevents page scroll during touch pan/pinch/paint */
+  touch-action: none;
 }
 
 .empty-state {
@@ -434,7 +447,6 @@ input[type="range"]::-moz-range-thumb {
   text-align: center;
 }
 
-/* CRITICAL FIX: top: 0; left: 0; ensures zoom math anchors exactly at the mouse cursor */
 .canvas-container {
   position: absolute;
   top: 0;
@@ -656,6 +668,98 @@ input[type="range"]::-moz-range-thumb {
   text-overflow: ellipsis;
 }
 
+/* WORKFLOW STEP BREADCRUMBS & SMART CROP STAGE */
+.workflow-steps {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+}
+.step-pill {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.step-pill.active {
+  background: var(--gold);
+  color: #fff;
+}
+.step-pill:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.step-arrow { color: var(--line-strong); font-weight: 700; }
+
+.step-disabled {
+  pointer-events: none;
+  opacity: 0.45;
+}
+
+.crop-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+  padding: 24px;
+  overflow-y: auto;
+  z-index: 15;
+}
+.crop-Preview-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+#cropPreviewCanvas {
+  background: #f5efe4;
+  border-radius: 8px;
+  box-shadow: 0 14px 40px rgba(60, 45, 20, 0.16);
+  cursor: grab;
+  touch-action: none;
+  max-width: 100%;
+}
+#cropPreviewCanvas:active { cursor: grabbing; }
+#cropPreviewCanvas.mask-editing {
+  cursor: none;
+}
+
+.crop-controls-card {
+  width: 350px;
+  max-width: 100%;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 20px 18px;
+  box-shadow: var(--shadow);
+}
+.crop-controls-card h3 {
+  font-family: "Cormorant Garamond", Georgia, serif;
+  font-size: 22px;
+  margin-bottom: 6px;
+}
+.crop-guides-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  margin-top: 6px;
+}
+
 /* MOBILE NAVIGATION (Hidden on Desktop) */
 .mobile-nav {
   display: none;
@@ -687,7 +791,6 @@ input[type="range"]::-moz-range-thumb {
     font-size: 12px;
   }
 
-  /* Slide-up bottom sheets for Tools & Inspector on Mobile/Tablet */
   .left-toolbar,
   .right-inspector {
     position: absolute;
@@ -775,4 +878,13 @@ input[type="range"]::-moz-range-thumb {
     font-weight: 700;
     background: var(--gold-soft);
   }
+
+  .workflow-steps { display: none; }
+  .crop-stage {
+    flex-direction: column;
+    justify-content: flex-start;
+    padding: 14px;
+    gap: 14px;
+  }
+  .crop-controls-card { width: 100%; max-height: none; padding: 16px; }
 }

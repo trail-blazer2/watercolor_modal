@@ -117,6 +117,10 @@ const STATE = {
   presetCache: new Map(),
   bgFetchPromises: new Map(),
   uploadSessionId: 0,
+  aspectRatioKey: "a4",
+  aspectOrientation: null, // "portrait" | "landscape"
+  uncroppedPlacement: null,
+  viewRect: { x: 0, y: 0, w: 1260, h: 1782 },
   zoom: 0.45,
   panX: 40,
   panY: 20,
@@ -138,6 +142,7 @@ let _progressTimer = null;
 
 window.addEventListener("DOMContentLoaded", () => {
   bindUIEvents();
+  if (window.Workflow) Workflow.init();
   prewarmModalServer();
   loadCachedBrushes();
 });
@@ -260,10 +265,121 @@ function loadImage(src) {
 
 function createCanvas(w, h) {
   const c = document.createElement("canvas");
-  c.width = w;
-  c.height = h;
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
   return c;
 }
+
+// ============================================================================
+// 5. ASPECT RATIO PARSER & NON-DESTRUCTIVE MASTER CANVAS CROPPER
+// ============================================================================
+const MASTER_CANVAS_DIM = 2400;
+
+function resolveActiveProfileKey() {
+  const presetEl = document.getElementById("presetSelect");
+  const presetKey = presetEl ? presetEl.value : "animals";
+  if (presetKey.startsWith("cars")) return "car";
+  if (presetKey === "people") return "person";
+  return "animal";
+}
+
+function parseAspectRatioToCm(ratioVal, profileKey, orientationOverride) {
+  const prof = profileKey || resolveActiveProfileKey();
+  const isDefaultLandscape = prof === "car";
+  const orient = orientationOverride || STATE.aspectOrientation || (isDefaultLandscape ? "landscape" : "portrait");
+  const v = String(ratioVal || "a4").trim().toLowerCase();
+
+  let longSide = 141.421356; // ISO A2/A3/A4 (sqrt(2) * 100)
+  let shortSide = 100;
+
+  if (v.includes("4:3") || v.includes("4_3") || v.includes("3:4")) {
+    longSide = 133.333333; shortSide = 100;
+  } else if (v.includes("3:2") || v.includes("3_2") || v.includes("2:3")) {
+    longSide = 150; shortSide = 100;
+  } else if (v.includes("16:9") || v.includes("16_9") || v.includes("9:16")) {
+    longSide = 177.777778; shortSide = 100;
+  } else {
+    longSide = 141.421356; shortSide = 100;
+  }
+
+  return orient === "landscape"
+    ? { width: longSide, height: shortSide }
+    : { width: shortSide, height: longSide };
+}
+
+// Computes the non-destructive viewport crop rectangle inside the 2400x2400 Master Canvas
+function computeMasterViewRect(ratioVal, orientationOverride) {
+  if (!STATE.payload || !STATE.payload.base_canvas_size) {
+    return { x: 0, y: 0, w: 1260, h: 1782 };
+  }
+  const [baseW, baseH] = STATE.payload.base_canvas_size;
+  const [padX, padY] = STATE.payload.pad || [0, 0];
+  const [masterW, masterH] = STATE.payload.canvas_size;
+
+  const prof = resolveActiveProfileKey();
+  const cm = parseAspectRatioToCm(ratioVal || STATE.aspectRatioKey, prof, orientationOverride);
+  const R = cm.width / cm.height;
+
+  let viewW, viewH, viewX, viewY;
+  if (prof === "car") {
+    // Vehicle: keep reference height 1260 for landscape ratios (expands sides up to 2240 for 16:9),
+    // or keep reference width 1782 for portrait ratios
+    if (R >= 1) {
+      viewH = baseH;
+      viewW = Math.min(masterW, Math.round(viewH * R));
+    } else {
+      viewW = baseW;
+      viewH = Math.min(masterH, Math.round(viewW / R));
+    }
+    viewX = Math.round(padX + (baseW - viewW) * 0.5);
+    viewY = Math.round(padY + (baseH - viewH) * 0.5);
+  } else {
+    // Portrait bust: anchor bottom at padY + baseH and center horizontally around padX + baseW/2
+    if (R <= 1.35) {
+      viewH = baseH;
+      viewW = Math.min(masterW, Math.round(viewH * R));
+    } else {
+      viewW = Math.min(masterW, Math.round(baseH * R));
+      viewH = Math.min(masterH, Math.round(viewW / R));
+    }
+    viewX = Math.round(padX + (baseW - viewW) * 0.5);
+    viewY = Math.round(padY + baseH - viewH);
+  }
+
+  viewX = Math.max(0, Math.min(masterW - viewW, viewX));
+  viewY = Math.max(0, Math.min(masterH - viewH, viewY));
+  return { x: viewX, y: viewY, w: viewW, h: viewH };
+}
+
+// Instant, zero-delay aspect ratio switching in Step 3: NO layer re-renders, zero brush shifting!
+function applyStudioAspectRatio(ratioVal, orientationOverride) {
+  if (ratioVal !== undefined && ratioVal !== null) {
+    STATE.aspectRatioKey = ratioVal;
+  }
+  if (orientationOverride !== undefined) {
+    STATE.aspectOrientation = orientationOverride;
+  }
+
+  const cropSel = document.getElementById("cropCanvasRatio");
+  const studioSel = document.getElementById("studioAspectRatio");
+  if (cropSel && cropSel.value !== STATE.aspectRatioKey) cropSel.value = STATE.aspectRatioKey;
+  if (studioSel && studioSel.value !== STATE.aspectRatioKey) studioSel.value = STATE.aspectRatioKey;
+
+  if (!STATE.payload) return;
+
+  STATE.viewRect = computeMasterViewRect(STATE.aspectRatioKey, STATE.aspectOrientation);
+  displayCanvas.width = STATE.viewRect.w;
+  displayCanvas.height = STATE.viewRect.h;
+
+  // If subject has bottomFade active, only composite needs to run (no procedural re-renders!)
+  invalidateStack();
+  fitCanvasToViewport();
+  compositeAllLayers();
+}
+
+window.applyStudioAspectRatio = applyStudioAspectRatio;
+window.changeStudioAspectRatio = applyStudioAspectRatio;
+window.parseAspectRatioToCm = parseAspectRatioToCm;
 
 // ============================================================================
 // 6. UPLOAD, GENERATION & FAST BOUNDING-BOX EDGE UNPACKING
@@ -301,8 +417,10 @@ async function fetchPresetPayloadFromServer(presetKey, useEditedMask, isPresetSw
   formData.append("preset_key", presetKey);
 
   if (useEditedMask && STATE.maskCanvas) {
-    formData.append("mask_base64", STATE.maskCanvas.toDataURL("image/webp", 0.95));
-  } else if (isPresetSwitch && STATE.rawMaskBase64) {
+    // Crop back to base_canvas_size if STATE.maskCanvas is on the master canvas
+    const b64 = exportBaseMaskDataURL();
+    formData.append("mask_base64", b64);
+  } else if (STATE.rawMaskBase64) {
     formData.append("raw_mask_base64", STATE.rawMaskBase64);
   }
 
@@ -312,6 +430,11 @@ async function fetchPresetPayloadFromServer(presetKey, useEditedMask, isPresetSw
   });
   if (!res.ok) throw new Error(`Server returned status ${res.status}`);
   return JSON.parse(await res.text());
+}
+
+function exportBaseMaskDataURL() {
+  if (!STATE.maskCanvas) return null;
+  return STATE.maskCanvas.toDataURL("image/webp", 0.95);
 }
 
 function pregenerateSiblingPresetsInBackground(activePresetKey, sessionId) {
@@ -342,7 +465,6 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
 
   const presetKey = document.getElementById("presetSelect").value;
 
-  // Clear cache on new photo upload or manual cutout mask edit
   if (!isPresetSwitch || useEditedMask) {
     STATE.uploadSessionId++;
     STATE.presetCache.clear();
@@ -351,25 +473,21 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
   }
 
   const currentSessionId = STATE.uploadSessionId;
-
-  // 1. INSTANT HIT: Sibling preset is already cached in RAM (0ms network wait!)
-  if (isPresetSwitch && !useEditedMask && STATE.presetCache.has(presetKey)) {
-    const cachedPayload = STATE.presetCache.get(presetKey);
-    await initializeStudioFromPayload(cachedPayload);
-    pregenerateSiblingPresetsInBackground(presetKey, currentSessionId);
-    return;
-  }
-
   startProgressBar(isPresetSwitch);
 
   try {
     const t0 = performance.now();
-    let payload;
+    let payload = null;
 
-    // 2. IN-FLIGHT HIT: Background fetch is already running for this preset—await it!
-    if (isPresetSwitch && !useEditedMask && STATE.bgFetchPromises.has(presetKey)) {
-      payload = await STATE.bgFetchPromises.get(presetKey);
+    if (isPresetSwitch && !useEditedMask) {
+      if (STATE.presetCache.has(presetKey)) {
+        payload = STATE.presetCache.get(presetKey);
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      } else if (STATE.bgFetchPromises.has(presetKey)) {
+        payload = await STATE.bgFetchPromises.get(presetKey);
+      }
     }
+
     if (!payload) {
       payload = await fetchPresetPayloadFromServer(presetKey, useEditedMask, isPresetSwitch);
     }
@@ -391,7 +509,6 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
 
     if (Object.keys(STATE.brushImages).length === 0) fetchBrushTextures();
 
-    // 3. Kick off sibling preset generation in the background AFTER UI is 100% ready
     setTimeout(() => {
       if (currentSessionId === STATE.uploadSessionId) {
         pregenerateSiblingPresetsInBackground(payload.preset_key || presetKey, currentSessionId);
@@ -405,8 +522,49 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false)
   }
 }
 
-const _EDGE_CHUNK_SHIFT = 6; // 64 points per bounding-box chunk
+const _EDGE_CHUNK_SHIFT = 6;
 const _EDGE_CHUNK_SIZE = 1 << _EDGE_CHUNK_SHIFT;
+
+function rebuildEdgeSpatialIndex(strokeData) {
+  if (!strokeData || !strokeData.edges) return;
+  const edges = strokeData.edges;
+  const count = edges.length;
+  const edgesX = new Int32Array(count);
+  const edgesY = new Int32Array(count);
+  let maxX = 0, maxY = 0;
+
+  const numChunks = Math.ceil(count / _EDGE_CHUNK_SIZE);
+  const chunkMinX = new Int32Array(numChunks).fill(0x7fffffff);
+  const chunkMaxX = new Int32Array(numChunks).fill(-0x7fffffff);
+  const chunkMinY = new Int32Array(numChunks).fill(0x7fffffff);
+  const chunkMaxY = new Int32Array(numChunks).fill(-0x7fffffff);
+
+  for (let j = 0; j < count; j++) {
+    const pt = edges[j];
+    const x = pt[0] | 0;
+    const y = pt[1] | 0;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    edgesX[j] = x;
+    edgesY[j] = y;
+    const c = j >> _EDGE_CHUNK_SHIFT;
+    if (x < chunkMinX[c]) chunkMinX[c] = x;
+    if (x > chunkMaxX[c]) chunkMaxX[c] = x;
+    if (y < chunkMinY[c]) chunkMinY[c] = y;
+    if (y > chunkMaxY[c]) chunkMaxY[c] = y;
+  }
+
+  strokeData.edgesX = edgesX;
+  strokeData.edgesY = edgesY;
+  strokeData.maxX = maxX;
+  strokeData.maxY = maxY;
+  strokeData.numChunks = numChunks;
+  strokeData.chunkMinX = chunkMinX;
+  strokeData.chunkMaxX = chunkMaxX;
+  strokeData.chunkMinY = chunkMinY;
+  strokeData.chunkMaxY = chunkMaxY;
+  strokeData.bottomCoords = null;
+}
 
 function unpackEdgesIfNeeded(strokeData) {
   if (!strokeData) return [];
@@ -420,31 +578,10 @@ function unpackEdgesIfNeeded(strokeData) {
   }
   const count = (flat.length / 8) | 0;
   const out = new Array(count);
-  const edgesX = new Int32Array(count);
-  const edgesY = new Int32Array(count);
-  let maxX = 0, maxY = 0;
-
-  const numChunks = Math.ceil(count / _EDGE_CHUNK_SIZE);
-  const chunkMinX = new Int32Array(numChunks).fill(0x7fffffff);
-  const chunkMaxX = new Int32Array(numChunks).fill(-0x7fffffff);
-  const chunkMinY = new Int32Array(numChunks).fill(0x7fffffff);
-  const chunkMaxY = new Int32Array(numChunks).fill(-0x7fffffff);
-
   for (let i = 0, j = 0; j < count; i += 8, j++) {
-    const x = flat[i] | 0;
-    const y = flat[i + 1] | 0;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-    edgesX[j] = x;
-    edgesY[j] = y;
-    const c = j >> _EDGE_CHUNK_SHIFT;
-    if (x < chunkMinX[c]) chunkMinX[c] = x;
-    if (x > chunkMaxX[c]) chunkMaxX[c] = x;
-    if (y < chunkMinY[c]) chunkMinY[c] = y;
-    if (y > chunkMaxY[c]) chunkMaxY[c] = y;
     out[j] = [
-      x,
-      y,
+      flat[i] | 0,
+      flat[i + 1] | 0,
       flat[i + 2] / 10000,
       flat[i + 3] / 10000,
       flat[i + 4],
@@ -454,21 +591,10 @@ function unpackEdgesIfNeeded(strokeData) {
     ];
   }
   strokeData.edges = out;
-  strokeData.edgesX = edgesX;
-  strokeData.edgesY = edgesY;
-  strokeData.maxX = maxX;
-  strokeData.maxY = maxY;
-  strokeData.numChunks = numChunks;
-  strokeData.chunkMinX = chunkMinX;
-  strokeData.chunkMaxX = chunkMaxX;
-  strokeData.chunkMinY = chunkMinY;
-  strokeData.chunkMaxY = chunkMaxY;
-  strokeData.bottomCoords = null;
+  rebuildEdgeSpatialIndex(strokeData);
   return out;
 }
 
-// Reconstructs a 100% untextured color-corrected subject from subject_raw + subject_cc
-// if running against a server payload that hasn't separated subject_tex yet.
 function buildCleanSubjectFromRawAndTextured(rawImg, texCcImg, payload) {
   const [cw, ch] = payload.canvas_size;
   const [offX, offY] = payload.offset;
@@ -507,8 +633,6 @@ function buildCleanSubjectFromRawAndTextured(rawImg, texCcImg, payload) {
     }
   }
 
-  // Smooth the color-correction delta over a 12px radius so 100% of the watercolor
-  // texture blotches are stripped while preserving exact color correction & sharp subject edges
   const den = boxBlurFloat32(inside, bw, bh, 12);
   const smDiffR = normalizedBlurFloat32(diffR, inside, bw, bh, 12, den);
   const smDiffG = normalizedBlurFloat32(diffG, inside, bw, bh, 12, den);
@@ -531,6 +655,117 @@ function buildCleanSubjectFromRawAndTextured(rawImg, texCcImg, payload) {
   return outCanvas;
 }
 
+// Places a base [baseW, baseH] server image onto the [masterW, masterH] Master Canvas at [padX, padY]
+function liftServerImageToMaster(srcImg, baseW, baseH, masterW, masterH, padX, padY, mode = "normal") {
+  if (!srcImg) return null;
+  const c = createCanvas(masterW, masterH);
+  const ctx = c.getContext("2d");
+
+  if (mode === "paper") {
+    // Mirror-tile the paper texture into the overscan borders while keeping (padX, padY) 100% exact
+    for (let ty = -1; ty <= 1; ty++) {
+      for (let tx = -1; tx <= 1; tx++) {
+        ctx.save();
+        const dx = padX + tx * baseW;
+        const dy = padY + ty * baseH;
+        ctx.translate(dx + (tx !== 0 ? baseW : 0), dy + (ty !== 0 ? baseH : 0));
+        ctx.scale(tx !== 0 ? -1 : 1, ty !== 0 ? -1 : 1);
+        ctx.drawImage(srcImg, 0, 0, baseW, baseH);
+        ctx.restore();
+      }
+    }
+    return c;
+  }
+
+  if (mode === "blur_bg") {
+    ctx.save();
+    ctx.filter = "blur(28px)";
+    ctx.drawImage(srcImg, 0, 0, masterW, masterH);
+    ctx.restore();
+    ctx.drawImage(srcImg, padX, padY, baseW, baseH);
+    return c;
+  }
+
+  ctx.drawImage(srcImg, padX, padY, baseW, baseH);
+  return c;
+}
+
+// Appends extra subject pixels & contour edges in the overscan zone (outside [baseW, baseH])
+// to the END of stroke_data.edges so original strokes never shift while wider ratios have full edges!
+function populateOverscanSubjectAndEdges(payload, rawImgs, baseW, baseH, masterW, masterH, padX, padY) {
+  const up = STATE.uncroppedPlacement;
+  if (!up || !up.cutoutCanvas || !up.maskCanvas) return;
+  if (up.refSize[0] !== baseW || up.refSize[1] !== baseH) return;
+
+  const fullX = Math.round(padX + up.px.x);
+  const fullY = Math.round(padY + up.px.y);
+  const fullW = Math.round(up.px.w);
+  const fullH = Math.round(up.px.h);
+
+  // Fill overscan subject pixels outside the central [padX, padY, baseW, baseH] box
+  for (const key of ["subject_raw", "subject_cc", "subject_tex", "oil_paint_full"]) {
+    const targetC = rawImgs[key];
+    if (!targetC) continue;
+    const overC = createCanvas(masterW, masterH);
+    const oCtx = overC.getContext("2d");
+    oCtx.drawImage(up.cutoutCanvas, fullX, fullY, fullW, fullH);
+    oCtx.clearRect(padX + 2, padY + 2, baseW - 4, baseH - 4);
+    const tCtx = targetC.getContext("2d");
+    tCtx.save();
+    tCtx.globalCompositeOperation = "destination-over";
+    tCtx.drawImage(overC, 0, 0);
+    tCtx.restore();
+  }
+
+  // Extract contour edges strictly in the overscan zone and append them to the END of edges
+  const sd = payload.stroke_data;
+  if (!sd || !sd.edges) return;
+  const [offX, offY] = payload.offset; // already shifted by padX, padY
+
+  const scaleDown = 4;
+  const gw = Math.round(masterW / scaleDown);
+  const gh = Math.round(masterH / scaleDown);
+  const mC = createCanvas(gw, gh);
+  const mCtx = mC.getContext("2d");
+  mCtx.fillStyle = "#000";
+  mCtx.fillRect(0, 0, gw, gh);
+  mCtx.drawImage(up.maskCanvas, fullX / scaleDown, fullY / scaleDown, fullW / scaleDown, fullH / scaleDown);
+  const mData = mCtx.getImageData(0, 0, gw, gh).data;
+
+  const pC = createCanvas(gw, gh);
+  const pCtx = pC.getContext("2d");
+  pCtx.drawImage(up.sourceCanvas, fullX / scaleDown, fullY / scaleDown, fullW / scaleDown, fullH / scaleDown);
+  const pData = pCtx.getImageData(0, 0, gw, gh).data;
+
+  const ix0 = Math.floor(padX / scaleDown);
+  const ix1 = Math.ceil((padX + baseW) / scaleDown);
+  const iy0 = Math.floor(padY / scaleDown);
+  const iy1 = Math.ceil((padY + baseH) / scaleDown);
+
+  for (let y = 2; y < gh - 2; y++) {
+    for (let x = 2; x < gw - 2; x++) {
+      if (x >= ix0 && x <= ix1 && y >= iy0 && y <= iy1) continue;
+      const idx = (y * gw + x) * 4;
+      if (mData[idx] < 128) continue;
+      const l = mData[idx - 4] < 128;
+      const r = mData[idx + 4] < 128;
+      const u = mData[idx - gw * 4] < 128;
+      const d = mData[idx + gw * 4] < 128;
+      if (!l && !r && !u && !d) continue;
+
+      const gx = (mData[idx + 4] - mData[idx - 4]) || 0;
+      const gy = (mData[idx + gw * 4] - mData[idx - gw * 4]) || 0;
+      const len = Math.hypot(gx, gy) || 1;
+      const nx = -gx / len;
+      const ny = -gy / len;
+
+      const mx = x * scaleDown - offX;
+      const my = y * scaleDown - offY;
+      sd.edges.push([mx, my, nx, ny, pData[idx], pData[idx + 1], pData[idx + 2], 1]);
+    }
+  }
+}
+
 async function initializeStudioFromPayload(payload) {
   cancelPendingSchedules();
   History.clear();
@@ -538,13 +773,49 @@ async function initializeStudioFromPayload(payload) {
   _sampleCache.clear();
   _ellipseGeomCache.clear();
   STATE.oilDetailCache = null;
-  STATE.glowCache = null; // Přidáno vedle STATE.oilDetailCache
   STATE.edgeCurveCache = null;
+  STATE.glowCache = null;
   destroyGLEdgeCurveResources();
 
-  unpackEdgesIfNeeded(payload.stroke_data);
-  STATE.payload = payload;
-  const [w, h] = payload.canvas_size;
+  // Clone payload coordinates so cached presets remain pristine
+  const workPayload = {
+    ...payload,
+    canvas_size: [...payload.canvas_size],
+    offset: [...payload.offset],
+    subject_size: [...payload.subject_size],
+    stroke_data: {
+      ...payload.stroke_data,
+      edges: null,
+      edgesX: null,
+    },
+  };
+  unpackEdgesIfNeeded(workPayload.stroke_data);
+  workPayload.stroke_data.edges = workPayload.stroke_data.edges.map((e) => [...e]);
+
+  const [baseW, baseH] = workPayload.canvas_size;
+  const masterW = MASTER_CANVAS_DIM;
+  const masterH = MASTER_CANVAS_DIM;
+  const padX = Math.round((masterW - baseW) * 0.5);
+  const padY = Math.round((masterH - baseH) * 0.5);
+
+  workPayload.base_canvas_size = [baseW, baseH];
+  workPayload.pad = [padX, padY];
+  workPayload.canvas_size = [masterW, masterH];
+  workPayload.offset = [workPayload.offset[0] + padX, workPayload.offset[1] + padY];
+  workPayload.stroke_data.accent_candidates = (workPayload.stroke_data.accent_candidates || []).map((c) => ({
+    ...c,
+    x: c.x + padX,
+    y: c.y + padY,
+    color: [...c.color],
+  }));
+  workPayload.stroke_data.accent_spots = (workPayload.stroke_data.accent_spots || []).map((s) => ({
+    ...s,
+    x: s.x + padX,
+    y: s.y + padY,
+    color: [...s.color],
+  }));
+
+  STATE.payload = workPayload;
 
   document.getElementById("emptyState").classList.add("hidden");
   canvasContainer.classList.remove("hidden");
@@ -565,37 +836,45 @@ async function initializeStudioFromPayload(payload) {
     sw.style.background = hex; sw.dataset.color = hex;
   }
 
-  // Použití předdekódovaného obrázku masky, pokud existuje
   const maskImg = payload._decoded ? payload._decoded.maskImg : await loadImage(payload.mask_png);
   STATE.maskCanvas = createCanvas(maskImg.width, maskImg.height);
   STATE.maskCanvas.getContext("2d", { willReadFrequently: true }).drawImage(maskImg, 0, 0);
   markMaskOverlayDirty();
 
-  // Použití předdekódovaných obrázků vrstev, pokud existují
-  let rawImgs;
+  let decodedImgs = {};
   if (payload._decoded && payload._decoded.rawImgs) {
-    rawImgs = { ...payload._decoded.rawImgs };
+    decodedImgs = { ...payload._decoded.rawImgs };
   } else {
-    rawImgs = {};
     await Promise.all(
       Object.entries(payload.layers).map(async ([key, b64]) => {
-        if (b64) rawImgs[key] = await loadImage(b64);
+        if (b64) decodedImgs[key] = await loadImage(b64);
       })
     );
   }
 
-  const cfg = payload.preset_settings;
-  // Separate clean subject_cc from watercolor-textured subject_tex if needed
+  // Lift all server images onto the 2400x2400 Master Canvas at [padX, padY]
+  const rawImgs = {};
+  for (const [key, img] of Object.entries(decodedImgs)) {
+    if (!img) continue;
+    const mode = key === "bg_paper" ? "paper" : key === "blur_bg" ? "blur_bg" : "normal";
+    rawImgs[key] = liftServerImageToMaster(img, baseW, baseH, masterW, masterH, padX, padY, mode);
+  }
+
+  const cfg = workPayload.preset_settings;
   if (cfg.WATERCOLOR_TEXTURE_ENABLED && !rawImgs.subject_tex && rawImgs.subject_cc && rawImgs.subject_raw) {
     rawImgs.subject_tex = rawImgs.subject_cc;
-    rawImgs.subject_cc = buildCleanSubjectFromRawAndTextured(rawImgs.subject_raw, rawImgs.subject_tex, payload);
+    rawImgs.subject_cc = buildCleanSubjectFromRawAndTextured(rawImgs.subject_raw, rawImgs.subject_tex, workPayload);
   }
-  STATE.serverImages = rawImgs;
 
+  // Add overscan subject pixels & append overscan edges at the end of stroke_data.edges
+  populateOverscanSubjectAndEdges(workPayload, rawImgs, baseW, baseH, masterW, masterH, padX, padY);
+  rebuildEdgeSpatialIndex(workPayload.stroke_data);
+
+  STATE.serverImages = rawImgs;
   STATE.layers = {};
 
   for (const def of LAYER_DEFINITIONS) {
-    const baseCanvas = createCanvas(w, h);
+    const baseCanvas = createCanvas(masterW, masterH);
     const baseCtx = baseCanvas.getContext("2d");
 
     let enabled = true;
@@ -636,7 +915,7 @@ async function initializeStudioFromPayload(payload) {
   await loadCachedBrushes();
   for (const def of LAYER_DEFINITIONS) {
     if (
-      ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur"].includes(
+      ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(
         def.type
       )
     ) {
@@ -647,15 +926,17 @@ async function initializeStudioFromPayload(payload) {
     rerenderLiveEdgeCurveLayer(true);
     rerenderLiveOilLayer(true);
   }
+  if (STATE.layers.glow) {
+    rerenderLiveGlowLayer(true);
+  }
+
+  STATE.viewRect = computeMasterViewRect(STATE.aspectRatioKey, STATE.aspectOrientation);
+  displayCanvas.width = STATE.viewRect.w;
+  displayCanvas.height = STATE.viewRect.h;
 
   invalidateStack();
   renderLayerListUI();
   selectLayer(STATE.selectedLayerId || "bg_brush");
-  if (displayCanvas.width !== w || displayCanvas.height !== h) {
-    displayCanvas.width = w;
-    displayCanvas.height = h;
-    fitCanvasToViewport();
-  }
   fitCanvasToViewport();
   compositeAllLayers();
 }
