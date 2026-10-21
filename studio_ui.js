@@ -196,6 +196,11 @@ function renderLayerListUI() {
       History.recordVis(def.id, lyr.vis);
       lyr.vis = !lyr.vis;
       visBtn.textContent = lyr.vis ? "👁️" : "🚫";
+      if (!lyr.vis && ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)) {
+        lyr.baseCanvas = null; // Free canvas backing memory while hidden
+      } else if (lyr.vis) {
+        ensureLayerCanvasRendered(lyr);
+      }
       if (STATE.selectedLayerId !== def.id) invalidateStack();
       compositeAllLayers();
     });
@@ -600,16 +605,13 @@ function resetLayerToOriginal(layerId) {
   invalidateStack();
   const lyr = STATE.layers[layerId];
   if (!lyr || !STATE.payload) return;
-  const [w, h] = STATE.payload.canvas_size;
   const cfg = STATE.payload.preset_settings;
 
   History.recordReset(layerId, lyr);
   lyr.params = buildInitialLayerParams(lyr.def, cfg);
   lyr.paintCanvas = null;
   lyr.eraseCanvas = null;
-
-  const bCtx = lyr.baseCanvas.getContext("2d");
-  bCtx.clearRect(0, 0, w, h);
+  lyr.strokesDirty = true;
 
   if (
     ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(
@@ -617,17 +619,18 @@ function resetLayerToOriginal(layerId) {
     )
   ) {
     rerenderProceduralLayer(layerId, true);
-  } else if (layerId === "edge_curve") {
+  } else if (layerId === "edge_curve" && lyr.vis) {
+    if (!lyr.baseCanvas) {
+      const [w, h] = STATE.payload.canvas_size;
+      lyr.baseCanvas = createCanvas(w, h);
+    }
     rerenderLiveEdgeCurveLayer(true);
-  } else if (layerId === "glow") {
+  } else if (layerId === "glow" && lyr.vis) {
     rerenderLiveGlowLayer(true);
-  } else if (layerId === "subject" && STATE.serverImages.subject_cc) {
-    bCtx.drawImage(STATE.serverImages.subject_cc, 0, 0);
+  } else if (layerId === "oil_paint" && lyr.vis) {
+    rerenderLiveOilLayer(true);
+  } else if (layerId === "subject" && STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
     rerenderLiveEdgeCurveLayer(true);
-  } else if (layerId === "oil_paint" && STATE.serverImages.oil_paint_full) {
-    bCtx.drawImage(STATE.serverImages.oil_paint_full, 0, 0);
-  } else if (lyr.origImage) {
-    bCtx.drawImage(lyr.origImage, 0, 0);
   }
 
   renderSlidersForLayer(lyr);

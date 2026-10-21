@@ -123,7 +123,7 @@ const Workflow = (() => {
     const url = URL.createObjectURL(file);
     const rawImg = await loadImage(url);
 
-    const maxDim = 1600;
+    const maxDim = IS_MOBILE ? 1024 : 1400;
     const scale = Math.min(1, maxDim / Math.max(rawImg.naturalWidth || rawImg.width, rawImg.naturalHeight || rawImg.height));
     const sw = Math.max(1, Math.round((rawImg.naturalWidth || rawImg.width) * scale));
     const sh = Math.max(1, Math.round((rawImg.naturalHeight || rawImg.height) * scale));
@@ -652,6 +652,12 @@ const Workflow = (() => {
     STATE.framedMaskBase64 = STATE.rawMaskBase64;
     STATE.detectedEyes = px.eyes || [];
     STATE.maskCanvas = null;
+
+    // Free heavy Step 2 temporary buffers & AI WASM models before Step 3 Studio allocates layers
+    CROP.maskTintCanvas = null;
+    if (window.SubjectVision && window.SubjectVision.releaseMemory) {
+      await window.SubjectVision.releaseMemory();
+    }
 
     goTo("studio");
     await runModalGeneration(false, false);

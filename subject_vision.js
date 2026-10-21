@@ -140,7 +140,7 @@
     _animalInitPromise = (async () => {
       const ort = await loadScriptOnce(ORT_CDN);
       if (!ort) return null;
-      ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+      ort.env.wasm.numThreads = 1;
       ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 
       const buf = await fetchCachedAnimalModelBuffer();
@@ -841,20 +841,42 @@
     });
   }
 
+  const IS_MOBILE_DEVICE =
+    typeof window !== "undefined" &&
+    (window.innerWidth <= 960 || /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent));
+
+  // Free WASM heaps before Step 3 (Studio) starts so iOS/Desktop RAM stays low
+  async function releaseMemory() {
+    if (_animalSess) {
+      try {
+        if (typeof _animalSess.release === "function") await _animalSess.release();
+      } catch (_) {}
+      _animalSess = null;
+      _animalInitPromise = null;
+    }
+    if (IS_MOBILE_DEVICE) {
+      try { if (_face && _face.close) _face.close(); } catch (_) {}
+      try { if (_obj && _obj.close) _obj.close(); } catch (_) {}
+      _face = null;
+      _obj = null;
+      _initPromise = null;
+    }
+  }
+
   window.SubjectVision = {
     init,
-    initAnimalPoseModel,
-    detect,
+    initAnimalPoseModel: () => (IS_MOBILE_DEVICE ? Promise.resolve(null) : initAnimalPoseModel()),
+    detect: async (canvas, opts = {}) => {
+      // On mobile, skip the 54.5 MB ONNX download so uploads are fast and iOS never crashes
+      if (IS_MOBILE_DEVICE) {
+        _animalInitPromise = Promise.resolve(null);
+      }
+      return detect(canvas, opts);
+    },
     fuse,
     recommendPreset,
     isPureWhiteSubject,
+    releaseMemory,
   };
-
-  // Prewarm both MediaPipe and RTMPose-m AP-10K ONNX in background
-  const prewarm = () => {
-    init();
-    setTimeout(() => initAnimalPoseModel(), 400);
-  };
-  if ("requestIdleCallback" in window) requestIdleCallback(prewarm, { timeout: 1200 });
-  else setTimeout(prewarm, 250);
+  // NOTE: Eager page-load prewarm removed so initial page load on GitHub Pages is instant!
 })();
