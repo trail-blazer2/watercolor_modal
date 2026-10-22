@@ -373,12 +373,13 @@ function renderSlidersForLayer(lyr) {
     });
   }
 
-  addSlider(container, "Brightness", p.brightness, 30, 200, "%", (val) => {
-    p.brightness = val;
-    scheduleComposite();
-  });
-
+  // Brightness, Contrast, and Saturation are hidden for the Glow layer
   if (def.type !== "glow") {
+    addSlider(container, "Brightness", p.brightness, 30, 200, "%", (val) => {
+      p.brightness = val;
+      scheduleComposite();
+    });
+
     addSlider(container, "Contrast", p.contrast, 30, 200, "%", (val) => {
       p.contrast = val;
       scheduleComposite();
@@ -626,7 +627,7 @@ function addSlider(parent, labelText, value, min, max, unit, onInput) {
   const input = document.createElement("input");
   input.type = "range";
   input.min = min; input.max = max; input.value = value;
-  input.step = unit === "px" ? 5 : 1;
+  input.step = unit === "px" && max > 100 ? 5 : 1;
   input.addEventListener("input", () => {
     History.paramBegin();
     valSpan.textContent = `${input.value}${unit}`;

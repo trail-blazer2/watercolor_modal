@@ -145,6 +145,8 @@ const canvasContainer = document.getElementById("canvasContainer");
 const viewport = document.getElementById("viewport");
 const brushCursor = document.getElementById("brushCursor");
 
+const BRUSH_CACHE_KEY = "wc_cached_brushes_v2";
+
 // ============================================================================
 // 4. PRE-WARMER, PROGRESS BAR & LIGHTWEIGHT BRUSH CACHE
 // ============================================================================
@@ -242,7 +244,7 @@ function finishProgressBar() {
 async function loadCachedBrushes() {
   if (Object.keys(STATE.brushImages).length >= 7) return;
   try {
-    const cachedStr = localStorage.getItem("wc_cached_brushes_v1");
+    const cachedStr = localStorage.getItem(BRUSH_CACHE_KEY);
     if (cachedStr) {
       const data = JSON.parse(cachedStr);
       for (const [name, b64] of Object.entries(data)) {
@@ -265,7 +267,7 @@ async function fetchBrushTextures() {
       STATE.brushImages[name] = await loadImage(b64);
     }
     invalidateGLBrushTextures();
-    try { localStorage.setItem("wc_cached_brushes_v1", JSON.stringify(data)); } catch (_) {}
+    try { localStorage.setItem(BRUSH_CACHE_KEY, JSON.stringify(data)); } catch (_) {}
   } catch (_) {}
 }
 
@@ -323,13 +325,6 @@ function createCanvas(w, h) {
 // ============================================================================
 // 5. ASPECT RATIO PARSER & ZERO-JUMP VIEWPORT CROP
 // ============================================================================
-function resolveActiveProfileKey() {
-  const presetEl = document.getElementById("presetSelect");
-  const presetKey = presetEl ? presetEl.value : "animals";
-  if (presetKey.startsWith("cars")) return "car";
-  if (presetKey === "people") return "person";
-  return "animal";
-}
 
 function parseAspectRatioToCm(ratioVal, profileKey, orientationOverride) {
   const prof = profileKey || resolveActiveProfileKey();
@@ -362,28 +357,6 @@ function resolveActiveProfileKey() {
   if (presetKey.startsWith("cars")) return "car";
   if (presetKey === "people") return "person";
   return "animal";
-}
-
-function parseAspectRatioToCm(ratioVal, profileKey, orientationOverride) {
-  const prof = profileKey || resolveActiveProfileKey();
-  const isDefaultLandscape = prof === "car";
-  const orient = orientationOverride || STATE.aspectOrientation || (isDefaultLandscape ? "landscape" : "portrait");
-  const v = String(ratioVal || "a4").trim().toLowerCase();
-
-  let longSide = 141.421356; // ISO A2/A3/A4 (sqrt(2) * 100)
-  let shortSide = 100;
-
-  if (v.includes("4:3") || v.includes("4_3") || v.includes("3:4")) {
-    longSide = 133.333333; shortSide = 100;
-  } else if (v.includes("3:2") || v.includes("3_2") || v.includes("2:3")) {
-    longSide = 150; shortSide = 100;
-  } else if (v.includes("16:9") || v.includes("16_9") || v.includes("9:16")) {
-    longSide = 177.777778; shortSide = 100;
-  }
-
-  return orient === "landscape"
-    ? { width: longSide, height: shortSide }
-    : { width: shortSide, height: longSide };
 }
 
 // Computes the exact viewport crop rectangle inside Overscan Space while strictly preserving aspect ratio R
@@ -1054,52 +1027,62 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
     ctx.drawImage(serverImg, padX, padY, baseW, baseH);
 
     if (overscanFillCanvas && hasUncropped) {
-      // Wide 80px smooth feather at the exact clipped boundaries [validX0, validY0, validX1, validY1]
-      const feather = 80;
-      const trim = 4;
-      ctx.save();
-      ctx.globalCompositeOperation = "destination-out";
+      const clipLeft = fullX < validX0 - 1;
+      const clipRight = fullX + fullW > validX1 + 1;
+      const clipTop = fullY < validY0 - 1;
+      const clipBottom = fullY + fullH > validY1 + 1;
 
-      if (fullX < validX0 - 1) {
-        const g = ctx.createLinearGradient(validX0 + trim, 0, validX0 + trim + feather, 0);
-        g.addColorStop(0, "rgba(0,0,0,1)");
-        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
-        g.addColorStop(1, "rgba(0,0,0,0)");
-        ctx.fillStyle = g;
-        ctx.fillRect(0, 0, validX0 + trim + feather, overH);
-      }
-      if (fullX + fullW > validX1 + 1) {
-        const rx = validX1 - trim;
-        const g = ctx.createLinearGradient(rx - feather, 0, rx, 0);
-        g.addColorStop(0, "rgba(0,0,0,0)");
-        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
-        g.addColorStop(1, "rgba(0,0,0,1)");
-        ctx.fillStyle = g;
-        ctx.fillRect(rx - feather, 0, overW - (rx - feather), overH);
-      }
-      if (fullY < validY0 - 1) {
-        const g = ctx.createLinearGradient(0, validY0 + trim, 0, validY0 + trim + feather);
-        g.addColorStop(0, "rgba(0,0,0,1)");
-        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
-        g.addColorStop(1, "rgba(0,0,0,0)");
-        ctx.fillStyle = g;
-        ctx.fillRect(0, 0, overW, validY0 + trim + feather);
-      }
-      if (fullY + fullH > validY1 + 1) {
-        const by = validY1 - trim;
-        const g = ctx.createLinearGradient(0, by - feather, 0, by);
-        g.addColorStop(0, "rgba(0,0,0,0)");
-        g.addColorStop(0.5, "rgba(0,0,0,0.5)");
-        g.addColorStop(1, "rgba(0,0,0,1)");
-        ctx.fillStyle = g;
-        ctx.fillRect(0, by - feather, overW, overH - (by - feather));
-      }
-      ctx.restore();
+      if (clipLeft || clipRight || clipTop || clipBottom) {
+        const feather = 64;
+        const trim = 3;
+        ctx.save();
+        ctx.globalCompositeOperation = "destination-out";
 
-      ctx.save();
-      ctx.globalCompositeOperation = "destination-over";
-      ctx.drawImage(overscanFillCanvas, fullX, fullY, fullW, fullH);
-      ctx.restore();
+        if (clipLeft) {
+          const g = ctx.createLinearGradient(validX0 + trim, 0, validX0 + trim + feather, 0);
+          g.addColorStop(0, "rgba(0,0,0,1)");
+          g.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = g;
+          ctx.fillRect(0, 0, validX0 + trim + feather, overH);
+        }
+        if (clipRight) {
+          const rx = validX1 - trim;
+          const g = ctx.createLinearGradient(rx - feather, 0, rx, 0);
+          g.addColorStop(0, "rgba(0,0,0,0)");
+          g.addColorStop(1, "rgba(0,0,0,1)");
+          ctx.fillStyle = g;
+          ctx.fillRect(rx - feather, 0, overW - (rx - feather), overH);
+        }
+        if (clipTop) {
+          const g = ctx.createLinearGradient(0, validY0 + trim, 0, validY0 + trim + feather);
+          g.addColorStop(0, "rgba(0,0,0,1)");
+          g.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = g;
+          ctx.fillRect(0, 0, overW, validY0 + trim + feather);
+        }
+        if (clipBottom) {
+          const by = validY1 - trim;
+          const g = ctx.createLinearGradient(0, by - feather, 0, by);
+          g.addColorStop(0, "rgba(0,0,0,0)");
+          g.addColorStop(1, "rgba(0,0,0,1)");
+          ctx.fillStyle = g;
+          ctx.fillRect(0, by - feather, overW, overH - (by - feather));
+        }
+        ctx.restore();
+
+        // Draw overscanFillCanvas ONLY in the outer border regions that were actually clipped by the frame
+        // so it NEVER adds an untrimmed halo around the subject inside the frame!
+        ctx.save();
+        ctx.beginPath();
+        if (clipLeft) ctx.rect(0, 0, validX0 + trim + feather, overH);
+        if (clipRight) ctx.rect(validX1 - trim - feather, 0, overW - (validX1 - trim - feather), overH);
+        if (clipTop) ctx.rect(0, 0, overW, validY0 + trim + feather);
+        if (clipBottom) ctx.rect(0, validY1 - trim - feather, overW, overH - (validY1 - trim - feather));
+        ctx.clip();
+        ctx.globalCompositeOperation = "destination-over";
+        ctx.drawImage(overscanFillCanvas, fullX, fullY, fullW, fullH);
+        ctx.restore();
+      }
     }
     return c;
   };

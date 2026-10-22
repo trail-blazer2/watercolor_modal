@@ -940,6 +940,7 @@ function rerenderLiveGlowLayer(skipComposite = false) {
   const { gw, gh, scale, maskAlpha, distPx, ringBuf, outCanvas, outCtx, outImg } = cache;
   const n = gw * gh;
 
+  // 1. Exact dilated rim of thickness p.size (matches PIL MaxFilter(glow_width * 2 + 1) - mask)
   const maxDist = Math.max(0.5, p.size * scale);
   for (let i = 0; i < n; i++) {
     const d = distPx[i];
@@ -952,12 +953,15 @@ function rerenderLiveGlowLayer(skipComposite = false) {
     }
   }
 
+  // 2. Exact Gaussian-variance matched 3-pass box blur:
+  // 3 box blurs of radius r have variance r*(r+1) = sigmaHalf^2 -> r = sqrt(sigmaHalf^2 + 0.25) - 0.5
   const blurRatio = p.defaultBlur / Math.max(1, p.defaultSize);
   const sigmaHalf = Math.max(0.8, p.size * blurRatio * scale);
-  const targetTotalR = Math.max(3, Math.round(sigmaHalf * 3.0 - 1.5));
-  const r1 = Math.max(1, Math.floor(targetTotalR / 3));
-  const r2 = Math.max(1, Math.floor((targetTotalR - r1) / 2));
-  const r3 = Math.max(1, targetTotalR - r1 - r2);
+  const exactR = Math.max(1.0, Math.sqrt(sigmaHalf * sigmaHalf + 0.25) - 0.5);
+  const totalR = Math.max(3, Math.round(exactR * 3));
+  const r1 = Math.max(1, Math.floor(totalR / 3));
+  const r2 = Math.max(1, Math.floor((totalR - r1) / 2));
+  const r3 = Math.max(1, totalR - r1 - r2);
 
   let blurred = boxBlurFloat32(ringBuf, gw, gh, r1);
   blurred = boxBlurFloat32(blurred, gw, gh, r2);
@@ -979,6 +983,7 @@ function rerenderLiveGlowLayer(skipComposite = false) {
   outCtx.putImageData(outImg, 0, 0);
   ctx.drawImage(outCanvas, 0, 0, gw, gh, 0, 0, cw, ch);
 
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   if (_stack.id !== "glow") invalidateStack();
   if (!skipComposite) compositeAllLayers();
 }
