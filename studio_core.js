@@ -1480,6 +1480,23 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   }
 
   appendOverscanEdges(workPayload, overW, overH);
+  // Free redundant 21.5 MB subject_raw canvas (it will be decoded on-demand from ServerLayerBlobs if ccBlend < 100)
+  if (rawImgs.subject_raw) {
+    if (rawImgs.subject_raw.tagName === "CANVAS") {
+      rawImgs.subject_raw.width = 1;
+      rawImgs.subject_raw.height = 1;
+    }
+    delete rawImgs.subject_raw;
+  }
+
+  // Free Step 2 temporary canvases (~30 MB) now that overscan layers and edges are built
+  if (STATE.uncroppedPlacement) {
+    for (const k of ["sourceCanvas", "maskCanvas", "cutoutCanvas"]) {
+      const c = STATE.uncroppedPlacement[k];
+      if (c && c.tagName === "CANVAS") { c.width = 1; c.height = 1; }
+      STATE.uncroppedPlacement[k] = null;
+    }
+  }
   rebuildEdgeSpatialIndex(workPayload.stroke_data);
 
   STATE.serverImages = rawImgs;
@@ -1569,6 +1586,13 @@ function freeEdgeCurveCpuUploadBuffers() {
     STATE.edgeCurveCache.smoothRgba = null;
     STATE.edgeCurveCache.rawZonesRgba = null;
     STATE.edgeCurveCache.staticWeightsRgba = null;
+    if (STATE.serverImages && STATE.serverImages.edge_curve) {
+      if (STATE.serverImages.edge_curve.tagName === "CANVAS") {
+        STATE.serverImages.edge_curve.width = 1;
+        STATE.serverImages.edge_curve.height = 1;
+      }
+      STATE.serverImages.edge_curve = null;
+    }
   }
 }
 

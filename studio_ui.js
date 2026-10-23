@@ -269,7 +269,24 @@ function renderLayerListUI() {
 }
 
 function selectLayer(layerId) {
+  const prevId = STATE.selectedLayerId;
   STATE.selectedLayerId = layerId;
+
+  if (prevId && prevId !== layerId && STATE.layers[prevId]) {
+    const prevLyr = STATE.layers[prevId];
+    if (
+      prevLyr.baseCanvas &&
+      ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "accent"].includes(prevLyr.def.type)
+    ) {
+      prevLyr.baseCanvas.width = 1;
+      prevLyr.baseCanvas.height = 1;
+      prevLyr.baseCanvas = null;
+    }
+  }
+  if (STATE.layers[layerId] && STATE.layers[layerId].vis) {
+    ensureLayerCanvasRendered(STATE.layers[layerId]);
+  }
+
   document.querySelectorAll(".layer-item").forEach((el) => {
     el.classList.toggle("selected", el.dataset.id === layerId);
   });

@@ -323,11 +323,41 @@ function applyBottomQuarterFade(tCtx, w, h, fadePercent) {
   tCtx.restore();
 }
 
+// Renders a procedural layer's precomputed strokes via WebGL and returns the shared WebGL canvas
+// (Zero 2D canvas allocation needed for non-selected layers!)
+function renderProceduralStrokesToSharedGL(lyr) {
+  if (!lyr || !STATE.payload) return null;
+  if (!lyr.cachedStrokes || lyr.strokesDirty) {
+    lyr.cachedStrokes = buildProceduralStrokesInOverscanSpace(lyr);
+    lyr.strokesDirty = false;
+  }
+  const p = lyr.params;
+  const brushKey = STATE.brushImages[p.brushFile] ? p.brushFile : Object.keys(STATE.brushImages)[0];
+  const brushImg = STATE.brushImages[brushKey];
+  if (!brushImg) return null;
+  const [overW, overH] = STATE.payload.canvas_size;
+  return drawStrokesWebGL(overW, overH, brushKey, brushImg, lyr.cachedStrokes);
+}
+
 function ensureLayerCanvasRendered(lyr) {
   const def = lyr.def;
-  if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)) {
-    if (!lyr.baseCanvas || lyr.strokesDirty) {
-      rerenderProceduralLayer(def.id, true);
+  const isProcedural = ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type);
+
+  if (isProcedural) {
+    if (!lyr.cachedStrokes || lyr.strokesDirty) {
+      lyr.cachedStrokes = buildProceduralStrokesInOverscanSpace(lyr);
+      lyr.strokesDirty = false;
+    }
+    // Only allocate a persistent 2D baseCanvas for the ONE currently selected layer (or mask_blur)
+    // Non-selected procedural layers draw directly from the shared WebGL canvas during stack rebuild!
+    if (STATE.selectedLayerId === def.id || def.type === "mask_blur") {
+      if (!lyr.baseCanvas) {
+        rerenderProceduralLayer(def.id, true);
+      }
+    } else if (lyr.baseCanvas) {
+      lyr.baseCanvas.width = 1;
+      lyr.baseCanvas.height = 1;
+      lyr.baseCanvas = null;
     }
   } else if (def.id === "edge_curve" && !lyr.baseCanvas) {
     const [bw, bh] = STATE.payload.canvas_size;
@@ -345,6 +375,64 @@ function ensureLayerCanvasRendered(lyr) {
     rerenderLiveOilLayer(true);
   } else if (def.id === "glow" && !lyr.baseCanvas) {
     rerenderLiveGlowLayer(true);
+  }
+}
+
+function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
+  if (def.id === "bg_paper") {
+    drawPaperLayerInViewport(targetCtx, vr);
+    return;
+  }
+
+  const movable = isSubjectMovableLayer(def.id);
+
+  if (def.id === "subject") {
+    const p = lyr.params;
+    const subMain =
+      p.wcTexture && STATE.serverImages.subject_tex
+        ? STATE.serverImages.subject_tex
+        : STATE.serverImages.subject_cc;
+
+    if (p.ccBlend < 100 && !STATE.serverImages.subject_raw && typeof ensureServerRasterLayerDecoded === "function") {
+      ensureServerRasterLayerDecoded("subject_raw").then(() => scheduleComposite());
+    }
+
+    targetCtx.save();
+    applyOverscanToViewportTransform(targetCtx, vr, true);
+    if (p.ccBlend < 100 && STATE.serverImages.subject_raw) {
+      targetCtx.drawImage(STATE.serverImages.subject_raw, 0, 0);
+      if (subMain) {
+        targetCtx.globalAlpha = p.ccBlend / 100;
+        targetCtx.drawImage(subMain, 0, 0);
+      }
+    } else if (subMain) {
+      targetCtx.drawImage(subMain, 0, 0);
+    }
+    targetCtx.restore();
+    return;
+  }
+
+  const src = lyr.baseCanvas || lyr.origImage;
+  if (src) {
+    targetCtx.save();
+    applyOverscanToViewportTransform(targetCtx, vr, movable);
+    targetCtx.drawImage(src, 0, 0);
+    targetCtx.restore();
+    return;
+  }
+
+  // Memory-saving direct WebGL render for non-selected procedural layers
+  if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "accent"].includes(def.type)) {
+    const glCanvas = renderProceduralStrokesToSharedGL(lyr);
+    if (glCanvas) {
+      targetCtx.save();
+      applyOverscanToViewportTransform(targetCtx, vr, movable);
+      if (def.type !== "accent" && lyr.params.baseOpacity < 1.0) {
+        targetCtx.globalAlpha *= lyr.params.baseOpacity;
+      }
+      targetCtx.drawImage(glCanvas, 0, 0);
+      targetCtx.restore();
+    }
   }
 }
 
@@ -392,44 +480,6 @@ function drawPaperLayerInViewport(targetCtx, vr) {
   targetCtx.restore();
 }
 
-function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
-  if (def.id === "bg_paper") {
-    drawPaperLayerInViewport(targetCtx, vr);
-    return;
-  }
-
-  const movable = isSubjectMovableLayer(def.id);
-
-  if (def.id === "subject") {
-    const p = lyr.params;
-    const subMain =
-      p.wcTexture && STATE.serverImages.subject_tex
-        ? STATE.serverImages.subject_tex
-        : STATE.serverImages.subject_cc;
-
-    targetCtx.save();
-    applyOverscanToViewportTransform(targetCtx, vr, true);
-    if (p.ccBlend < 100 && STATE.serverImages.subject_raw) {
-      targetCtx.drawImage(STATE.serverImages.subject_raw, 0, 0);
-      if (subMain) {
-        targetCtx.globalAlpha = p.ccBlend / 100;
-        targetCtx.drawImage(subMain, 0, 0);
-      }
-    } else if (subMain) {
-      targetCtx.drawImage(subMain, 0, 0);
-    }
-    targetCtx.restore();
-    return;
-  }
-
-  const src = lyr.baseCanvas || lyr.origImage;
-  if (src) {
-    targetCtx.save();
-    applyOverscanToViewportTransform(targetCtx, vr, movable);
-    targetCtx.drawImage(src, 0, 0);
-    targetCtx.restore();
-  }
-}
 
 function drawLayerInto(ctx, def) {
   if (!def) return;
@@ -527,20 +577,28 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
   const hasSubjectBlend = isSubject && p.ccBlend < 100 && STATE.serverImages.subject_raw;
   const hasPaintOrErase = !!(lyr.paintCanvas || lyr.eraseCanvas);
 
-  const subMain =
+  let subMain =
     isSubject && p.wcTexture && STATE.serverImages.subject_tex
       ? STATE.serverImages.subject_tex
       : isSubject
       ? STATE.serverImages.subject_cc
       : lyr.baseCanvas || lyr.origImage;
+
+  let isDirectGL = false;
+  if (!subMain && ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "accent"].includes(def.type)) {
+    subMain = renderProceduralStrokesToSharedGL(lyr);
+    isDirectGL = true;
+  }
   if (!subMain) return;
+
+  const effOp = isDirectGL && def.type !== "accent" ? op * (p.baseOpacity ?? 1.0) : op;
 
   if (!hasFilter && !hasSubjectBlend && !hasPaintOrErase) {
     targetCtx.save();
-    targetCtx.globalAlpha = Math.min(1, op);
+    targetCtx.globalAlpha = Math.min(1, effOp);
     targetCtx.drawImage(subMain, 0, 0);
-    if (op > 1) {
-      targetCtx.globalAlpha = Math.min(1, op - 1);
+    if (effOp > 1) {
+      targetCtx.globalAlpha = Math.min(1, effOp - 1);
       targetCtx.drawImage(subMain, 0, 0);
     }
     targetCtx.restore();
@@ -567,13 +625,104 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
   }
 
   targetCtx.save();
-  targetCtx.globalAlpha = Math.min(1, op);
+  targetCtx.globalAlpha = Math.min(1, effOp);
   targetCtx.drawImage(tmp, 0, 0);
-  if (op > 1) {
-    targetCtx.globalAlpha = Math.min(1, op - 1);
+  if (effOp > 1) {
+    targetCtx.globalAlpha = Math.min(1, effOp - 1);
     targetCtx.drawImage(tmp, 0, 0);
   }
   targetCtx.restore();
+  tmp.width = 1; tmp.height = 1;
+}
+
+function rerenderProceduralLayer(layerId, skipComposite = false) {
+  if (layerId === "glow") {
+    rerenderLiveGlowLayer(skipComposite);
+    return;
+  }
+  const lyr = STATE.layers[layerId];
+  if (!lyr || !STATE.payload) return;
+  const def = lyr.def;
+  const p = lyr.params;
+
+  if (!lyr.cachedStrokes || lyr.strokesDirty) {
+    lyr.cachedStrokes = buildProceduralStrokesInOverscanSpace(lyr);
+    lyr.strokesDirty = false;
+  }
+
+  // Only allocate/keep a 2D baseCanvas if this layer is currently selected or is mask_blur!
+  const needsCanvas = lyr.vis && (STATE.selectedLayerId === layerId || def.type === "mask_blur");
+  if (!needsCanvas) {
+    if (lyr.baseCanvas) {
+      lyr.baseCanvas.width = 1;
+      lyr.baseCanvas.height = 1;
+      lyr.baseCanvas = null;
+    }
+    invalidateMoveFastStack();
+    if (_stack.id !== layerId) invalidateStack();
+    if (!skipComposite) compositeAllLayers();
+    return;
+  }
+
+  const brushKey = STATE.brushImages[p.brushFile] ? p.brushFile : Object.keys(STATE.brushImages)[0];
+  const brushImg = STATE.brushImages[brushKey];
+  if (!brushImg) return;
+
+  const [overW, overH] = STATE.payload.canvas_size;
+  if (!lyr.baseCanvas) {
+    lyr.baseCanvas = createCanvas(overW, overH);
+  } else if (lyr.baseCanvas.width !== overW || lyr.baseCanvas.height !== overH) {
+    lyr.baseCanvas.width = overW;
+    lyr.baseCanvas.height = overH;
+  }
+
+  const ctx = lyr.baseCanvas.getContext("2d");
+  ctx.clearRect(0, 0, overW, overH);
+  const strokes = lyr.cachedStrokes;
+
+  if (def.type === "mask_blur" && STATE.serverImages.blur_bg) {
+    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
+    ctx.drawImage(STATE.serverImages.blur_bg, 0, 0);
+    if (glCanvas) {
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-in";
+      ctx.globalAlpha = p.baseOpacity;
+      ctx.drawImage(glCanvas, 0, 0);
+      ctx.restore();
+    }
+  } else if (def.type === "accent") {
+    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
+    if (glCanvas) {
+      ctx.drawImage(glCanvas, 0, 0);
+    } else {
+      for (const s of strokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
+    }
+  } else {
+    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
+    if (glCanvas) {
+      ctx.save();
+      ctx.globalAlpha = p.baseOpacity;
+      ctx.drawImage(glCanvas, 0, 0);
+      ctx.restore();
+    } else {
+      for (const s of strokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
+      if (p.baseOpacity < 1.0) {
+        ctx.save();
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.fillStyle = `rgba(0, 0, 0, ${p.baseOpacity})`;
+        ctx.fillRect(0, 0, overW, overH);
+        ctx.restore();
+      }
+    }
+  }
+
+  invalidateMoveFastStack();
+  if (_stack.id !== layerId) {
+    invalidateStack();
+  }
+  if (!skipComposite) {
+    compositeAllLayers();
+  }
 }
 
 function ensureMoveFastStackReady() {
@@ -1448,86 +1597,6 @@ function buildProceduralStrokesInOverscanSpace(lyr) {
   return strokes;
 }
 
-function rerenderProceduralLayer(layerId, skipComposite = false) {
-  if (layerId === "glow") {
-    rerenderLiveGlowLayer(skipComposite);
-    return;
-  }
-  const lyr = STATE.layers[layerId];
-  if (!lyr || !STATE.payload) return;
-  const def = lyr.def;
-  const p = lyr.params;
-
-  if (!lyr.cachedStrokes || lyr.strokesDirty) {
-    lyr.cachedStrokes = buildProceduralStrokesInOverscanSpace(lyr);
-    lyr.strokesDirty = false;
-  }
-
-  if (!lyr.vis) {
-    lyr.baseCanvas = null;
-    return;
-  }
-
-  const brushKey = STATE.brushImages[p.brushFile] ? p.brushFile : Object.keys(STATE.brushImages)[0];
-  const brushImg = STATE.brushImages[brushKey];
-  if (!brushImg) return;
-
-  const [overW, overH] = STATE.payload.canvas_size;
-  if (!lyr.baseCanvas) {
-    lyr.baseCanvas = createCanvas(overW, overH);
-  } else if (lyr.baseCanvas.width !== overW || lyr.baseCanvas.height !== overH) {
-    lyr.baseCanvas.width = overW;
-    lyr.baseCanvas.height = overH;
-  }
-
-  const ctx = lyr.baseCanvas.getContext("2d");
-  ctx.clearRect(0, 0, overW, overH);
-  const strokes = lyr.cachedStrokes;
-
-  if (def.type === "mask_blur" && STATE.serverImages.blur_bg) {
-    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
-    ctx.drawImage(STATE.serverImages.blur_bg, 0, 0);
-    if (glCanvas) {
-      ctx.save();
-      ctx.globalCompositeOperation = "destination-in";
-      ctx.globalAlpha = p.baseOpacity;
-      ctx.drawImage(glCanvas, 0, 0);
-      ctx.restore();
-    }
-  } else if (def.type === "accent") {
-    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
-    if (glCanvas) {
-      ctx.drawImage(glCanvas, 0, 0);
-    } else {
-      for (const s of strokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
-    }
-  } else {
-    const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
-    if (glCanvas) {
-      ctx.save();
-      ctx.globalAlpha = p.baseOpacity;
-      ctx.drawImage(glCanvas, 0, 0);
-      ctx.restore();
-    } else {
-      for (const s of strokes) colorizeAndDrawBrush(ctx, brushImg, s.x, s.y, s.size, s.rot, s.rgb, s.op);
-      if (p.baseOpacity < 1.0) {
-        ctx.save();
-        ctx.globalCompositeOperation = "destination-in";
-        ctx.fillStyle = `rgba(0, 0, 0, ${p.baseOpacity})`;
-        ctx.fillRect(0, 0, overW, overH);
-        ctx.restore();
-      }
-    }
-  }
-
-  invalidateMoveFastStack();
-  if (_stack.id !== layerId) {
-    invalidateStack();
-  }
-  if (!skipComposite) {
-    compositeAllLayers();
-  }
-}
 
 // Fast 60 FPS subject move/scale update: ZERO procedural re-renders!
 let _pendingSubjectMoveRaf = 0;
