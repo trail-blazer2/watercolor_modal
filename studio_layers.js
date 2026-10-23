@@ -94,10 +94,23 @@ function scheduleComposite() {
   _ensureRaf();
 }
 
+function isCarPresetActive() {
+  const key =
+    (STATE.payload && STATE.payload.preset_key) ||
+    (document.getElementById("presetSelect") && document.getElementById("presetSelect").value) ||
+    "";
+  return key.startsWith("cars");
+}
+
 function ensureSubjectParams(p) {
   const cfg = (STATE.payload && STATE.payload.preset_settings) || {};
+  const isCar = isCarPresetActive();
   if (p.ccBlend === undefined) p.ccBlend = 100;
-  if (p.bottomFade === undefined || Number.isNaN(p.bottomFade)) p.bottomFade = 100;
+  if (isCar) {
+    p.bottomFade = 0;
+  } else if (p.bottomFade === undefined || Number.isNaN(p.bottomFade)) {
+    p.bottomFade = 100;
+  }
   if (p.wcTexture === undefined) p.wcTexture = !!cfg.WATERCOLOR_TEXTURE_ENABLED;
   if (p.underWindowEnabled === undefined) p.underWindowEnabled = false;
   if (p.underWindowColor === undefined) p.underWindowColor = cfg.DARK_BACKGROUND_ENABLED ? "black" : "white";
@@ -246,6 +259,17 @@ const _moveFastStack = {
 function invalidateStack() { _stack.dirty = true; }
 function invalidateMoveFastStack() { _moveFastStack.dirty = true; }
 
+function releaseMoveFastStack() {
+  _moveFastStack.dirty = true;
+  for (const k of ["movableUnder", "subjectGroup", "fixedOvals", "movableOver"]) {
+    if (_moveFastStack[k]) {
+      _moveFastStack[k].width = 1;
+      _moveFastStack[k].height = 1;
+      _moveFastStack[k] = null;
+    }
+  }
+}
+
 const FIXED_CANVAS_LAYERS = new Set(["outer_white", "white_ellipse", "dark_ellipse", "bg_paper"]);
 
 function isSubjectMovableLayer(layerId) {
@@ -308,6 +332,13 @@ function ensureLayerCanvasRendered(lyr) {
   } else if (def.id === "edge_curve" && !lyr.baseCanvas) {
     const [bw, bh] = STATE.payload.canvas_size;
     lyr.baseCanvas = createCanvas(bw, bh);
+    if (typeof ensureServerRasterLayerDecoded === "function" && (!STATE.serverImages || !STATE.serverImages.edge_curve)) {
+      ensureServerRasterLayerDecoded("edge_curve").then(() => {
+        rerenderLiveEdgeCurveLayer(false);
+        if (typeof freeEdgeCurveCpuUploadBuffers === "function") freeEdgeCurveCpuUploadBuffers();
+      });
+      return;
+    }
     rerenderLiveEdgeCurveLayer(true);
     if (typeof freeEdgeCurveCpuUploadBuffers === "function") freeEdgeCurveCpuUploadBuffers();
   } else if (def.id === "oil_paint" && !lyr.baseCanvas) {
@@ -414,7 +445,10 @@ function drawLayerInto(ctx, def) {
   const isSubject = def.id === "subject";
   const isSubjectOverlay = def.id === "oil_paint" || def.id === "edge_curve";
   const subParams = STATE.layers.subject ? ensureSubjectParams(STATE.layers.subject.params) : null;
-  const bottomFadePct = isSubject
+  const isCar = isCarPresetActive();
+  const bottomFadePct = isCar
+    ? 0
+    : isSubject
     ? (ensureSubjectParams(p).bottomFade ?? 100)
     : isSubjectOverlay && subParams
     ? (subParams.bottomFade ?? 100)
@@ -590,7 +624,6 @@ function ensureMoveFastStackReady() {
 function compositeFastSubjectMove() {
   ensureMoveFastStackReady();
   const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
-
   displayCtx.clearRect(0, 0, vr.w, vr.h);
 
   // 1. Fixed Paper Base
@@ -606,8 +639,11 @@ function compositeFastSubjectMove() {
   drawBackdropWindowIfEnabled(displayCtx);
 
   // 4. Movable Subject + Oil + EdgeCurve with Fixed Canvas Oval Bottom 25% Fade
+  const isCar = isCarPresetActive();
   const subParams = STATE.layers.subject ? ensureSubjectParams(STATE.layers.subject.params) : null;
-  const bottomFadePct = subParams ? (subParams.bottomFade ?? 100) : 0;
+  
+  const bottomFadePct = isCar ? 0 : (subParams ? (subParams.bottomFade ?? 100) : 0);
+
   if (bottomFadePct > 0.05) {
     if (_tempLayerCanvas.width !== vr.w || _tempLayerCanvas.height !== vr.h) {
       _tempLayerCanvas.width = vr.w;
@@ -806,12 +842,22 @@ function getOrBuildOilDetailCache() {
   pCtx.filter = "none";
 
   STATE.oilDetailCache = { bx, by, bw, bh, oilCrop, popCanvas };
+  // Release the redundant 21.5 MB full-size oil_paint_full canvas now that oilCrop & popCanvas are cached
+  if (STATE.serverImages && STATE.serverImages.oil_paint_full) {
+    if (STATE.serverImages.oil_paint_full.tagName === "CANVAS") {
+      STATE.serverImages.oil_paint_full.width = 1;
+      STATE.serverImages.oil_paint_full.height = 1;
+    }
+    STATE.serverImages.oil_paint_full = null;
+  }
+
+  STATE.oilDetailCache = { bx, by, bw, bh, oilCrop, popCanvas };
   return STATE.oilDetailCache;
 }
 
 function rerenderLiveOilLayer(skipComposite = false) {
   const lyr = STATE.layers.oil_paint;
-  if (!lyr || !STATE.serverImages.oil_paint_full) return;
+  if (!lyr || (!STATE.serverImages.oil_paint_full && !STATE.oilDetailCache)) return;
   const [w, h] = STATE.payload.canvas_size;
   if (!lyr.baseCanvas) lyr.baseCanvas = createCanvas(w, h);
 

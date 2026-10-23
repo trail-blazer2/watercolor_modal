@@ -327,11 +327,14 @@ function renderSlidersForLayer(lyr) {
 
   if (def.type === "subject") {
     ensureSubjectParams(p);
-    addSlider(container, "Fade Out Bottom (Lower 25%)", p.bottomFade, 0, 100, "%", (val) => {
-      p.bottomFade = val;
-      invalidateStack();
-      scheduleComposite();
-    });
+    if (!isCarPresetActive()) {
+      addSlider(container, "Fade Out Bottom (Lower 25%)", p.bottomFade, 0, 100, "%", (val) => {
+        p.bottomFade = val;
+        if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+        invalidateStack();
+        scheduleComposite();
+      });
+    }
 
     addSlider(container, "Color Correction Strength", p.ccBlend, 0, 100, "%", (val) => {
       p.ccBlend = val;
@@ -740,6 +743,9 @@ function syncMoveSubjectUI() {
 }
 
 function setActiveTool(tool) {
+  if (tool !== "move_subject" && typeof releaseMoveFastStack === "function") {
+    releaseMoveFastStack();
+  }
   // Clicking "Move Subject" again toggles it off back to Pan
   if (tool === "move_subject" && STATE.activeTool === "move_subject") {
     tool = "pan";

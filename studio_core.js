@@ -1279,13 +1279,96 @@ function appendOverscanEdges(workPayload, overW, overH) {
   }
 }
 
+// Stream-decodes only the required server raster layers one-by-one so RAM never spikes
+async function decodeAndBuildOverscanServerImages(
+  layerBlobs,
+  workPayload,
+  origOffset,
+  baseW,
+  baseH,
+  overW,
+  overH,
+  padX,
+  padY
+) {
+  if (!layerBlobs) return {};
+  const cfg = workPayload.preset_settings || {};
+
+  // Only decode raster layers that are actually used (procedural brush layers are built from stroke_data!)
+  const neededKeys = ["bg_paper", "subject_raw", "subject_cc"];
+  if (cfg.MASK_BRUSH_ENABLED !== false) neededKeys.push("blur_bg");
+  if (cfg.OIL_PAINT_ENABLED !== false) neededKeys.push("oil_paint_full");
+  if (cfg.EDGE_CURVE_ENABLED) neededKeys.push("edge_curve");
+  if (cfg.SHADOW_BRUSH_ENABLED) neededKeys.push("shadow");
+  if (cfg.COLORDROP_BRUSH_ENABLED) neededKeys.push("colordrop");
+
+  const decodedImgs = {};
+  for (const key of neededKeys) {
+    const blob = layerBlobs[key];
+    if (blob) {
+      decodedImgs[key] = await loadImage(blob);
+    }
+  }
+
+  const rawImgs = buildOverscanServerImages(
+    decodedImgs,
+    workPayload,
+    origOffset,
+    baseW,
+    baseH,
+    overW,
+    overH,
+    padX,
+    padY
+  );
+
+  // Immediately release temporary HTMLImageElements (except bg_paper which is kept at native size)
+  for (const [key, img] of Object.entries(decodedImgs)) {
+    if (key !== "bg_paper" && img) {
+      try { img.src = ""; } catch (_) {}
+    }
+  }
+  return rawImgs;
+}
+
+// On-demand decoder if the user toggles on a disabled raster layer (like edge_curve) later in the session
+async function ensureServerRasterLayerDecoded(layerId) {
+  if (!STATE.payload || !STATE.ServerLayerBlobs) return;
+  if (STATE.serverImages && STATE.serverImages[layerId]) return;
+  const blob = STATE.ServerLayerBlobs[layerId];
+  if (!blob) return;
+
+  const [baseW, baseH] = STATE.payload.base_canvas_size;
+  const [padX, padY] = STATE.payload.pad;
+  const [overW, overH] = STATE.payload.canvas_size;
+  const origOffset = [STATE.payload.offset[0] - padX, STATE.payload.offset[1] - padY];
+
+  const img = await loadImage(blob);
+  const partial = buildOverscanServerImages(
+    { [layerId]: img },
+    STATE.payload,
+    origOffset,
+    baseW,
+    baseH,
+    overW,
+    overH,
+    padX,
+    padY
+  );
+  try { img.src = ""; } catch (_) {}
+  if (partial[layerId]) {
+    STATE.serverImages[layerId] = partial[layerId];
+  }
+}
+
 async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false) {
   cancelPendingSchedules();
   if (!isPresetSwitch) {
     History.clear();
     STATE.subjectTransform = { dx: 0, dy: 0, scale: 1.0 };
   }
-  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+  if (typeof releaseMoveFastStack === "function") releaseMoveFastStack();
+  else if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   invalidateStack();
   _sampleCache.clear();
   _ellipseGeomCache.clear();
@@ -1295,6 +1378,20 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   destroyGLEdgeCurveResources();
   _blurTmpA = new Float32Array(0);
   _colSumA = new Float32Array(0);
+
+  // Free previous session canvases explicitly before allocating new ones
+  if (STATE.serverImages) {
+    for (const k of Object.keys(STATE.serverImages)) {
+      const c = STATE.serverImages[k];
+      if (c && c.tagName === "CANVAS") { c.width = 1; c.height = 1; }
+    }
+    STATE.serverImages = {};
+  }
+  if (STATE.layers) {
+    for (const lyr of Object.values(STATE.layers)) {
+      if (lyr.baseCanvas) { lyr.baseCanvas.width = 1; lyr.baseCanvas.height = 1; lyr.baseCanvas = null; }
+    }
+  }
 
   const compact = compactifyPayloadForCache(sourcePayload);
   const [baseW, baseH] = compact.canvas_size;
@@ -1332,6 +1429,7 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   };
 
   STATE.payload = workPayload;
+  STATE.ServerLayerBlobs = compact.layerBlobs || {};
 
   document.getElementById("emptyState").classList.add("hidden");
   canvasContainer.classList.remove("hidden");
@@ -1359,18 +1457,12 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
     const maskImg = await loadImage(compact.maskBlob);
     STATE.maskCanvas = createCanvas(maskImg.width, maskImg.height);
     STATE.maskCanvas.getContext("2d", { willReadFrequently: true }).drawImage(maskImg, 0, 0);
+    try { maskImg.src = ""; } catch (_) {}
     markMaskOverlayDirty();
   }
 
-  const decodedImgs = {};
-  if (compact.layerBlobs) {
-    for (const [key, blob] of Object.entries(compact.layerBlobs)) {
-      if (blob) decodedImgs[key] = await loadImage(blob);
-    }
-  }
-
-const rawImgs = buildOverscanServerImages(
-    decodedImgs,
+  const rawImgs = await decodeAndBuildOverscanServerImages(
+    compact.layerBlobs,
     workPayload,
     compact.offset,
     baseW,
@@ -1380,7 +1472,7 @@ const rawImgs = buildOverscanServerImages(
     padX,
     padY
   );
-  
+
   const cfg = workPayload.preset_settings;
   if (cfg.WATERCOLOR_TEXTURE_ENABLED && !rawImgs.subject_tex && rawImgs.subject_cc && rawImgs.subject_raw) {
     rawImgs.subject_tex = rawImgs.subject_cc;
@@ -1423,10 +1515,13 @@ const rawImgs = buildOverscanServerImages(
       baseCanvas = createCanvas(overW, overH);
     }
 
+    // Only keep origImage for true static effect layers (shadow, colordrop)
+    const staticOrig = def.id === "shadow" || def.id === "colordrop" ? (rawImgs[def.id] || null) : null;
+
     STATE.layers[def.id] = {
       def,
       vis: enabled,
-      origImage: rawImgs[def.id] || null,
+      origImage: staticOrig,
       baseCanvas,
       cachedStrokes: null,
       strokesDirty: true,
@@ -1448,6 +1543,7 @@ const rawImgs = buildOverscanServerImages(
     }
   }
   if (STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
+    await ensureServerRasterLayerDecoded("edge_curve");
     rerenderLiveEdgeCurveLayer(true);
     freeEdgeCurveCpuUploadBuffers();
   }
@@ -1458,7 +1554,10 @@ const rawImgs = buildOverscanServerImages(
     rerenderLiveGlowLayer(true);
   }
 
-  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+  // Free temporary blur scratch arrays after initialization
+  _blurTmpA = new Float32Array(0);
+  _colSumA = new Float32Array(0);
+
   invalidateStack();
   renderLayerListUI();
   selectLayer(STATE.selectedLayerId || "bg_brush");
