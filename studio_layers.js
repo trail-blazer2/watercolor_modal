@@ -438,7 +438,9 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
     targetCtx.save();
     applyOverscanToViewportTransform(targetCtx, vr, movable);
     targetCtx.drawImage(src, 0, 0);
-    drawEyeBeautifierPatchesInOverscan(targetCtx);
+    if (def.id === "oil_paint") {
+      drawEyeBeautifierPatchesInOverscan(targetCtx);
+    }
     targetCtx.restore();
     return;
   }
@@ -624,6 +626,9 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
       targetCtx.drawImage(subMain, 0, 0);
     }
     targetCtx.restore();
+    if (def.id === "subject" || def.id === "oil_paint") {
+      drawEyeBeautifierPatchesInOverscan(targetCtx);
+    }
     return;
   }
 

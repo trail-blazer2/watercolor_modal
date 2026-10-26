@@ -123,6 +123,17 @@ const Workflow = (() => {
     init();
     STATE.uploadedFile = file;
     STATE.maskEditedByUser = false;
+    // Clear all previous image masks & caches so a new upload NEVER reuses the previous photo's mask!
+    STATE.rawMaskBase64 = null;
+    STATE.framedMaskBase64 = null;
+    STATE.framedMaskCanvas = null;
+    STATE.framedPhotoCanvas = null;
+    STATE.maskCanvas = null;
+    STATE.headRectNorm = null;
+    STATE.detectedEyes = [];
+    STATE.eyeBeautifierPatches = [];
+    if (STATE.presetCache) STATE.presetCache.clear();
+    if (STATE.presetUserEdits) STATE.presetUserEdits.clear();
     History.clear();
 
     const url = URL.createObjectURL(file);
@@ -678,20 +689,20 @@ const Workflow = (() => {
     fmCtx.fillRect(0, 0, outW, outH);
     fmCtx.drawImage(CROP.maskCanvas, px.x, px.y, px.w, px.h);
 
-    // Pass framed canvases directly to ClientWatercolorEngine (saves ~250 ms of base64 encode/decode!)
     STATE.framedPhotoCanvas = framedPhotoC;
     STATE.framedMaskCanvas = framedMaskC;
-    STATE.originalImg = framedPhotoC;
+    STATE.originalImg = await loadImage(framedPhotoC.toDataURL("image/jpeg", 0.95));
+    STATE.rawMaskBase64 = framedMaskC.toDataURL("image/png");
+    STATE.framedMaskBase64 = STATE.rawMaskBase64;
     STATE.detectedEyes = px.eyes || [];
     STATE.detectedEyesRefSize = [outW, outH];
-
-    if (profileKey === "animal" || (STATE.detectedEyes && STATE.detectedEyes.length > 0 && profileKey !== "car")) {
+    STATE.headRectNorm = refFraming.headRect || null;
+    if (profileKey === "animal" || (presetKey && presetKey.startsWith("animals"))) {
       STATE.isAnimalPhoto = true;
     }
-
     STATE.maskCanvas = null;
-    CROP.maskTintCanvas = null;
 
+    CROP.maskTintCanvas = null;
     if (window.SubjectVision && window.SubjectVision.releaseMemory) {
       await window.SubjectVision.releaseMemory();
     }
