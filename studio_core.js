@@ -174,7 +174,7 @@ function prewarmModalServer() {
 function startFilePickerPrewarm() {
   prewarmModalServer();
   loadCachedBrushes();
-  if (!IS_MOBILE && window.SubjectVision && window.SubjectVision.init) {
+  if (window.SubjectVision && window.SubjectVision.init) {
     window.SubjectVision.init();
   }
   stopFilePickerPrewarm();
@@ -544,19 +544,6 @@ const SIBLING_PRESETS = {
 };
 
 async function fetchPresetPayloadFromServer(presetKey, useEditedMask) {
-  // 1. POKUS O KLIENTSKÉ GENEROVÁNÍ (WatercolorEngine)
-  try {
-    await loadCachedBrushes();
-    if (window.ClientWatercolorEngine && typeof window.ClientWatercolorEngine.generate === 'function') {
-      const rawPayload = await window.ClientWatercolorEngine.generate(presetKey, useEditedMask);
-      return compactifyPayloadForCache(rawPayload);
-    }
-  } catch (error) {
-    console.warn("Klientský WatercolorEngine selhal, přecházím na server:", error);
-    // Kód nepadá, try/catch zachytí chybu a funkce pokračuje na serverový fallback níže
-  }
-
-  // 2. SERVEROVÝ FALLBACK (Původní logika)
   const optimizedBlob = await prepareOptimizedUploadBlob(STATE.originalImg, presetKey);
   const formData = new FormData();
   formData.append("image_file", optimizedBlob, "upload.jpg");
@@ -573,13 +560,11 @@ async function fetchPresetPayloadFromServer(presetKey, useEditedMask) {
     body: formData,
   });
   if (!res.ok) throw new Error(`Server returned status ${res.status}`);
-  
   const rawPayload = JSON.parse(await res.text());
   if (rawPayload.raw_mask_png) {
     STATE.rawMaskBase64 = rawPayload.raw_mask_png;
     delete rawPayload.raw_mask_png;
   }
-  
   return compactifyPayloadForCache(rawPayload);
 }
 

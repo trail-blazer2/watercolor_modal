@@ -156,7 +156,7 @@ const Workflow = (() => {
 
     try {
       const visionPromise = window.SubjectVision
-        ? window.SubjectVision.detect(srcC, { timeoutMs: 1800 })
+        ? window.SubjectVision.detect(srcC, { timeoutMs: 4500 })
         : Promise.resolve(null);
 
       let maskArr;

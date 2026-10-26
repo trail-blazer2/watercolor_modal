@@ -48,6 +48,9 @@ function invalidateGLBrushTextures() {
 }
 
 function getGLBrushRenderer(w, h) {
+  if (_glBrush && _glBrush.gl && _glBrush.gl.isContextLost()) {
+    _glBrush = null;
+  }
   if (_glBrush === false) return null;
   if (!_glBrush) {
     const canvas = createCanvas(w, h);
@@ -90,11 +93,14 @@ function getGLBrushRenderer(w, h) {
     `;
 
     const compile = (type, src) => {
+      if (gl.isContextLost()) return null;
       const s = gl.createShader(type);
+      if (!s) return null;
       gl.shaderSource(s, src);
       gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
         console.error(gl.getShaderInfoLog(s));
+        gl.deleteShader(s);
         return null;
       }
       return s;
@@ -491,6 +497,9 @@ function destroyGLEdgeCurveResources() {
 }
 
 function initGLEdgeCurveContext() {
+  if (_glEC && _glEC.gl && _glEC.gl.isContextLost()) {
+  _glEC = null;
+  }
   if (_glEC === false) return null;
   if (_glEC) return _glEC;
 
@@ -637,15 +646,18 @@ function initGLEdgeCurveContext() {
   `;
 
   const compile = (type, src) => {
-    const s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-      console.error(gl.getShaderInfoLog(s));
-      return null;
-    }
-    return s;
-  };
+      if (gl.isContextLost()) return null;
+      const s = gl.createShader(type);
+      if (!s) return null;
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(s));
+        gl.deleteShader(s);
+        return null;
+      }
+      return s;
+    };
   const link = (vs, fs) => {
     const p = gl.createProgram();
     gl.attachShader(p, vs);
