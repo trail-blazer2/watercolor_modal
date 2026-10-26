@@ -294,6 +294,7 @@ function dataUrlToBlob(dataUrl) {
 }
 
 function loadImage(src) {
+  if (src && (src.tagName === "CANVAS" || src.tagName === "IMG")) return Promise.resolve(src);
   return new Promise((resolve, reject) => {
     if (!src) return reject(new Error("Empty image source"));
     let objectUrl = null;
@@ -974,13 +975,11 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
   const [origOffX, origOffY] = origOffset || [0, 0];
   const [subW, subH] = workPayload.subject_size || [baseW, baseH];
 
-  // Where the server placed STATE.originalImg (`framedPhotoC`) in Overscan Space:
   const imgBoxX = padX + origOffX;
   const imgBoxY = padY + origOffY;
   const imgBoxW = subW;
   const imgBoxH = subH;
 
-  // Actual non-clipped bounding box of server images inside [padX, padY, baseW, baseH]:
   const validX0 = Math.max(padX, imgBoxX);
   const validY0 = Math.max(padY, imgBoxY);
   const validX1 = Math.min(padX + baseW, imgBoxX + imgBoxW);
@@ -988,7 +987,6 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
   const validW = Math.max(1, validX1 - validX0);
   const validH = Math.max(1, validY1 - validY0);
 
-  // Exact mapping of the uncropped subject `up.cutoutCanvas` into Overscan Space:
   const scaleX = hasUncropped ? imgBoxW / up.refSize[0] : 1;
   const scaleY = hasUncropped ? imgBoxH / up.refSize[1] : 1;
   const fullX = hasUncropped ? Math.round(imgBoxX + up.px.x * scaleX) : imgBoxX;
@@ -1010,17 +1008,25 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
   const extY1 = Math.min(overH, Math.max(validY1, fullY + fullH));
   workPayload.full_subject_box = [extX0, extY0, Math.max(1, extX1 - extX0), Math.max(1, extY1 - extY0)];
 
+  // Only compute uncropped overscan fill when the subject actually clips outside [validX0, validY0, validX1, validY1]!
+  const clipLeft = hasUncropped && fullX < validX0 - 1;
+  const clipRight = hasUncropped && fullX + fullW > validX1 + 1;
+  const clipTop = hasUncropped && fullY < validY0 - 1;
+  const clipBottom = hasUncropped && fullY + fullH > validY1 + 1;
+  const isClipped = clipLeft || clipRight || clipTop || clipBottom;
+
   let ccUncropped = null;
   let oilUncropped = null;
-  if (hasUncropped && decodedImgs.subject_raw && decodedImgs.subject_cc) {
+  if (isClipped && decodedImgs.subject_raw && decodedImgs.subject_cc) {
     const ccLut = buildHistogramMatchLUT(decodedImgs.subject_raw, decodedImgs.subject_cc, baseW, baseH);
     ccUncropped = applyRGBLutToCutout(up.cutoutCanvas, ccLut);
   }
-  if (hasUncropped && decodedImgs.subject_raw && decodedImgs.oil_paint_full) {
+  if (isClipped && decodedImgs.subject_raw && decodedImgs.oil_paint_full) {
     const oilLut = buildHistogramMatchLUT(decodedImgs.subject_raw, decodedImgs.oil_paint_full, baseW, baseH);
     const oilToned = applyRGBLutToCutout(up.cutoutCanvas, oilLut);
     oilUncropped = buildOilStyledUncroppedCutout(oilToned);
-  } else if (ccUncropped) {
+    oilToned.width = 1; oilToned.height = 1;
+  } else if (isClipped && ccUncropped) {
     oilUncropped = buildOilStyledUncroppedCutout(ccUncropped);
   }
 
@@ -1031,63 +1037,54 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
 
     ctx.drawImage(serverImg, padX, padY, baseW, baseH);
 
-    if (overscanFillCanvas && hasUncropped) {
-      const clipLeft = fullX < validX0 - 1;
-      const clipRight = fullX + fullW > validX1 + 1;
-      const clipTop = fullY < validY0 - 1;
-      const clipBottom = fullY + fullH > validY1 + 1;
+    if (overscanFillCanvas && isClipped) {
+      const feather = 64;
+      const trim = 3;
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-out";
 
-      if (clipLeft || clipRight || clipTop || clipBottom) {
-        const feather = 64;
-        const trim = 3;
-        ctx.save();
-        ctx.globalCompositeOperation = "destination-out";
-
-        if (clipLeft) {
-          const g = ctx.createLinearGradient(validX0 + trim, 0, validX0 + trim + feather, 0);
-          g.addColorStop(0, "rgba(0,0,0,1)");
-          g.addColorStop(1, "rgba(0,0,0,0)");
-          ctx.fillStyle = g;
-          ctx.fillRect(0, 0, validX0 + trim + feather, overH);
-        }
-        if (clipRight) {
-          const rx = validX1 - trim;
-          const g = ctx.createLinearGradient(rx - feather, 0, rx, 0);
-          g.addColorStop(0, "rgba(0,0,0,0)");
-          g.addColorStop(1, "rgba(0,0,0,1)");
-          ctx.fillStyle = g;
-          ctx.fillRect(rx - feather, 0, overW - (rx - feather), overH);
-        }
-        if (clipTop) {
-          const g = ctx.createLinearGradient(0, validY0 + trim, 0, validY0 + trim + feather);
-          g.addColorStop(0, "rgba(0,0,0,1)");
-          g.addColorStop(1, "rgba(0,0,0,0)");
-          ctx.fillStyle = g;
-          ctx.fillRect(0, 0, overW, validY0 + trim + feather);
-        }
-        if (clipBottom) {
-          const by = validY1 - trim;
-          const g = ctx.createLinearGradient(0, by - feather, 0, by);
-          g.addColorStop(0, "rgba(0,0,0,0)");
-          g.addColorStop(1, "rgba(0,0,0,1)");
-          ctx.fillStyle = g;
-          ctx.fillRect(0, by - feather, overW, overH - (by - feather));
-        }
-        ctx.restore();
-
-        // Draw overscanFillCanvas ONLY in the outer border regions that were actually clipped by the frame
-        // so it NEVER adds an untrimmed halo around the subject inside the frame!
-        ctx.save();
-        ctx.beginPath();
-        if (clipLeft) ctx.rect(0, 0, validX0 + trim + feather, overH);
-        if (clipRight) ctx.rect(validX1 - trim - feather, 0, overW - (validX1 - trim - feather), overH);
-        if (clipTop) ctx.rect(0, 0, overW, validY0 + trim + feather);
-        if (clipBottom) ctx.rect(0, validY1 - trim - feather, overW, overH - (validY1 - trim - feather));
-        ctx.clip();
-        ctx.globalCompositeOperation = "destination-over";
-        ctx.drawImage(overscanFillCanvas, fullX, fullY, fullW, fullH);
-        ctx.restore();
+      if (clipLeft) {
+        const g = ctx.createLinearGradient(validX0 + trim, 0, validX0 + trim + feather, 0);
+        g.addColorStop(0, "rgba(0,0,0,1)");
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, validX0 + trim + feather, overH);
       }
+      if (clipRight) {
+        const rx = validX1 - trim;
+        const g = ctx.createLinearGradient(rx - feather, 0, rx, 0);
+        g.addColorStop(0, "rgba(0,0,0,0)");
+        g.addColorStop(1, "rgba(0,0,0,1)");
+        ctx.fillStyle = g;
+        ctx.fillRect(rx - feather, 0, overW - (rx - feather), overH);
+      }
+      if (clipTop) {
+        const g = ctx.createLinearGradient(0, validY0 + trim, 0, validY0 + trim + feather);
+        g.addColorStop(0, "rgba(0,0,0,1)");
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, overW, validY0 + trim + feather);
+      }
+      if (clipBottom) {
+        const by = validY1 - trim;
+        const g = ctx.createLinearGradient(0, by - feather, 0, by);
+        g.addColorStop(0, "rgba(0,0,0,0)");
+        g.addColorStop(1, "rgba(0,0,0,1)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, by - feather, overW, overH - (by - feather));
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.beginPath();
+      if (clipLeft) ctx.rect(0, 0, validX0 + trim + feather, overH);
+      if (clipRight) ctx.rect(validX1 - trim - feather, 0, overW - (validX1 - trim - feather), overH);
+      if (clipTop) ctx.rect(0, 0, overW, validY0 + trim + feather);
+      if (clipBottom) ctx.rect(0, validY1 - trim - feather, overW, overH - (validY1 - trim - feather));
+      ctx.clip();
+      ctx.globalCompositeOperation = "destination-over";
+      ctx.drawImage(overscanFillCanvas, fullX, fullY, fullW, fullH);
+      ctx.restore();
     }
     return c;
   };
@@ -1115,6 +1112,8 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
       out[key] = c;
     }
   }
+  if (ccUncropped) { ccUncropped.width = 1; ccUncropped.height = 1; }
+  if (oilUncropped) { oilUncropped.width = 1; oilUncropped.height = 1; }
   return out;
 }
 
@@ -1141,12 +1140,12 @@ function buildSeamlessOverscanBlurBg(blurImg, baseW, baseH, overW, overH, padX, 
   oCtx.filter = "blur(36px)";
   oCtx.drawImage(rawC, 0, 0);
   oCtx.restore();
+  rawC.width = 1; rawC.height = 1; // Free 25.1 MB temporary canvas immediately!
 
   oCtx.drawImage(blurImg, padX, padY, baseW, baseH);
   return outC;
 }
 
-// Seamlessly extends `shadow` and `colordrop` beyond [padX, padY, baseW, baseH] if they touch the frame edges
 function buildSeamlessOverscanEffectLayer(effectImg, baseW, baseH, overW, overH, padX, padY, kind) {
   const outC = createCanvas(overW, overH);
   const ctx = outC.getContext("2d");
@@ -1156,7 +1155,6 @@ function buildSeamlessOverscanEffectLayer(effectImg, baseW, baseH, overW, overH,
   const reach = kind === "shadow" ? 260 : 190;
   const strip = kind === "shadow" ? 18 : 96;
 
-  // Left & Right extensions
   eCtx.save();
   eCtx.translate(padX + 2, padY);
   eCtx.scale(-1, 1);
@@ -1169,25 +1167,22 @@ function buildSeamlessOverscanEffectLayer(effectImg, baseW, baseH, overW, overH,
   eCtx.drawImage(effectImg, baseW - strip, 0, strip, baseH, 0, 0, reach, baseH);
   eCtx.restore();
 
-  // Bottom extension
   eCtx.save();
   eCtx.translate(padX, padY + baseH - 2 + reach);
   eCtx.scale(1, -1);
   eCtx.drawImage(effectImg, 0, baseH - strip, baseW, strip, 0, 0, baseW, reach);
   eCtx.restore();
 
-  // Soften and fade the extended margins outward from the [padX, padY, baseW, baseH] box
   const blurredExt = createCanvas(overW, overH);
   const bCtx = blurredExt.getContext("2d");
   bCtx.save();
   bCtx.filter = kind === "shadow" ? "blur(18px)" : "blur(4px)";
   bCtx.drawImage(extC, 0, 0);
   bCtx.restore();
+  extC.width = 1; extC.height = 1; // Free 25.1 MB temporary canvas!
 
-  // Fade outer edges of the extension to 0% alpha so it tapers off naturally
   bCtx.save();
   bCtx.globalCompositeOperation = "destination-in";
-  // Horizontal fade mask
   const hMask = createCanvas(overW, overH);
   const hmCtx = hMask.getContext("2d");
   const gL = hmCtx.createLinearGradient(Math.max(0, padX - reach), 0, padX, 0);
@@ -1205,7 +1200,6 @@ function buildSeamlessOverscanEffectLayer(effectImg, baseW, baseH, overW, overH,
   hmCtx.fillStyle = gR;
   hmCtx.fillRect(padX + baseW, 0, overW - (padX + baseW), overH);
 
-  // Vertical bottom fade mask
   const gB = hmCtx.createLinearGradient(0, padY + baseH, 0, Math.min(overH, padY + baseH + reach));
   gB.addColorStop(0, "rgba(0,0,0,1)");
   gB.addColorStop(1, "rgba(0,0,0,0)");
@@ -1217,17 +1211,20 @@ function buildSeamlessOverscanEffectLayer(effectImg, baseW, baseH, overW, overH,
   vmCtx.fillStyle = gB;
   vmCtx.fillRect(0, padY + baseH, overW, overH - (padY + baseH));
   hmCtx.drawImage(vMask, 0, 0);
+  vMask.width = 1; vMask.height = 1; // Free 25.1 MB temporary canvas!
 
   bCtx.drawImage(hMask, 0, 0);
+  hMask.width = 1; hMask.height = 1; // Free 25.1 MB temporary canvas!
   bCtx.restore();
 
-  // Clear interior of blurredExt so original [padX, padY, baseW, baseH] stays 100% untouched
   bCtx.clearRect(padX + 2, padY + 2, baseW - 4, baseH - 4);
 
   ctx.drawImage(blurredExt, 0, 0);
+  blurredExt.width = 1; blurredExt.height = 1; // Free 25.1 MB temporary canvas!
   ctx.drawImage(effectImg, padX, padY, baseW, baseH);
   return outC;
 }
+
 
 function appendOverscanEdges(workPayload, overW, overH) {
   const up = STATE.uncroppedPlacement;
@@ -1330,7 +1327,10 @@ async function decodeAndBuildOverscanServerImages(
   // Immediately release temporary HTMLImageElements (except bg_paper which is kept at native size)
   for (const [key, img] of Object.entries(decodedImgs)) {
     if (key !== "bg_paper" && img) {
-      try { img.src = ""; } catch (_) {}
+      try {
+        if (img.tagName === "CANVAS") { img.width = 1; img.height = 1; }
+        else { img.src = ""; }
+      } catch (_) {}
     }
   }
   return rawImgs;
