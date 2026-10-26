@@ -1,6 +1,5 @@
 <div align="center" style="margin: 20px 0;">
-  <a href="[https://example.com](https://trail-blazer2.github.io/watercolor_modal/
-)" class="modern-gradient-btn">
+  <a href="https://trail-blazer2.github.io/watercolor_modal/" class="modern-gradient-btn">
     <span>Go there</span>
     <svg class="btn-arrow" viewBox="0 0 24 24" xmlns="http://w3.org">
       <path d="M5 12h14M12 5l7 7-7 7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
