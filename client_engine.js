@@ -1,14 +1,10 @@
 /**
- * ⚡ client_engine.js — Production WebGL2 GPU Client Engine + Multi-Eye Beautifier (v8 Port) + Memory/Speed Profiler
+ * ⚡ client_engine.js — Production WebGL2 GPU Client Engine + Memory/Speed Profiler
  */
 (function () {
   "use strict";
 
-  // ==========================================================================
-  // 0. STUDIO SPEED & MEMORY PROFILER (Verify Local GPU Execution & RAM Budget)
-  // ==========================================================================
   const StudioProfiler = {
-    lastReport: null,
     measureCanvasMB() {
       let bytes = 0;
       let count = 0;
@@ -59,9 +55,6 @@
   };
   window.StudioProfiler = StudioProfiler;
 
-  // ==========================================================================
-  // 1. SINGLE-SOURCE PRESET LOADER (Reads from Python /health or /cutout)
-  // ==========================================================================
   async function getPresetFromServerSingleSource(presetKey) {
     if (!STATE.serverPresets) {
       try {
@@ -130,10 +123,8 @@
     return dst;
   }
 
-
-
   // ==========================================================================
-  // 3. WEBGL2 GPU ENGINE FOR COLOR CORRECTION & LIC OIL PAINT
+  // 2. WEBGL2 GPU ENGINE FOR COLOR CORRECTION & 4-PASS LIC OIL PAINT
   // ==========================================================================
   let _glgpu = null;
 
@@ -183,10 +174,11 @@
       uniform float u_wcOp;
       uniform vec2 u_wcScale;
       uniform int u_flipY;
+      uniform int u_useMask;
       out vec4 outColor;
       void main() {
         vec2 uv = u_flipY == 1 ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
-        float a = texture(u_mask, uv).r;
+        float a = u_useMask == 1 ? texture(u_mask, uv).r : 1.0;
         if (a <= 0.001) {
           outColor = vec4(0.0);
           return;
@@ -227,6 +219,7 @@
       }
     `;
 
+    // Oil Pass 1: Tone Curve + Levels + Gamma (also outputs luminance in .a)
     const fsOilTone = `#version 300 es
       precision highp float;
       in vec2 v_uv;
@@ -252,83 +245,116 @@
       }
     `;
 
+    // Oil Pass 2: Structure Tensor + 8-Step Bidirectional LIC Advection
+    // Mask-aware: if a streamline steps outside the subject mask, it clamps to the last valid interior pixel!
     const fsOilLIC = `#version 300 es
       precision highp float;
       in vec2 v_uv;
       uniform sampler2D u_toned;
-      uniform sampler2D u_origCc;
+      uniform sampler2D u_mask;
       uniform vec2 u_step;
-      uniform float u_hpStrength;
-      uniform float u_unsharp;
-      uniform float u_finalCon;
       out vec4 outColor;
 
       vec2 getFlow(vec2 uv) {
         float ixx = 0.0, iyy = 0.0, ixy = 0.0;
-        for (int dy = -1; dy <= 1; dy++) {
-          for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -2; dy <= 2; dy++) {
+          for (int dx = -2; dx <= 2; dx++) {
+            float w = (dx == 0 && dy == 0) ? 2.0 : 1.0;
             vec2 p = uv + vec2(float(dx), float(dy)) * u_step;
             float gx = (texture(u_toned, p + vec2(u_step.x, 0.0)).a - texture(u_toned, p - vec2(u_step.x, 0.0)).a) * 0.5;
             float gy = (texture(u_toned, p + vec2(0.0, u_step.y)).a - texture(u_toned, p - vec2(0.0, u_step.y)).a) * 0.5;
-            ixx += gx * gx;
-            iyy += gy * gy;
-            ixy += gx * gy;
+            ixx += gx * gx * w;
+            iyy += gy * gy * w;
+            ixy += gx * gy * w;
           }
         }
         float theta = 0.5 * atan(2.0 * ixy, ixx - iyy + 1e-7);
         return vec2(-sin(theta), cos(theta));
       }
 
-      vec3 sampleLIC(vec2 uv0) {
+      void main() {
+        vec3 centerCol = texture(u_toned, v_uv).rgb;
+        float centerMask = texture(u_mask, v_uv).r;
         vec3 acc = vec3(0.0);
         float wsum = 0.0;
-        float stepPx = 4.2;
+        float stepPx = 5.0;
+
         for (int dir = -1; dir <= 1; dir += 2) {
-          vec2 p = uv0;
+          vec2 p = v_uv;
+          vec3 lastValid = centerCol;
           float fdir = float(dir) * stepPx;
           for (int s = 0; s < 4; s++) {
             float wt = 1.0 - float(s) * 0.125;
-            acc += texture(u_toned, clamp(p, vec2(0.0), vec2(1.0))).rgb * wt;
+            vec2 pc = clamp(p, vec2(0.0), vec2(1.0));
+            float m = texture(u_mask, pc).r;
+            vec3 samp = m > 0.35 ? texture(u_toned, pc).rgb : lastValid;
+            if (m > 0.35) lastValid = samp;
+            acc += samp * wt;
             wsum += wt;
-            vec2 fl = getFlow(p);
+            vec2 fl = getFlow(pc);
             p += fl * u_step * fdir;
           }
         }
-        return acc / wsum;
+        outColor = vec4(acc / wsum, centerMask);
       }
+    `;
 
+    // Oil Pass 3: True 2D Gaussian Blur (sigma=2.7) of the LIC-Advected Image (Mask-normalized so edges never halo!)
+    const fsOilBlur = `#version 300 es
+      precision highp float;
+      in vec2 v_uv;
+      uniform sampler2D u_src;
+      uniform vec2 u_dirStep;
+      out vec4 outColor;
+      void main() {
+        vec3 sum = vec3(0.0);
+        float wsum = 0.0;
+        vec3 centerCol = texture(u_src, v_uv).rgb;
+        for (int i = -6; i <= 6; i++) {
+          float fi = float(i);
+          float w = exp(-(fi * fi) / (2.0 * 2.7 * 2.7));
+          vec4 s = texture(u_src, clamp(v_uv + u_dirStep * fi, vec2(0.0), vec2(1.0)));
+          vec3 col = s.a > 0.35 ? s.rgb : centerCol;
+          sum += col * w;
+          wsum += w;
+        }
+        outColor = vec4(sum / max(1e-5, wsum), texture(u_src, v_uv).a);
+      }
+    `;
+
+    // Oil Pass 4: Exact High-Pass Bristle Overlay + Unsharp Mask + Final Contrast + Mask Alpha
+    const fsOilComp = `#version 300 es
+      precision highp float;
+      in vec2 v_uv;
+      uniform sampler2D u_lic;
+      uniform sampler2D u_licBlur;
+      uniform sampler2D u_mask;
+      uniform float u_hpStrength;
+      uniform float u_unsharp;
+      uniform float u_finalCon;
+      out vec4 outColor;
       void main() {
         vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
-        vec4 orig = texture(u_origCc, uv);
-        if (orig.a <= 0.001) {
+        float a = texture(u_mask, uv).r;
+        if (a <= 0.001) {
           outColor = vec4(0.0);
           return;
         }
-        float minA = orig.a;
-        minA = min(minA, texture(u_origCc, uv + vec2(4.0 * u_step.x, 0.0)).a);
-        minA = min(minA, texture(u_origCc, uv - vec2(4.0 * u_step.x, 0.0)).a);
-        minA = min(minA, texture(u_origCc, uv + vec2(0.0, 4.0 * u_step.y)).a);
-        minA = min(minA, texture(u_origCc, uv - vec2(0.0, 4.0 * u_step.y)).a);
-        float rimBlend = smoothstep(0.1, 0.95, minA);
+        vec3 base = texture(u_lic, uv).rgb;
+        vec3 blurred = texture(u_licBlur, uv).rgb;
 
-        vec3 centerLic = sampleLIC(uv);
-        vec3 blurLic = (
-          centerLic * 2.0 +
-          texture(u_toned, uv + vec2(2.5 * u_step.x, 0.0)).rgb +
-          texture(u_toned, uv - vec2(2.5 * u_step.x, 0.0)).rgb +
-          texture(u_toned, uv + vec2(0.0, 2.5 * u_step.y)).rgb +
-          texture(u_toned, uv - vec2(0.0, 2.5 * u_step.y)).rgb
-        ) / 6.0;
-
-        vec3 hp = clamp(centerLic - blurLic + 0.5, 0.0, 1.0);
-        vec3 ov = mix(2.0 * centerLic * hp, 1.0 - 2.0 * (1.0 - centerLic) * (1.0 - hp), step(vec3(0.5), centerLic));
-        vec3 res = mix(centerLic, ov, u_hpStrength);
-        res = res + (res - blurLic) * (u_unsharp * 0.55);
+        vec3 hp = clamp(base - blurred + (128.0 / 255.0), 0.0, 1.0);
+        vec3 blended = mix(
+          2.0 * base * hp,
+          1.0 - 2.0 * (1.0 - base) * (1.0 - hp),
+          step(vec3(0.5), base)
+        );
+        vec3 res = base + (blended - base) * u_hpStrength;
+        res = res + (res - blurred) * u_unsharp;
         if (u_finalCon > 1.0) {
           res = 0.5 + (res - 0.5) * u_finalCon;
         }
-        res = clamp(mix(orig.rgb, res, rimBlend), 0.0, 1.0);
-        outColor = vec4(res, orig.a);
+        outColor = vec4(clamp(res, 0.0, 1.0), a);
       }
     `;
 
@@ -357,12 +383,16 @@
     const fCC = compile(gl.FRAGMENT_SHADER, fsCC);
     const fOT = compile(gl.FRAGMENT_SHADER, fsOilTone);
     const fOL = compile(gl.FRAGMENT_SHADER, fsOilLIC);
-    if (!vs || !fCC || !fOT || !fOL) { _glgpu = false; return null; }
+    const fOB = compile(gl.FRAGMENT_SHADER, fsOilBlur);
+    const fOC = compile(gl.FRAGMENT_SHADER, fsOilComp);
+    if (!vs || !fCC || !fOT || !fOL || !fOB || !fOC) { _glgpu = false; return null; }
 
     const progCC = link(vs, fCC);
     const progOilTone = link(vs, fOT);
     const progOilLIC = link(vs, fOL);
-    if (!progCC || !progOilTone || !progOilLIC) { _glgpu = false; return null; }
+    const progOilBlur = link(vs, fOB);
+    const progOilComp = link(vs, fOC);
+    if (!progCC || !progOilTone || !progOilLIC || !progOilBlur || !progOilComp) { _glgpu = false; return null; }
 
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -372,7 +402,7 @@
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-    _glgpu = { canvas, gl, vao, progCC, progOilTone, progOilLIC };
+    _glgpu = { canvas, gl, vao, progCC, progOilTone, progOilLIC, progOilBlur, progOilComp };
     return _glgpu;
   }
 
@@ -389,28 +419,69 @@
     return tex;
   }
 
+  function createEmptyTexFbo(gl, w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    return { tex, fbo };
+  }
+
   function renderSubjectAndOilGPU(origC, maskCleanCanvas, w, h, cw, ch, offset, cfg) {
     const eng = getGPUFilterEngine();
     const [offX, offY] = offset;
     if (!eng) return null;
-    const { gl, canvas, vao, progCC, progOilTone, progOilLIC } = eng;
+    const { gl, canvas, vao, progCC, progOilTone, progOilLIC, progOilBlur, progOilComp } = eng;
+
 
     const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
+    const subSmallC = createCanvas(sw4, sh4);
+    subSmallC.getContext("2d").drawImage(origC, 0, 0, sw4, sh4);
+    const subSmData = subSmallC.getContext("2d").getImageData(0, 0, sw4, sh4).data;
+
+    const maskSmallC = createCanvas(sw4, sh4);
+    maskSmallC.getContext("2d").drawImage(maskCleanCanvas, 0, 0, sw4, sh4);
+    const maskSmData = maskSmallC.getContext("2d").getImageData(0, 0, sw4, sh4).data;
+    maskSmallC.width = 1; maskSmallC.height = 1;
+
+    const n4 = sw4 * sh4;
+    const lum4 = new Float32Array(n4);
+    const in4 = new Float32Array(n4);
+    let sumL = 0, cntL = 0;
+    for (let i = 0; i < n4; i++) {
+      const p = i * 4;
+      const l = 0.299 * subSmData[p] + 0.587 * subSmData[p + 1] + 0.114 * subSmData[p + 2];
+      lum4[i] = l;
+      if (maskSmData[p] > 200) {
+        in4[i] = 1.0;
+        sumL += l;
+        cntL++;
+      }
+    }
+    const meanL = (cntL > 0 ? sumL / cntL : 128.0) / 255.0;
+
+    // Mask-normalized blur: white #faf8f4 background outside the subject NEVER bleeds into u_lumBlur!
+    const den6 = boxBlurFloat32(in4, sw4, sh4, 6);
+    let lumBlur4 = normalizedBlurFloat32(lum4, in4, sw4, sh4, 6, den6);
+    lumBlur4 = normalizedBlurFloat32(lumBlur4, in4, sw4, sh4, 5);
+
     const lumSmallC = createCanvas(sw4, sh4);
     const lsCtx = lumSmallC.getContext("2d");
-    lsCtx.filter = "blur(6px)";
-    lsCtx.drawImage(origC, 0, 0, sw4, sh4);
-    lsCtx.filter = "none";
-
-    const thumbC = createCanvas(64, 64);
-    thumbC.getContext("2d").drawImage(lumSmallC, 0, 0, 64, 64);
-    const tData = thumbC.getContext("2d").getImageData(0, 0, 64, 64).data;
-    thumbC.width = 1; thumbC.height = 1;
-    let sumL = 0;
-    for (let i = 0; i < tData.length; i += 4) {
-      sumL += 0.299 * tData[i] + 0.587 * tData[i + 1] + 0.114 * tData[i + 2];
+    const lsImg = lsCtx.createImageData(sw4, sh4);
+    for (let i = 0; i < n4; i++) {
+      const v = Math.max(0, Math.min(255, Math.round(lumBlur4[i])));
+      const p = i * 4;
+      lsImg.data[p] = v; lsImg.data[p + 1] = v; lsImg.data[p + 2] = v; lsImg.data[p + 3] = 255;
     }
-    const meanL = (sumL / (64 * 64)) / 255.0;
+    lsCtx.putImageData(lsImg, 0, 0);
+    subSmallC.width = 1; subSmallC.height = 1;
+
 
     const texOrig = uploadTex2D(gl, origC, false);
     const texLumBlur = uploadTex2D(gl, lumSmallC, false);
@@ -421,7 +492,7 @@
     gl.bindVertexArray(vao);
     gl.disable(gl.BLEND);
 
-    const runCCPass = (useWcTex) => {
+    const runCCPass = (useWcTex, useMask = true) => {
       canvas.width = w;
       canvas.height = h;
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -456,12 +527,18 @@
       gl.uniform1f(gl.getUniformLocation(progCC, "u_wcOp"), useWcTex && wcImg ? (cfg.WATERCOLOR_TEXTURE_OPACITY ?? 0.6) : 0.0);
       gl.uniform2f(gl.getUniformLocation(progCC, "u_wcScale"), w / tw, h / th);
       gl.uniform1i(gl.getUniformLocation(progCC, "u_flipY"), 1);
+      gl.uniform1i(gl.getUniformLocation(progCC, "u_useMask"), useMask ? 1 : 0);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     };
 
-    // Always produce clean untextured subject_cc AND (when WATERCOLOR_TEXTURE_ENABLED) separate subject_tex!
-    runCCPass(false);
+    // 1. Render UNMASKED color-corrected image for Oil Paint
+    runCCPass(false, false);
+    const unmaskedCcCrop = createCanvas(w, h);
+    unmaskedCcCrop.getContext("2d").drawImage(canvas, 0, 0);
+
+    // 2. Render MASKED color-corrected subject for subject_cc
+    runCCPass(false, true);
     const cleanCcCrop = createCanvas(w, h);
     cleanCcCrop.getContext("2d").drawImage(canvas, 0, 0);
 
@@ -470,27 +547,29 @@
 
     let subTexFull = null;
     if (cfg.WATERCOLOR_TEXTURE_ENABLED && wcImg) {
-      runCCPass(true);
+      runCCPass(true, true);
       subTexFull = createCanvas(cw, ch);
       subTexFull.getContext("2d").drawImage(canvas, offX, offY);
     }
 
     let oilFull = null;
     if (cfg.OIL_PAINT_ENABLED !== false) {
-      const texCc = uploadTex2D(gl, cleanCcCrop, false);
-      const texToned = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, texToned);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      // Match Python's OIL_DETAIL_SCALE (0.85) so LIC stroke length & High-Pass radius match 1:1!
+      const oilScale = cfg.OIL_DETAIL_SCALE ?? 0.85;
+      const ow = Math.max(16, Math.round(w * oilScale));
+      const oh = Math.max(16, Math.round(h * oilScale));
 
-      const fbo = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texToned, 0);
-      gl.viewport(0, 0, w, h);
+      const texCc = uploadTex2D(gl, unmaskedCcCrop, false);
+      unmaskedCcCrop.width = 1; unmaskedCcCrop.height = 1;
 
+      const rtToned = createEmptyTexFbo(gl, ow, oh);
+      const rtLic = createEmptyTexFbo(gl, ow, oh);
+      const rtPing = createEmptyTexFbo(gl, ow, oh);
+      const rtBlur = createEmptyTexFbo(gl, ow, oh);
+
+      // Oil Pass 1: Tone + Levels into rtToned (ow x oh)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rtToned.fbo);
+      gl.viewport(0, 0, ow, oh);
       gl.useProgram(progOilTone);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texCc);
       gl.uniform1i(gl.getUniformLocation(progOilTone, "u_cc"), 0);
@@ -508,27 +587,58 @@
       gl.uniform1f(gl.getUniformLocation(progOilTone, "u_invGamma"), 1.0 / (cfg.OIL_LEVELS_GAMMA ?? 0.95));
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
+      // Oil Pass 2: Structure Tensor + 8-Step LIC into rtLic (ow x oh)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rtLic.fbo);
+      gl.useProgram(progOilLIC);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtToned.tex);
+      gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_toned"), 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texMask);
+      gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_mask"), 1);
+      gl.uniform2f(gl.getUniformLocation(progOilLIC, "u_step"), 1.0 / ow, 1.0 / oh);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      // Oil Pass 3: Separable 2D Gaussian Blur of rtLic -> rtPing -> rtBlur
+      gl.useProgram(progOilBlur);
+      gl.uniform1i(gl.getUniformLocation(progOilBlur, "u_src"), 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rtPing.fbo);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtLic.tex);
+      gl.uniform2f(gl.getUniformLocation(progOilBlur, "u_dirStep"), 1.0 / ow, 0.0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rtBlur.fbo);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtPing.tex);
+      gl.uniform2f(gl.getUniformLocation(progOilBlur, "u_dirStep"), 0.0, 1.0 / oh);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      // Oil Pass 4: High-Pass Bristle Overlay + Unsharp Mask + Mask Alpha at full w x h
+      canvas.width = w;
+      canvas.height = h;
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, w, h);
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.useProgram(progOilLIC);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texToned);
-      gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_toned"), 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texCc);
-      gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_origCc"), 1);
-      gl.uniform2f(gl.getUniformLocation(progOilLIC, "u_step"), 1.0 / w, 1.0 / h);
-      gl.uniform1f(gl.getUniformLocation(progOilLIC, "u_hpStrength"), cfg.OIL_HIGH_PASS_STRENGTH ?? 0.5);
-      gl.uniform1f(gl.getUniformLocation(progOilLIC, "u_unsharp"), cfg.OIL_UNSHARP_AMOUNT ?? 1.1);
-      gl.uniform1f(gl.getUniformLocation(progOilLIC, "u_finalCon"), cfg.OIL_FINAL_CONTRAST ?? 1.0);
+      gl.useProgram(progOilComp);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtLic.tex);
+      gl.uniform1i(gl.getUniformLocation(progOilComp, "u_lic"), 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, rtBlur.tex);
+      gl.uniform1i(gl.getUniformLocation(progOilComp, "u_licBlur"), 1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texMask);
+      gl.uniform1i(gl.getUniformLocation(progOilComp, "u_mask"), 2);
+      gl.uniform1f(gl.getUniformLocation(progOilComp, "u_hpStrength"), cfg.OIL_HIGH_PASS_STRENGTH ?? 0.5);
+      gl.uniform1f(gl.getUniformLocation(progOilComp, "u_unsharp"), cfg.OIL_UNSHARP_AMOUNT ?? 1.1);
+      gl.uniform1f(gl.getUniformLocation(progOilComp, "u_finalCon"), cfg.OIL_FINAL_CONTRAST ?? 1.0);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       oilFull = createCanvas(cw, ch);
       oilFull.getContext("2d").drawImage(canvas, offX, offY);
 
-      gl.deleteFramebuffer(fbo);
-      gl.deleteTexture(texToned);
+      for (const rt of [rtToned, rtLic, rtPing, rtBlur]) {
+        gl.deleteFramebuffer(rt.fbo);
+        gl.deleteTexture(rt.tex);
+      }
       gl.deleteTexture(texCc);
+    } else {
+      unmaskedCcCrop.width = 1; unmaskedCcCrop.height = 1;
     }
 
     gl.deleteTexture(texOrig);
@@ -542,7 +652,7 @@
   }
 
   // ==========================================================================
-  // 4. HALF-SCALE PYRAMID FOR 21x21 NORMALS & ACCENTS + FULL-RES EDGE SAMPLING
+  // 3. HALF-SCALE PYRAMID FOR 21x21 NORMALS & ACCENTS + FULL-RES EDGE SAMPLING
   // ==========================================================================
   function computeEdgesPaletteAndAccentsFast(cleanCcCrop, maskClean, w, h, offset, cfg) {
     const subjectData = cleanCcCrop.getContext("2d").getImageData(0, 0, w, h).data;
@@ -804,7 +914,7 @@
   }
 
   // ==========================================================================
-  // 5. PAPER, BLUR_BG, SHADOW & COLORDROP LAYERS
+  // 4. PAPER, BLUR_BG, SHADOW & COLORDROP LAYERS
   // ==========================================================================
   function buildPaperLayerClient(cw, ch, cfg) {
     const c = createCanvas(cw, ch);
@@ -981,7 +1091,7 @@
   }
 
   // ==========================================================================
-  // 6. MASTER CLIENT-SIDE PAYLOAD GENERATOR
+  // 5. MASTER CLIENT-SIDE PAYLOAD GENERATOR
   // ==========================================================================
   async function generate(presetKey, useEditedMask = false) {
     const t0 = performance.now();
@@ -1044,21 +1154,23 @@
     const offY = (ch - h) >> 1;
     const offset = [offX, offY];
 
-    // 2. WebGL2 GPU Color Correction + WebGL2 GPU LIC Oil Paint (~15 ms)
+    // 2. WebGL2 GPU Color Correction + WebGL2 GPU 4-Pass LIC Oil Paint
     tStep = performance.now();
     const gpuOut = renderSubjectAndOilGPU(origC, maskC, w, h, cw, ch, offset, cfg);
     if (!gpuOut) throw new Error("WebGL2 GPU filter context unavailable");
     const { cleanCcCrop, subCcFull, subTexFull, oilFull } = gpuOut;
 
-    // 3. Multi-Eye Beautifier (delegated to standalone eye_beautifier.js)
-    const tEye = performance.now();
-    if (window.EyeBeautifier && typeof window.EyeBeautifier.processForPayload === "function") {
-      window.EyeBeautifier.processForPayload(origC, maskClean, w, h, offset, key);
-    }
-    timings["2b_eye_beautifier_sec"] = Number(((performance.now() - tEye) / 1000).toFixed(3));
-    timings["2b_eyes_beautified_count"] = (STATE.eyeBeautifierPatches || []).length;
+    const subRawFull = createCanvas(cw, ch);
+    const origCtx = origC.getContext("2d");
+    const origImgData = origCtx.getImageData(0, 0, w, h);
+    const oD = origImgData.data;
+    for (let i = 0, p = 3; i < maskClean.length; i++, p += 4) oD[p] = maskClean[i];
+    origCtx.putImageData(origImgData, 0, 0);
+    subRawFull.getContext("2d").drawImage(origC, offX, offY);
+    origC.width = 1; origC.height = 1;
+    timings["2_gpu_cc_and_oil_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
 
-    // 4. Half-Scale Normal Pyramid, Full-Res Edges, Accents & Auxiliary Layers
+    // 3. Half-Scale Normal Pyramid, Full-Res Edges, Accents & Auxiliary Layers
     tStep = performance.now();
     const {
       averageColor,

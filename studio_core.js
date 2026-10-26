@@ -545,6 +545,16 @@ const SIBLING_PRESETS = {
 };
 
 async function fetchPresetPayloadFromServer(presetKey, useEditedMask) {
+  try {
+    await loadCachedBrushes();
+    if (window.ClientWatercolorEngine && typeof window.ClientWatercolorEngine.generate === "function") {
+      const rawPayload = await window.ClientWatercolorEngine.generate(presetKey, useEditedMask);
+      return compactifyPayloadForCache(rawPayload);
+    }
+  } catch (err) {
+    console.warn("ClientWatercolorEngine fallback to server:", err);
+  }
+
   const optimizedBlob = await prepareOptimizedUploadBlob(STATE.originalImg, presetKey);
   const formData = new FormData();
   formData.append("image_file", optimizedBlob, "upload.jpg");

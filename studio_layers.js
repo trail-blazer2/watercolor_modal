@@ -991,6 +991,7 @@ function getOrBuildOilDetailCache() {
     const subC = createCanvas(bw, bh);
     subC.getContext("2d").drawImage(STATE.serverImages.subject_cc, bx, by, bw, bh, 0, 0, bw, bh);
     const sData = subC.getContext("2d").getImageData(0, 0, bw, bh).data;
+    subC.width = 1; subC.height = 1;
 
     const n = bw * bh;
     const outerSil = new Float32Array(n);
@@ -1020,8 +1021,6 @@ function getOrBuildOilDetailCache() {
   pCtx.drawImage(oilCrop, 0, 0);
   pCtx.filter = "none";
 
-  STATE.oilDetailCache = { bx, by, bw, bh, oilCrop, popCanvas };
-  // Release the redundant 21.5 MB full-size oil_paint_full canvas now that oilCrop & popCanvas are cached
   if (STATE.serverImages && STATE.serverImages.oil_paint_full) {
     if (STATE.serverImages.oil_paint_full.tagName === "CANVAS") {
       STATE.serverImages.oil_paint_full.width = 1;

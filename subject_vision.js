@@ -256,42 +256,12 @@
     };
     const kptsUpper = await runRTMPoseOnAnimalBox(sourceCanvas, upperBox, 1.08);
 
-    if (!kptsFull) return kptsUpper ? [kptsUpper] : [];
-    if (!kptsUpper) return [kptsFull];
+    if (!kptsFull) return kptsUpper;
+    if (!kptsUpper) return kptsFull;
 
     const scoreFull = kptsFull[0].score + kptsFull[1].score;
     const scoreUpper = kptsUpper[0].score + kptsUpper[1].score;
-    const primary = scoreUpper > scoreFull * 1.05 ? kptsUpper : kptsFull;
-    const results = [primary];
-
-    // Check if there is a 2nd animal head inside the same box (e.g. 2 dogs snuggled together = 3 or 4 eyes!)
-    const bw = animalBox.x1 - animalBox.x0;
-    if (bw > 0.36 && Math.max(primary[0].score, primary[1].score) >= 0.20) {
-      const W = sourceCanvas.width, H = sourceCanvas.height;
-      const maskedC = document.createElement("canvas");
-      maskedC.width = W; maskedC.height = H;
-      const mCtx = maskedC.getContext("2d");
-      mCtx.drawImage(sourceCanvas, 0, 0);
-
-      // Mask out the primary head region (eyes + nose)
-      const validPts = [primary[0], primary[1], primary[2]].filter((p) => p && p.score >= 0.12);
-      if (validPts.length > 0) {
-        const hx = validPts.reduce((s, p) => s + p.u, 0) / validPts.length;
-        const hy = validPts.reduce((s, p) => s + p.v, 0) / validPts.length;
-        const maskR = Math.max(0.11, Math.hypot(primary[0].u - primary[1].u, primary[0].v - primary[1].v) * 1.65);
-        mCtx.fillStyle = "#808080";
-        mCtx.beginPath();
-        mCtx.arc(hx * W, hy * H, maskR * Math.min(W, H), 0, Math.PI * 2);
-        mCtx.fill();
-
-        const kptsSecondary = await runRTMPoseOnAnimalBox(maskedC, upperBox, 1.08);
-        maskedC.width = 1; maskedC.height = 1;
-        if (kptsSecondary && Math.max(kptsSecondary[0].score, kptsSecondary[1].score) >= 0.24) {
-          results.push(kptsSecondary);
-        }
-      }
-    }
-    return results;
+    return scoreUpper > scoreFull * 1.05 ? kptsUpper : kptsFull;
   }
 
   // ------------------------------------------------------------------ 3. Helpers & Main Detect

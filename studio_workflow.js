@@ -175,6 +175,7 @@ const Workflow = (() => {
         maskArr = window.WatercolorFraming.maskFromImageData(photoData, "alpha");
         CROP.visionResult = await visionPromise;
       } else {
+        // Run /cutout and SubjectVision in parallel so Step 1 -> Step 2 is fast!
         const [maskImg, visionRes] = await Promise.all([
           fetchSubjectMaskFromBackend(rawImg),
           visionPromise,
@@ -188,6 +189,21 @@ const Workflow = (() => {
       }
 
       finalizeCropMask(maskArr, sw, sh);
+
+      // Fire Eye Beautifier in the background while the user is on Step 2 (zero upload delay!)
+      const vRes = CROP.visionResult;
+      let animalBoxes = [];
+      if (vRes) {
+        if (vRes.animals && vRes.animals.length > 0) {
+          animalBoxes = vRes.animals.map((a) => [a.box.x0, a.box.y0, a.box.x1, a.box.y1]);
+        } else if (vRes.primaryKind === "animal") {
+          animalBoxes = [[0.0, 0.0, 1.0, 1.0]];
+        }
+      }
+      STATE.isAnimalPhoto = animalBoxes.length > 0 || getActiveProfileKey() === "animal";
+      if (STATE.isAnimalPhoto) {
+        fetchEyePatchesInBackground(rawImg, animalBoxes);
+      }
     } catch (err) {
       alert("Error analyzing subject: " + err.message);
       console.error(err);
@@ -219,6 +235,50 @@ const Workflow = (() => {
     if (!res.ok) throw new Error(`Server status ${res.status}`);
     const payload = await res.json();
     return await loadImage(payload.raw_mask_png || payload.mask_png);
+  }
+
+  function mapRawEyePatchesToCanvas() {
+    if (!STATE.uncroppedPlacement || !Array.isArray(STATE.rawEyePatches)) return;
+    const { px } = STATE.uncroppedPlacement;
+    STATE.eyeBeautifierPatches = STATE.rawEyePatches.map((ep) => ({
+      baseX: Math.round(px.x + ep.x0Frac * px.w),
+      baseY: Math.round(px.y + ep.y0Frac * px.h),
+      w: Math.max(1, Math.round(ep.wFrac * px.w)),
+      h: Math.max(1, Math.round(ep.hFrac * px.h)),
+      canvas: ep.img,
+    }));
+  }
+
+  async function fetchEyePatchesInBackground(img, animalBoxes) {
+    const uploadRef = STATE.uploadedFile;
+    try {
+      const blob = await prepareOptimizedUploadBlob(img, "animals");
+      const fd = new FormData();
+      fd.append("image_file", blob, "upload.jpg");
+      fd.append("animal_boxes_json", JSON.stringify(animalBoxes));
+      const res = await fetch(`${STATE.apiUrl}/beautify_eyes`, { method: "POST", body: fd });
+      if (!res.ok || STATE.uploadedFile !== uploadRef) return;
+      const data = await res.json();
+      if (Array.isArray(data.eye_patches) && data.eye_patches.length > 0 && STATE.uploadedFile === uploadRef) {
+        STATE.rawEyePatches = await Promise.all(
+          data.eye_patches.map(async (ep) => ({
+            ...ep,
+            img: await loadImage(ep.png),
+          }))
+        );
+        mapRawEyePatchesToCanvas();
+        if (currentStep === "studio" && STATE.payload) {
+          if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+          invalidateStack();
+          if (STATE.selectedLayerId === "subject" && STATE.layers.subject) {
+            renderSlidersForLayer(STATE.layers.subject);
+          }
+          compositeAllLayers();
+        }
+      }
+    } catch (e) {
+      console.warn("Background eye beautifier skipped:", e);
+    }
   }
 
   // Builds CROP.cutoutCanvas and CROP.maskTintCanvas (solid black where removed; drawn at 0.5 alpha)
@@ -672,6 +732,9 @@ const Workflow = (() => {
       refSize: [outW, outH],
       px: { x: px.x, y: px.y, w: px.w, h: px.h },
     };
+
+    mapRawEyePatchesToCanvas();
+
 
     const framedPhotoC = createCanvas(outW, outH);
     const fpCtx = framedPhotoC.getContext("2d");
