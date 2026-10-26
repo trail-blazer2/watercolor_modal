@@ -196,6 +196,7 @@ const Workflow = (() => {
       const resCut = await fetch(`${STATE.apiUrl}/cutout`, { method: "POST", body: fd });
       if (resCut.ok) {
         const data = await resCut.json();
+        if (data.presets) STATE.serverPresets = data.presets;
         if (data.raw_mask_png) return await loadImage(data.raw_mask_png);
       }
     } catch (_) {}

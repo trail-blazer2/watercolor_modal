@@ -145,7 +145,7 @@ const canvasContainer = document.getElementById("canvasContainer");
 const viewport = document.getElementById("viewport");
 const brushCursor = document.getElementById("brushCursor");
 
-const BRUSH_CACHE_KEY = "wc_cached_brushes_v2";
+const BRUSH_CACHE_KEY = "wc_cached_brushes_v5";
 
 // ============================================================================
 // 4. PRE-WARMER, PROGRESS BAR & LIGHTWEIGHT BRUSH CACHE
@@ -163,7 +163,12 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 function prewarmModalServer() {
-  fetch(`${STATE.apiUrl}/health`, { mode: "cors" }).catch(() => {});
+  fetch(`${STATE.apiUrl}/health`, { mode: "cors" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => {
+      if (d && d.presets) STATE.serverPresets = d.presets;
+    })
+    .catch(() => {});
 }
 
 function startFilePickerPrewarm() {
@@ -242,7 +247,7 @@ function finishProgressBar() {
 }
 
 async function loadCachedBrushes() {
-  if (Object.keys(STATE.brushImages).length >= 7) return;
+  if (Object.keys(STATE.brushImages).length >= 9) return;
   try {
     const cachedStr = localStorage.getItem(BRUSH_CACHE_KEY);
     if (cachedStr) {
@@ -251,14 +256,14 @@ async function loadCachedBrushes() {
         STATE.brushImages[name] = await loadImage(b64);
       }
       invalidateGLBrushTextures();
-      return;
+      if (Object.keys(STATE.brushImages).length >= 9) return;
     }
   } catch (_) {}
-  fetchBrushTextures();
+  await fetchBrushTextures();
 }
 
 async function fetchBrushTextures() {
-  if (Object.keys(STATE.brushImages).length >= 7) return;
+  if (Object.keys(STATE.brushImages).length >= 9) return;
   try {
     const res = await fetch(`${STATE.apiUrl}/brushes`);
     if (!res.ok) return;
@@ -539,6 +544,19 @@ const SIBLING_PRESETS = {
 };
 
 async function fetchPresetPayloadFromServer(presetKey, useEditedMask) {
+  // 1. POKUS O KLIENTSKÉ GENEROVÁNÍ (WatercolorEngine)
+  try {
+    await loadCachedBrushes();
+    if (window.ClientWatercolorEngine && typeof window.ClientWatercolorEngine.generate === 'function') {
+      const rawPayload = await window.ClientWatercolorEngine.generate(presetKey, useEditedMask);
+      return compactifyPayloadForCache(rawPayload);
+    }
+  } catch (error) {
+    console.warn("Klientský WatercolorEngine selhal, přecházím na server:", error);
+    // Kód nepadá, try/catch zachytí chybu a funkce pokračuje na serverový fallback níže
+  }
+
+  // 2. SERVEROVÝ FALLBACK (Původní logika)
   const optimizedBlob = await prepareOptimizedUploadBlob(STATE.originalImg, presetKey);
   const formData = new FormData();
   formData.append("image_file", optimizedBlob, "upload.jpg");
@@ -555,11 +573,13 @@ async function fetchPresetPayloadFromServer(presetKey, useEditedMask) {
     body: formData,
   });
   if (!res.ok) throw new Error(`Server returned status ${res.status}`);
+  
   const rawPayload = JSON.parse(await res.text());
   if (rawPayload.raw_mask_png) {
     STATE.rawMaskBase64 = rawPayload.raw_mask_png;
     delete rawPayload.raw_mask_png;
   }
+  
   return compactifyPayloadForCache(rawPayload);
 }
 
