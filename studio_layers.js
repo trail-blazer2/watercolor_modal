@@ -102,6 +102,11 @@ function isCarPresetActive() {
   return key.startsWith("cars");
 }
 
+function isAnimalPresetOrPhoto() {
+  const key = (STATE.payload && STATE.payload.preset_key) || "";
+  return key.startsWith("animals") || !!STATE.isAnimalPhoto;
+}
+
 function ensureSubjectParams(p) {
   const cfg = (STATE.payload && STATE.payload.preset_settings) || {};
   const isCar = isCarPresetActive();
@@ -112,6 +117,7 @@ function ensureSubjectParams(p) {
     p.bottomFade = 100;
   }
   if (p.wcTexture === undefined) p.wcTexture = !!cfg.WATERCOLOR_TEXTURE_ENABLED;
+  if (p.eyeBeautifier === undefined) p.eyeBeautifier = isAnimalPresetOrPhoto();
   if (p.underWindowEnabled === undefined) p.underWindowEnabled = false;
   if (p.underWindowColor === undefined) p.underWindowColor = cfg.DARK_BACKGROUND_ENABLED ? "black" : "white";
   if (p.underWindowOpacity === undefined || Number.isNaN(p.underWindowOpacity)) p.underWindowOpacity = 85;
@@ -297,6 +303,20 @@ function drawBackdropWindowIfEnabled(ctx) {
   ctx.restore();
 }
 
+function drawEyeBeautifierPatchesInOverscan(targetCtx) {
+  const subLyr = STATE.layers && STATE.layers.subject;
+  if (!subLyr || !subLyr.vis || !subLyr.params || !subLyr.params.eyeBeautifier) return;
+  const patches = STATE.eyeBeautifierPatches;
+  if (!patches || !patches.length || !STATE.payload) return;
+  const [padX, padY] = STATE.payload.pad || [0, 0];
+  for (let i = 0; i < patches.length; i++) {
+    const ep = patches[i];
+    if (ep && ep.canvas) {
+      targetCtx.drawImage(ep.canvas, ep.baseX + padX, ep.baseY + padY, ep.w, ep.h);
+    }
+  }
+}
+
 function applyBottomQuarterFade(tCtx, w, h, fadePercent) {
   const strength = Math.max(0, Math.min(1, (fadePercent ?? 0) / 100));
   if (strength <= 0.001 || w <= 0 || h <= 0) return;
@@ -408,6 +428,7 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
     } else if (subMain) {
       targetCtx.drawImage(subMain, 0, 0);
     }
+    drawEyeBeautifierPatchesInOverscan(targetCtx);
     targetCtx.restore();
     return;
   }
@@ -417,6 +438,7 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
     targetCtx.save();
     applyOverscanToViewportTransform(targetCtx, vr, movable);
     targetCtx.drawImage(src, 0, 0);
+    drawEyeBeautifierPatchesInOverscan(targetCtx);
     targetCtx.restore();
     return;
   }
@@ -632,6 +654,9 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
     targetCtx.drawImage(tmp, 0, 0);
   }
   targetCtx.restore();
+  if (def.id === "subject" || def.id === "oil_paint") {
+    drawEyeBeautifierPatchesInOverscan(targetCtx);
+  }
   tmp.width = 1; tmp.height = 1;
 }
 

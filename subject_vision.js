@@ -240,9 +240,13 @@
    * Runs a two-stage pass (full animal box + head-focused upper box) so both
    * full-body animals and close-up portrait busts get pinpoint eye accuracy.
    */
+  /**
+   * Runs a two-stage pass (full animal box + head-focused upper box) AND checks for a secondary
+   * animal head inside the same box (by masking out the primary head and re-running RTMPose)
+   * so 2, 3 (one front + one half-turned), 4, or 6+ eyes are all detected!
+   */
   async function detectAnimalPoseForBox(sourceCanvas, animalBox) {
     const kptsFull = await runRTMPoseOnAnimalBox(sourceCanvas, animalBox, 1.12);
-    // Also run on the upper 68% of the animal box (head & chest focus)
     const bh = animalBox.y1 - animalBox.y0;
     const upperBox = {
       x0: animalBox.x0,
@@ -252,13 +256,42 @@
     };
     const kptsUpper = await runRTMPoseOnAnimalBox(sourceCanvas, upperBox, 1.08);
 
-    if (!kptsFull) return kptsUpper;
-    if (!kptsUpper) return kptsFull;
+    if (!kptsFull) return kptsUpper ? [kptsUpper] : [];
+    if (!kptsUpper) return [kptsFull];
 
-    // Pick whichever crop gave higher confidence on the eyes (keypoints 0 & 1)
     const scoreFull = kptsFull[0].score + kptsFull[1].score;
     const scoreUpper = kptsUpper[0].score + kptsUpper[1].score;
-    return scoreUpper > scoreFull * 1.05 ? kptsUpper : kptsFull;
+    const primary = scoreUpper > scoreFull * 1.05 ? kptsUpper : kptsFull;
+    const results = [primary];
+
+    // Check if there is a 2nd animal head inside the same box (e.g. 2 dogs snuggled together = 3 or 4 eyes!)
+    const bw = animalBox.x1 - animalBox.x0;
+    if (bw > 0.36 && Math.max(primary[0].score, primary[1].score) >= 0.20) {
+      const W = sourceCanvas.width, H = sourceCanvas.height;
+      const maskedC = document.createElement("canvas");
+      maskedC.width = W; maskedC.height = H;
+      const mCtx = maskedC.getContext("2d");
+      mCtx.drawImage(sourceCanvas, 0, 0);
+
+      // Mask out the primary head region (eyes + nose)
+      const validPts = [primary[0], primary[1], primary[2]].filter((p) => p && p.score >= 0.12);
+      if (validPts.length > 0) {
+        const hx = validPts.reduce((s, p) => s + p.u, 0) / validPts.length;
+        const hy = validPts.reduce((s, p) => s + p.v, 0) / validPts.length;
+        const maskR = Math.max(0.11, Math.hypot(primary[0].u - primary[1].u, primary[0].v - primary[1].v) * 1.65);
+        mCtx.fillStyle = "#808080";
+        mCtx.beginPath();
+        mCtx.arc(hx * W, hy * H, maskR * Math.min(W, H), 0, Math.PI * 2);
+        mCtx.fill();
+
+        const kptsSecondary = await runRTMPoseOnAnimalBox(maskedC, upperBox, 1.08);
+        maskedC.width = 1; maskedC.height = 1;
+        if (kptsSecondary && Math.max(kptsSecondary[0].score, kptsSecondary[1].score) >= 0.24) {
+          results.push(kptsSecondary);
+        }
+      }
+    }
+    return results;
   }
 
   // ------------------------------------------------------------------ 3. Helpers & Main Detect
@@ -422,8 +455,12 @@
 
       for (const box of targetBoxes) {
         try {
-          const kpts = await detectAnimalPoseForBox(input, box);
-          if (kpts) animalPoses.push({ box, kpts });
+          const kptsList = await detectAnimalPoseForBox(input, box);
+          if (Array.isArray(kptsList)) {
+            for (const kpts of kptsList) animalPoses.push({ box, kpts });
+          } else if (kptsList) {
+            animalPoses.push({ box, kpts: kptsList });
+          }
         } catch (err) {
           console.warn("Animal pose inference error:", err);
         }
@@ -678,6 +715,9 @@
       (vision && vision.primaryKind) ||
       (analysis && !analysis.empty ? window.WatercolorFraming.resolveProfile(analysis, "auto").key : "animal");
 
+    if (typeof STATE !== "undefined") {
+      STATE.isAnimalPhoto = kind === "animal" || (vision && vision.animals && vision.animals.length > 0);
+    }
     if (kind === "car") return "cars_black";
     if (kind === "person") return "people";
     if (isPureWhiteSubject(photoImageData, maskArr)) return "animals_black";

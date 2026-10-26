@@ -678,14 +678,20 @@ const Workflow = (() => {
     fmCtx.fillRect(0, 0, outW, outH);
     fmCtx.drawImage(CROP.maskCanvas, px.x, px.y, px.w, px.h);
 
-    STATE.originalImg = await loadImage(framedPhotoC.toDataURL("image/jpeg", 0.95));
-    STATE.rawMaskBase64 = framedMaskC.toDataURL("image/webp", 0.95);
-    STATE.framedMaskBase64 = STATE.rawMaskBase64;
+    // Pass framed canvases directly to ClientWatercolorEngine (saves ~250 ms of base64 encode/decode!)
+    STATE.framedPhotoCanvas = framedPhotoC;
+    STATE.framedMaskCanvas = framedMaskC;
+    STATE.originalImg = framedPhotoC;
     STATE.detectedEyes = px.eyes || [];
-    STATE.maskCanvas = null;
+    STATE.detectedEyesRefSize = [outW, outH];
 
-    // Free heavy Step 2 temporary buffers & AI WASM models before Step 3 Studio allocates layers
+    if (profileKey === "animal" || (STATE.detectedEyes && STATE.detectedEyes.length > 0 && profileKey !== "car")) {
+      STATE.isAnimalPhoto = true;
+    }
+
+    STATE.maskCanvas = null;
     CROP.maskTintCanvas = null;
+
     if (window.SubjectVision && window.SubjectVision.releaseMemory) {
       await window.SubjectVision.releaseMemory();
     }

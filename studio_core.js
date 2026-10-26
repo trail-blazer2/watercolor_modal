@@ -1118,30 +1118,31 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
 }
 
 function buildSeamlessOverscanBlurBg(blurImg, baseW, baseH, overW, overH, padX, padY) {
-  const rawC = createCanvas(overW, overH);
-  const rCtx = rawC.getContext("2d");
-  const edgeStrip = 4;
+  const qW = Math.max(1, overW >> 2), qH = Math.max(1, overH >> 2);
+  const rawSmall = createCanvas(qW, qH);
+  const rCtx = rawSmall.getContext("2d");
+  const edgeStrip = 8;
+  const sx = qW / overW, sy = qH / overH;
+  const pX = Math.round(padX * sx), pY = Math.round(padY * sy);
+  const bW = Math.round(baseW * sx), bH = Math.round(baseH * sy);
 
-  rCtx.drawImage(blurImg, 0, 0, edgeStrip, edgeStrip, 0, 0, padX + 2, padY + 2);
-  rCtx.drawImage(blurImg, baseW - edgeStrip, 0, edgeStrip, edgeStrip, padX + baseW - 2, 0, padX + 2, padY + 2);
-  rCtx.drawImage(blurImg, 0, baseH - edgeStrip, edgeStrip, edgeStrip, 0, padY + baseH - 2, padX + 2, padY + 2);
-  rCtx.drawImage(blurImg, baseW - edgeStrip, baseH - edgeStrip, edgeStrip, edgeStrip, padX + baseW - 2, padY + baseH - 2, padX + 2, padY + 2);
+  rCtx.drawImage(blurImg, 0, 0, baseW, edgeStrip, pX, 0, bW, pY + 2);
+  rCtx.drawImage(blurImg, 0, baseH - edgeStrip, baseW, edgeStrip, pX, pY + bH - 2, bW, pY + 2);
+  rCtx.drawImage(blurImg, 0, 0, edgeStrip, baseH, 0, pY, pX + 2, bH);
+  rCtx.drawImage(blurImg, baseW - edgeStrip, 0, edgeStrip, baseH, pX + bW - 2, pY, pX + 2, bH);
+  rCtx.drawImage(blurImg, pX, pY, bW, bH);
 
-  rCtx.drawImage(blurImg, 0, 0, baseW, edgeStrip, padX, 0, baseW, padY + 2);
-  rCtx.drawImage(blurImg, 0, baseH - edgeStrip, baseW, edgeStrip, padX, padY + baseH - 2, baseW, padY + 2);
-  rCtx.drawImage(blurImg, 0, 0, edgeStrip, baseH, 0, padY, padX + 2, baseH);
-  rCtx.drawImage(blurImg, baseW - edgeStrip, 0, edgeStrip, baseH, padX + baseW - 2, padY, padX + 2, baseH);
-  rCtx.drawImage(blurImg, padX, padY, baseW, baseH);
+  const blurSmall = createCanvas(qW, qH);
+  const bCtx = blurSmall.getContext("2d");
+  bCtx.filter = "blur(9px)";
+  bCtx.drawImage(rawSmall, 0, 0);
+  bCtx.filter = "none";
+  rawSmall.width = 1; rawSmall.height = 1;
 
   const outC = createCanvas(overW, overH);
   const oCtx = outC.getContext("2d");
-  oCtx.drawImage(rawC, 0, 0);
-  oCtx.save();
-  oCtx.filter = "blur(36px)";
-  oCtx.drawImage(rawC, 0, 0);
-  oCtx.restore();
-  rawC.width = 1; rawC.height = 1; // Free 25.1 MB temporary canvas immediately!
-
+  oCtx.drawImage(blurSmall, 0, 0, overW, overH);
+  blurSmall.width = 1; blurSmall.height = 1;
   oCtx.drawImage(blurImg, padX, padY, baseW, baseH);
   return outC;
 }
@@ -1297,7 +1298,7 @@ async function decodeAndBuildOverscanServerImages(
   const cfg = workPayload.preset_settings || {};
 
   // Only decode raster layers that are actually used (procedural brush layers are built from stroke_data!)
-  const neededKeys = ["bg_paper", "subject_raw", "subject_cc"];
+  const neededKeys = ["bg_paper", "subject_raw", "subject_cc", "subject_tex"];
   if (cfg.MASK_BRUSH_ENABLED !== false) neededKeys.push("blur_bg");
   if (cfg.OIL_PAINT_ENABLED !== false) neededKeys.push("oil_paint_full");
   if (cfg.EDGE_CURVE_ENABLED) neededKeys.push("edge_curve");
@@ -1446,6 +1447,9 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   document.getElementById("exportJpgBtn").disabled = false;
   document.getElementById("resetLayerBtn").disabled = false;
   document.getElementById("renderTimeBadge").textContent = `⚡ ${compact.elapsed_sec}s`;
+
+  const srcTag = STATE.lastEngineSource || "Local GPU";
+  document.getElementById("renderTimeBadge").textContent = `⚡ ${compact.elapsed_sec}s · ${srcTag}`;
 
   if (compact.average_color) {
     const hex = rgbToHex(...compact.average_color);

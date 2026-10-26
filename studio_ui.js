@@ -413,7 +413,38 @@ function renderSlidersForLayer(lyr) {
 }
 
 function addSubjectOverlayAndWindowControls(container, def, p) {
-  const hasWcTex = !!(STATE.serverImages && (STATE.serverImages.subject_tex || STATE.serverImages.edge_curve));
+  const showEyeToggle =
+    (typeof isAnimalPresetOrPhoto === "function" && isAnimalPresetOrPhoto()) ||
+    (Array.isArray(STATE.eyeBeautifierPatches) && STATE.eyeBeautifierPatches.length > 0);
+
+  if (showEyeToggle) {
+    const eyeRow = document.createElement("div");
+    eyeRow.className = "control-row";
+    const eyeCount = Array.isArray(STATE.eyeBeautifierPatches) ? STATE.eyeBeautifierPatches.length : 0;
+    const eyeLbl = document.createElement("label");
+    eyeLbl.innerHTML = `<span>Animal Eye Beautifier${eyeCount > 0 ? ` (${eyeCount} eye${eyeCount > 1 ? "s" : ""})` : ""}</span>`;
+    eyeRow.appendChild(eyeLbl);
+
+    const eyeBtn = document.createElement("button");
+    const syncEyeBtn = () => {
+      eyeBtn.className = p.eyeBeautifier ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+      eyeBtn.textContent = p.eyeBeautifier
+        ? "🐾 Eye Beautifier (Reflections & Iris): ON"
+        : "🐾 Eye Beautifier (Reflections & Iris): OFF";
+    };
+    syncEyeBtn();
+    eyeBtn.addEventListener("click", () => {
+      History.paramBegin();
+      p.eyeBeautifier = !p.eyeBeautifier;
+      syncEyeBtn();
+      if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+      invalidateStack();
+      scheduleComposite();
+      History.paramCommit();
+    });
+    eyeRow.appendChild(eyeBtn);
+    container.appendChild(eyeRow);
+  }  const hasWcTex = !!(STATE.serverImages && (STATE.serverImages.subject_tex || STATE.serverImages.edge_curve));
 
   if (hasWcTex) {
     const wcRow = document.createElement("div");
