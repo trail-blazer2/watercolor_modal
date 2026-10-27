@@ -466,7 +466,6 @@
     }
     const meanL = (cntL > 0 ? sumL / cntL : 128.0) / 255.0;
 
-    // Mask-normalized blur: white #faf8f4 background outside the subject NEVER bleeds into u_lumBlur!
     const den6 = boxBlurFloat32(in4, sw4, sh4, 6);
     let lumBlur4 = normalizedBlurFloat32(lum4, in4, sw4, sh4, 6, den6);
     lumBlur4 = normalizedBlurFloat32(lumBlur4, in4, sw4, sh4, 5);
@@ -963,20 +962,52 @@
     }
     smallSub.width = 1; smallSub.height = 1;
 
-    // Use HTML5 2D context drawing with multiple overlapping downscales for guaranteed mobile blur
-    const blurR = Math.max(2, (cfg.BLUR_AMOUNT ?? 25) >> 1);
-    const blurC = createCanvas(sw, sh);
-    const bCtx = blurC.getContext("2d");
-    bCtx.drawImage(stackC, 0, 0);
-    bCtx.drawImage(stackC, 0, 0);
-    bCtx.drawImage(stackC, 0, 0);
+    // Cross-platform 2-pass boxBlurFloat32 + saturation/contrast boost (works 100% on iOS Safari where ctx.filter is unsupported!)
+    const blurR = Math.max(2, (cfg.BLUR_AMOUNT ?? 28) >> 2);
+    const satB = cfg.SATURATION_BOOST ?? 1.1;
+    const conB = cfg.CONTRAST_BOOST ?? 1.4;
+
+    const imgData = stCtx.getImageData(0, 0, sw, sh);
+    const d = imgData.data;
+    const n = sw * sh;
+    const chR = new Float32Array(n), chG = new Float32Array(n), chB = new Float32Array(n), chA = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const p = i * 4;
+      const a = d[p + 3] / 255.0;
+      chR[i] = d[p] * a;
+      chG[i] = d[p + 1] * a;
+      chB[i] = d[p + 2] * a;
+      chA[i] = d[p + 3];
+    }
+    const r1 = Math.max(1, Math.round(blurR * 0.85));
+    const r2 = Math.max(1, Math.round(blurR * 0.65));
+    const bR = boxBlurFloat32(boxBlurFloat32(chR, sw, sh, r1), sw, sh, r2);
+    const bG = boxBlurFloat32(boxBlurFloat32(chG, sw, sh, r1), sw, sh, r2);
+    const bB = boxBlurFloat32(boxBlurFloat32(chB, sw, sh, r1), sw, sh, r2);
+    const bA = boxBlurFloat32(boxBlurFloat32(chA, sw, sh, r1), sw, sh, r2);
+
+    for (let i = 0; i < n; i++) {
+      const aVal = bA[i];
+      const p = i * 4;
+      if (aVal <= 0.5) {
+        d[p] = 0; d[p + 1] = 0; d[p + 2] = 0; d[p + 3] = 0;
+        continue;
+      }
+      const invA = 255.0 / aVal;
+      let r = bR[i] * invA, g = bG[i] * invA, b = bB[i] * invA;
+      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+      r = 128 + ((gray + (r - gray) * satB) - 128) * conB;
+      g = 128 + ((gray + (g - gray) * satB) - 128) * conB;
+      b = 128 + ((gray + (b - gray) * satB) - 128) * conB;
+      d[p] = Math.max(0, Math.min(255, r));
+      d[p + 1] = Math.max(0, Math.min(255, g));
+      d[p + 2] = Math.max(0, Math.min(255, b));
+      d[p + 3] = Math.max(0, Math.min(255, aVal));
+    }
+    stCtx.putImageData(imgData, 0, 0);
 
     const outC = createCanvas(cw, ch);
-    const oCtx = outC.getContext("2d");
-    oCtx.imageSmoothingEnabled = true;
-    oCtx.imageSmoothingQuality = "high";
-    oCtx.drawImage(blurC, 0, 0, cw, ch);
-    blurC.width = 1; blurC.height = 1;
+    outC.getContext("2d").drawImage(stackC, 0, 0, cw, ch);
     stackC.width = 1; stackC.height = 1;
     return outC;
   }

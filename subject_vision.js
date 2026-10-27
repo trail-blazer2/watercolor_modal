@@ -306,9 +306,13 @@
     const sorted = [...list].sort((a, b) => b.score - a.score);
     const keep = [];
     for (const item of sorted) {
-      if (!keep.some((k) => boxIoU(item.box, k.box) > iouThresh)) {
-        keep.push(item);
-      }
+      const duplicate = keep.some(
+        (k) =>
+          boxIoU(item.box, k.box) > iouThresh ||
+          boxContainment(item.box, k.box) > 0.55 ||
+          boxContainment(k.box, item.box) > 0.55
+      );
+      if (!duplicate) keep.push(item);
     }
     return keep;
   }

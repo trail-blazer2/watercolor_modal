@@ -632,7 +632,8 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false,
     const t0 = performance.now();
     let compactPayload = null;
 
-    if ((isPresetSwitch || isHistoryRestore) && !useEditedMask) {
+    const useLocalGPU = !!(window.ClientWatercolorEngine && typeof window.ClientWatercolorEngine.generate === "function");
+    if (!useLocalGPU && (isPresetSwitch || isHistoryRestore) && !useEditedMask) {
       if (STATE.presetCache.has(presetKey)) {
         compactPayload = STATE.presetCache.get(presetKey);
       } else if (STATE.bgFetchPromises.has(presetKey)) {
@@ -644,7 +645,7 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false,
       compactPayload = await fetchPresetPayloadFromServer(presetKey, useEditedMask);
     }
 
-    if (currentSessionId === STATE.uploadSessionId && compactPayload) {
+    if (!useLocalGPU && currentSessionId === STATE.uploadSessionId && compactPayload) {
       storePresetInMemoryCache(compactPayload.preset_key || presetKey, compactPayload);
     }
 
@@ -1128,7 +1129,7 @@ function buildOverscanServerImages(decodedImgs, workPayload, origOffset, baseW, 
 }
 
 function buildSeamlessOverscanBlurBg(blurImg, baseW, baseH, overW, overH, padX, padY) {
-  const qW = Math.max(1, overW >> 2), qH = Math.max(1, overH >> 2);
+  const qW = Math.max(1, overW >> 3), qH = Math.max(1, overH >> 3);
   const rawSmall = createCanvas(qW, qH);
   const rCtx = rawSmall.getContext("2d");
   const edgeStrip = 8;
@@ -1142,17 +1143,10 @@ function buildSeamlessOverscanBlurBg(blurImg, baseW, baseH, overW, overH, padX, 
   rCtx.drawImage(blurImg, baseW - edgeStrip, 0, edgeStrip, baseH, pX + bW - 2, pY, pX + 2, bH);
   rCtx.drawImage(blurImg, pX, pY, bW, bH);
 
-  const blurSmall = createCanvas(qW, qH);
-  const bCtx = blurSmall.getContext("2d");
-  bCtx.filter = "blur(9px)";
-  bCtx.drawImage(rawSmall, 0, 0);
-  bCtx.filter = "none";
-  rawSmall.width = 1; rawSmall.height = 1;
-
   const outC = createCanvas(overW, overH);
   const oCtx = outC.getContext("2d");
-  oCtx.drawImage(blurSmall, 0, 0, overW, overH);
-  blurSmall.width = 1; blurSmall.height = 1;
+  oCtx.drawImage(rawSmall, 0, 0, overW, overH);
+  rawSmall.width = 1; rawSmall.height = 1;
   oCtx.drawImage(blurImg, padX, padY, baseW, baseH);
   return outC;
 }
@@ -1499,23 +1493,7 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   }
 
   appendOverscanEdges(workPayload, overW, overH);
-  // Free redundant 21.5 MB subject_raw canvas (it will be decoded on-demand from ServerLayerBlobs if ccBlend < 100)
-  if (rawImgs.subject_raw) {
-    if (rawImgs.subject_raw.tagName === "CANVAS") {
-      rawImgs.subject_raw.width = 1;
-      rawImgs.subject_raw.height = 1;
-    }
-    delete rawImgs.subject_raw;
-  }
 
-  // Free Step 2 temporary canvases (~30 MB) now that overscan layers and edges are built
-  if (STATE.uncroppedPlacement) {
-    for (const k of ["sourceCanvas", "maskCanvas", "cutoutCanvas"]) {
-      const c = STATE.uncroppedPlacement[k];
-      if (c && c.tagName === "CANVAS") { c.width = 1; c.height = 1; }
-      STATE.uncroppedPlacement[k] = null;
-    }
-  }
   rebuildEdgeSpatialIndex(workPayload.stroke_data);
 
   STATE.serverImages = rawImgs;

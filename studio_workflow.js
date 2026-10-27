@@ -133,10 +133,9 @@ const Workflow = (() => {
     STATE.maskCanvas = null;
     STATE.headRectNorm = null;
     STATE.detectedEyes = [];
-    STATE.eyeBeautifierPatches = [];
-    
     STATE.rawEyePatches = [];
     STATE.eyeBeautifierPatches = [];
+
 
     if (STATE.presetCache) STATE.presetCache.clear();
     if (STATE.presetUserEdits) STATE.presetUserEdits.clear();
