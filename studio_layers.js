@@ -422,8 +422,11 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
     if (p.ccBlend < 100 && STATE.serverImages.subject_raw) {
       targetCtx.drawImage(STATE.serverImages.subject_raw, 0, 0);
       if (subMain) {
+        targetCtx.save();
         targetCtx.globalAlpha = p.ccBlend / 100;
+        targetCtx.globalCompositeOperation = "source-atop";
         targetCtx.drawImage(subMain, 0, 0);
+        targetCtx.restore();
       }
     } else if (subMain) {
       targetCtx.drawImage(subMain, 0, 0);

@@ -120,6 +120,8 @@ const Workflow = (() => {
 
   async function startFromUploadedFile(file) {
     if (!file) return;
+    STATE.eyeSessionId = (STATE.eyeSessionId || 0) + 1;
+    const mySessionId = STATE.eyeSessionId;
     init();
     STATE.uploadedFile = file;
     STATE.maskEditedByUser = false;
@@ -132,6 +134,10 @@ const Workflow = (() => {
     STATE.headRectNorm = null;
     STATE.detectedEyes = [];
     STATE.eyeBeautifierPatches = [];
+    
+    STATE.rawEyePatches = [];
+    STATE.eyeBeautifierPatches = [];
+
     if (STATE.presetCache) STATE.presetCache.clear();
     if (STATE.presetUserEdits) STATE.presetUserEdits.clear();
     History.clear();
@@ -251,13 +257,16 @@ const Workflow = (() => {
 
   async function fetchEyePatchesInBackground(img, animalBoxes) {
     const uploadRef = STATE.uploadedFile;
+    // Přidáno přesně podle zadání
+    const targetSessionId = STATE.eyeSessionId;
     try {
       const blob = await prepareOptimizedUploadBlob(img, "animals");
       const fd = new FormData();
       fd.append("image_file", blob, "upload.jpg");
       fd.append("animal_boxes_json", JSON.stringify(animalBoxes));
       const res = await fetch(`${STATE.apiUrl}/beautify_eyes`, { method: "POST", body: fd });
-      if (!res.ok || STATE.uploadedFile !== uploadRef) return;
+      // Upraveno přesně podle zadání
+      if (!res.ok || STATE.eyeSessionId !== targetSessionId || STATE.uploadedFile !== uploadRef) return;
       const data = await res.json();
       if (Array.isArray(data.eye_patches) && data.eye_patches.length > 0 && STATE.uploadedFile === uploadRef) {
         STATE.rawEyePatches = await Promise.all(

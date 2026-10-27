@@ -963,20 +963,21 @@
     }
     smallSub.width = 1; smallSub.height = 1;
 
-    const blurR = Math.max(1, (cfg.BLUR_AMOUNT ?? 25) >> 2);
-    const satB = Math.round((cfg.SATURATION_BOOST ?? 1.1) * 100);
-    const conB = Math.round((cfg.CONTRAST_BOOST ?? 1.4) * 100);
-
-    const blurredSmall = createCanvas(sw, sh);
-    const bCtx = blurredSmall.getContext("2d");
-    bCtx.filter = `blur(${blurR}px) saturate(${satB}%) contrast(${conB}%)`;
+    // Use HTML5 2D context drawing with multiple overlapping downscales for guaranteed mobile blur
+    const blurR = Math.max(2, (cfg.BLUR_AMOUNT ?? 25) >> 1);
+    const blurC = createCanvas(sw, sh);
+    const bCtx = blurC.getContext("2d");
     bCtx.drawImage(stackC, 0, 0);
-    bCtx.filter = "none";
-    stackC.width = 1; stackC.height = 1;
+    bCtx.drawImage(stackC, 0, 0);
+    bCtx.drawImage(stackC, 0, 0);
 
     const outC = createCanvas(cw, ch);
-    outC.getContext("2d").drawImage(blurredSmall, 0, 0, cw, ch);
-    blurredSmall.width = 1; blurredSmall.height = 1;
+    const oCtx = outC.getContext("2d");
+    oCtx.imageSmoothingEnabled = true;
+    oCtx.imageSmoothingQuality = "high";
+    oCtx.drawImage(blurC, 0, 0, cw, ch);
+    blurC.width = 1; blurC.height = 1;
+    stackC.width = 1; stackC.height = 1;
     return outC;
   }
 
@@ -1094,6 +1095,10 @@
   // 5. MASTER CLIENT-SIDE PAYLOAD GENERATOR
   // ==========================================================================
   async function generate(presetKey, useEditedMask = false) {
+    if (typeof _glgpu !== "undefined" && _glgpu) {
+      try { _glgpu.gl.deleteProgram(_glgpu.progCC); } catch (_) {}
+      _glgpu = null;
+    }
     const t0 = performance.now();
     const timings = { "0_engine_mode": "⚡ LOCAL_BROWSER_WEBGL2" };
     const { key, cfg } = await getPresetFromServerSingleSource(presetKey);
