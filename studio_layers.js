@@ -1007,12 +1007,14 @@ function getOrBuildOilDetailCache() {
     for (let i = 0; i < n; i++) {
       const p = i * 4;
       if (oData[p + 3] === 0) continue;
-      const keepOil = Math.max(0, Math.min(1, (0.18 - silBlur[i]) / 0.16));
+      // Smoothly inset oil layer slightly from the outer edge and fade both RGB and Alpha!
+      const keepOil = Math.max(0, Math.min(1, (0.20 - silBlur[i]) / 0.17));
       if (keepOil < 0.999) {
         const inv = 1 - keepOil;
         oData[p] = Math.round(sData[p] * inv + oData[p] * keepOil);
         oData[p + 1] = Math.round(sData[p + 1] * inv + oData[p + 1] * keepOil);
         oData[p + 2] = Math.round(sData[p + 2] * inv + oData[p + 2] * keepOil);
+        oData[p + 3] = Math.round(oData[p + 3] * keepOil);
       }
     }
     oCtx.putImageData(oilImg, 0, 0);
