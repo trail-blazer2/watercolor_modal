@@ -547,7 +547,7 @@ let _glEC = null;
 function destroyGLEdgeCurveResources() {
   if (!_glEC) return;
   const { gl } = _glEC;
-  for (const k of ["texOrig", "texDarkPaint", "texMidPaint", "texLightPaint", "texPyrA", "texPyrB", "texWc"]) {
+  for (const k of ["texOrig", "texDarkPaint", "texMidPaint", "texLightPaint", "texPyrA", "texPyrB", "texWc", "texPaper"]) {
     if (_glEC[k]) { gl.deleteTexture(_glEC[k]); _glEC[k] = null; }
   }
   _glEC.uploadedCache = null;
@@ -584,12 +584,6 @@ function initGLEdgeCurveContext() {
     }
   `;
 
-  // True C2-Continuous Cubic B-Spline + Tangent-Flow Artist Cutout Shader:
-  // 1. Samples u_pyrA using a 4-fetch hardware Cubic B-Spline filter (C2 continuous derivatives!)
-  //    so bilinear pixel-grid kinks and staircase steps CANNOT exist at any resolution (even 5000x3000px!).
-  // 2. Smooths ALONG the local edge tangent to straighten contours and round corners.
-  // 3. Computes the exact analytical gradient magnitude |grad(L)| from the B-Spline surface (instead of
-  //    blocky 2x2 fwidth) for silky-smooth, sub-pixel vector anti-aliasing along every edge!
   const fsCutoutAction = `#version 300 es
     precision highp float;
     in vec2 v_uv;
@@ -600,16 +594,16 @@ function initGLEdgeCurveContext() {
     uniform sampler2D u_pyrA;
     uniform sampler2D u_pyrB;
     uniform sampler2D u_wcTex;
+    uniform sampler2D u_paperTex;
     uniform vec2 u_step;
     uniform vec2 u_wcScale;
-    uniform float u_detail;       // 0.0 (0%) .. 2.0 (200%)
-    uniform float u_rimStrength;  // 0.0 by default
-    uniform float u_useWcTex;     // 1.0 when Subject Watercolor Texture is ON
+    uniform vec2 u_paperScale;
+    uniform float u_detail;         // 0.0 (0%) .. 2.0 (200%)
+    uniform float u_rimStrength;    // 0.0 by default
+    uniform float u_bloomStrength;  // 0.0 .. 1.5 (Watercolor Blooms & Washes)
+    uniform float u_paperStrength;  // 0.0 .. 1.5 (Cold-Press Paper Grain & Tooth)
     out vec4 outColor;
 
-    // Fast 4-tap Hardware Cubic B-Spline Texture Lookup:
-    // Converts standard C0 bilinear hardware filtering into a C2-continuous cubic B-spline surface!
-    // Completely eliminates texel-boundary kinks and diagonal pixel staircases!
     vec4 textureBicubicBSpline(sampler2D tex, vec2 uv) {
       vec2 texSize = 1.0 / u_step;
       vec2 coord = uv * texSize - 0.5;
@@ -650,7 +644,6 @@ function initGLEdgeCurveContext() {
 
       float detailBoost = clamp((u_detail - 0.15) / 1.85, 0.0, 1.0) * 2.15;
       float diff = a.a;
-      // Smooth C1 deadzone (sqrt(diff^2 + eps^2) - eps) instead of sharp max(0, |diff|-eps) so zero kinks!
       float eps = 0.012;
       float cleanMag = max(0.0, sqrt(diff * diff + eps * eps) - eps);
       float cleanDiff = (diff >= 0.0 ? 1.0 : -1.0) * cleanMag;
@@ -658,7 +651,6 @@ function initGLEdgeCurveContext() {
       return clamp(baseL + cleanDiff * detailBoost, 0.0, 1.0);
     }
 
-    // Evaluates both the tangent-straightened luminance L AND its exact analytical gradient magnitude |grad(L)|
     vec2 evalSmoothLumAndGrad(vec2 uv) {
       vec2 sp = u_step * 2.2;
       float lN = evalSplineLumAt(uv + vec2(0.0, -sp.y));
@@ -671,7 +663,6 @@ function initGLEdgeCurveContext() {
       vec2 tang = gradLen > 1e-4 ? vec2(-grad.y / gradLen, grad.x / gradLen) : vec2(1.0, 0.0);
       vec2 nrm  = vec2(tang.y, -tang.x);
 
-      // Smooth 5 taps ALONG the tangent (straightens lines) and 3 taps ACROSS the normal
       float tangScale = mix(2.8, 1.6, clamp(u_detail / 2.0, 0.0, 1.0));
       float nrmScale  = mix(2.0, 1.0, clamp(u_detail / 2.0, 0.0, 1.0));
       vec2 dT = tang * u_step * tangScale;
@@ -689,7 +680,6 @@ function initGLEdgeCurveContext() {
         }
       }
 
-      // Per-pixel gradient magnitude for exact 1.5-pixel analytical anti-aliasing (no 2x2 fwidth blocks!)
       float perPixelGrad = gradLen / 4.4;
       return vec2(sum, perPixelGrad);
     }
@@ -710,17 +700,14 @@ function initGLEdgeCurveContext() {
         return;
       }
 
-      // 1. Evaluate the Cubic B-Spline Tangent-Straightened Field L and its analytical slope:
       vec2 lg = evalSmoothLumAndGrad(uv);
       float L = lg.x;
-      // Analytical 1.6-pixel anti-aliasing ramp width (clamped so both steep lines & gentle slopes are silky smooth!)
       float aa = clamp(lg.y * 1.65, 0.015, 0.042);
 
       float darkMask  = 1.0 - smoothstep(0.265 - aa, 0.265 + aa, L);
       float lightMask = smoothstep(0.635 - aa, 0.635 + aa, L);
       float midMask   = max(0.0, 1.0 - darkMask - lightMask);
 
-      // 2. Sample each zone's dedicated, extrapolated paint buffer (also using B-spline smoothing!)
       vec3 darkCol  = texture(u_darkPaint, uv).rgb;
       vec3 midCol   = texture(u_midPaint, uv).rgb;
       vec3 lightCol = texture(u_lightPaint, uv).rgb;
@@ -730,7 +717,6 @@ function initGLEdgeCurveContext() {
 
       vec3 segmentedRgb = darkCol * darkMask + midCol * midMask + lightCol * lightMask;
 
-      // 3. Optional Segment Edge Thickness (0.0 by default = clean Photoshop Action look)
       if (u_rimStrength > 0.001 && intWeight > 0.0) {
         float drim = 4.0 * darkMask * (1.0 - darkMask);
         float lrim = 4.0 * lightMask * (1.0 - lightMask);
@@ -738,15 +724,38 @@ function initGLEdgeCurveContext() {
         segmentedRgb *= (1.0 - rim * u_rimStrength);
       }
 
-      // 4. Watercolor Texture Overlay
-      if (u_useWcTex > 0.01) {
-        float wcTex = texture(u_wcTex, fract(uv * u_wcScale)).r;
+      // 4. Photoshop Action Extra #1: Dual-Scale Watercolor Blooms & Wet-Edge Pigment Washes
+      //    Combines fine + broad watercolortexture.png overlays + wet water-ring cauliflower edges!
+      if (u_bloomStrength > 0.01) {
+        float wc1 = texture(u_wcTex, fract(uv * u_wcScale)).r;
+        float wc2 = texture(u_wcTex, fract(uv * u_wcScale * 0.47 + vec2(0.37, 0.61))).r;
+        // Enhance contrast of watercolor blooms around 0.5
+        float wcCombo = clamp(0.5 + ((wc1 * 0.62 + wc2 * 0.38) - 0.5) * 1.45, 0.0, 1.0);
+
         vec3 blendedTex = mix(
-          2.0 * segmentedRgb * wcTex,
-          1.0 - 2.0 * (1.0 - segmentedRgb) * (1.0 - wcTex),
+          2.0 * segmentedRgb * wcCombo,
+          1.0 - 2.0 * (1.0 - segmentedRgb) * (1.0 - wcCombo),
           step(vec3(0.5), segmentedRgb)
         );
-        segmentedRgb = clamp(mix(segmentedRgb, blendedTex, 0.50 * u_useWcTex), 0.0, 1.0);
+        // Subtle wet-ring pigment pooling where watercolor texture transitions across 0.48
+        float wetRing = exp(-pow((wc1 - 0.48) / 0.045, 2.0)) * 0.12 * (1.0 - lightMask * 0.5);
+        blendedTex *= (1.0 - wetRing);
+
+        segmentedRgb = clamp(mix(segmentedRgb, blendedTex, min(1.0, 0.68 * u_bloomStrength)), 0.0, 1.0);
+      }
+
+      // 5. Photoshop Action Extra #3: Cold-Press Paper Grain & Dry-Brush Tooth
+      if (u_paperStrength > 0.01) {
+        vec3 pTex = texture(u_paperTex, fract(uv * u_paperScale)).rgb;
+        float pLum = dot(pTex, vec3(0.299, 0.587, 0.114));
+        // Center paper grain around 0.5 with crisp cotton tooth
+        float grain = clamp(0.5 + (pLum - 0.78) * 1.85, 0.0, 1.0);
+        vec3 grainBlend = mix(
+          2.0 * segmentedRgb * grain,
+          1.0 - 2.0 * (1.0 - segmentedRgb) * (1.0 - grain),
+          step(vec3(0.5), segmentedRgb)
+        );
+        segmentedRgb = clamp(mix(segmentedRgb, grainBlend, min(1.0, 0.45 * u_paperStrength)), 0.0, 1.0);
       }
 
       vec3 finalRgb = clamp(mix(orig.rgb, segmentedRgb, outerFade), 0.0, 1.0);
@@ -798,14 +807,17 @@ function initGLEdgeCurveContext() {
   gl.uniform1i(gl.getUniformLocation(progC, "u_pyrA"), 4);
   gl.uniform1i(gl.getUniformLocation(progC, "u_pyrB"), 5);
   gl.uniform1i(gl.getUniformLocation(progC, "u_wcTex"), 6);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_paperTex"), 7);
 
   _glEC = {
     canvas, gl, vao, progC,
     uC_step: gl.getUniformLocation(progC, "u_step"),
     uC_wcScale: gl.getUniformLocation(progC, "u_wcScale"),
+    uC_paperScale: gl.getUniformLocation(progC, "u_paperScale"),
     uC_detail: gl.getUniformLocation(progC, "u_detail"),
     uC_rimStrength: gl.getUniformLocation(progC, "u_rimStrength"),
-    uC_useWcTex: gl.getUniformLocation(progC, "u_useWcTex"),
+    uC_bloomStrength: gl.getUniformLocation(progC, "u_bloomStrength"),
+    uC_paperStrength: gl.getUniformLocation(progC, "u_paperStrength"),
     uploadedCache: null,
   };
   return _glEC;
@@ -838,6 +850,24 @@ function createGLTexRGBA16F(gl, w, h, float32Data) {
   return tex;
 }
 
+function uploadRepeatImageTex(gl, img, fallbackTex) {
+  if (!img) return { tex: fallbackTex, w: 512, h: 512 };
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  return {
+    tex,
+    w: img.naturalWidth || img.width || 512,
+    h: img.naturalHeight || img.height || 512,
+  };
+}
+
 function renderEdgeCurveWebGL(cache, p) {
   const ec = initGLEdgeCurveContext();
   if (!ec) return null;
@@ -858,29 +888,19 @@ function renderEdgeCurveWebGL(cache, p) {
     ec.texDarkPaint  = createGLTexRGBA8(gl, mw, mh, cache.darkPaintRgba,  true, false);
     ec.texMidPaint   = createGLTexRGBA8(gl, mw, mh, cache.midPaintRgba,   true, false);
     ec.texLightPaint = createGLTexRGBA8(gl, mw, mh, cache.lightPaintRgba, true, false);
-    // 16-bit Floating-Point Texture (RGBA16F) -> ZERO 8-bit quantization stair-steps!
     ec.texPyrA       = createGLTexRGBA16F(gl, bw, bh, cache.zonePyrFloat);
     ec.texPyrB       = createGLTexRGBA8(gl, bw, bh, cache.zonePyrBRgba,   true, false);
 
-    const wcImg = STATE.brushImages && STATE.brushImages["watercolortexture.png"];
-    if (wcImg) {
-      const tex = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, wcImg);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
-      ec.texWc = tex;
-      ec.wcW = wcImg.naturalWidth || wcImg.width || 512;
-      ec.wcH = wcImg.naturalHeight || wcImg.height || 512;
-    } else {
-      ec.texWc = ec.texOrig;
-      ec.wcW = 512;
-      ec.wcH = 512;
-    }
+    const wcInfo = uploadRepeatImageTex(gl, STATE.brushImages && STATE.brushImages["watercolortexture.png"], ec.texOrig);
+    ec.texWc = wcInfo.tex;
+    ec.wcW = wcInfo.w;
+    ec.wcH = wcInfo.h;
+
+    const paperInfo = uploadRepeatImageTex(gl, STATE.brushImages && STATE.brushImages["papertexture.png"], ec.texOrig);
+    ec.texPaper = paperInfo.tex;
+    ec.paperW = paperInfo.w;
+    ec.paperH = paperInfo.h;
+
     ec.uploadedCache = cache;
   }
 
@@ -890,7 +910,12 @@ function renderEdgeCurveWebGL(cache, p) {
   const rimStrength = Math.min(0.65, (edgeThick / 100.0) * 0.55);
 
   const subLayer = STATE.layers && STATE.layers.subject;
-  const useWcTex = subLayer && subLayer.params && subLayer.params.wcTexture ? 1.0 : 0.0;
+  const subWcOn = subLayer && subLayer.params && subLayer.params.wcTexture;
+  const bloomOn = p.wcBlooms !== undefined ? !!p.wcBlooms : !!subWcOn;
+  const bloomStrength = bloomOn ? ((p.wcBloomsIntensity ?? 75) / 100.0) : 0.0;
+
+  const paperOn = p.paperGrain !== undefined ? !!p.paperGrain : true;
+  const paperStrength = paperOn ? ((p.paperGrainIntensity ?? 55) / 100.0) : 0.0;
 
   gl.disable(gl.BLEND);
   gl.bindVertexArray(vao);
@@ -907,15 +932,84 @@ function renderEdgeCurveWebGL(cache, p) {
   gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, ec.texPyrA);
   gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, ec.texPyrB);
   gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, ec.texWc);
+  gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, ec.texPaper);
 
   gl.uniform2f(ec.uC_step, 1.0 / bw, 1.0 / bh);
-  gl.uniform2f(ec.uC_wcScale, bw / Math.max(1.0, ec.wcW * 0.8), bh / Math.max(1.0, ec.wcH * 0.8));
+  gl.uniform2f(ec.uC_wcScale, bw / Math.max(1.0, ec.wcW * 0.78), bh / Math.max(1.0, ec.wcH * 0.78));
+  gl.uniform2f(ec.uC_paperScale, bw / Math.max(1.0, ec.paperW * 0.85), bh / Math.max(1.0, ec.paperH * 0.85));
   gl.uniform1f(ec.uC_detail, detailNorm);
   gl.uniform1f(ec.uC_rimStrength, rimStrength);
-  gl.uniform1f(ec.uC_useWcTex, useWcTex);
+  gl.uniform1f(ec.uC_bloomStrength, bloomStrength);
+  gl.uniform1f(ec.uC_paperStrength, paperStrength);
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   return canvas;
+}
+
+// Builds deterministic interior Photoshop-Action Paint Splatters, Micro-Droplets & Color Washes
+// across the subject (like the white/colored droplets on the Skoda, Red Audi & Two Dogs!)
+function getOrBuildSubjectSplatterStrokes(cache) {
+  if (cache.splatterData) return cache.splatterData;
+  const { bw, bh, subData } = cache;
+  const rng = new PythonRandom(((STATE.payload && STATE.payload.preset_settings && STATE.payload.preset_settings.RANDOM_SEED) || 42) + 919);
+
+  const whiteDrops = [];
+  const darkDrops = [];
+  const colorWashes = [];
+
+  const sampleSubjectColor = (x, y) => {
+    const ix = Math.max(0, Math.min(bw - 1, Math.round(x)));
+    const iy = Math.max(0, Math.min(bh - 1, Math.round(y)));
+    const p = (iy * bw + ix) * 4;
+    if (subData[p + 3] < 210) return null;
+    return [subData[p], subData[p + 1], subData[p + 2]];
+  };
+
+  // 1. Interior Watercolor Bloom Washes (soft color-matched blotches like on the Red Audi & Dogs)
+  const numWashes = 42;
+  for (let i = 0; i < numWashes * 2 && colorWashes.length < numWashes; i++) {
+    const x = rng.uniform(bw * 0.06, bw * 0.94);
+    const y = rng.uniform(bh * 0.06, bh * 0.94);
+    const col = sampleSubjectColor(x, y);
+    if (!col) continue;
+    // Boost saturation & slightly shift brightness so the wash reads like a wet watercolor glaze
+    const lum = 0.299 * col[0] + 0.587 * col[1] + 0.114 * col[2];
+    const satMult = 1.35;
+    const brMult = i % 2 === 0 ? 1.16 : 0.82;
+    const rgb = col.map((c) => Math.max(0, Math.min(255, Math.round((lum + (c - lum) * satMult) * brMult))));
+    const sz = Math.round(Math.min(bw, bh) * rng.uniform(0.16, 0.36));
+    colorWashes.push({ x, y, size: sz, rot: rng.uniform(0, 360), rgb, op: rng.uniform(0.16, 0.30) });
+  }
+
+  // 2. Crisp White & Tinted Micro-Droplets (whitedots.png — like the white paint specks on the Skoda & Red Audi)
+  const numWhite = 28;
+  for (let i = 0; i < numWhite * 2 && whiteDrops.length < numWhite; i++) {
+    const x = rng.uniform(bw * 0.05, bw * 0.95);
+    const y = rng.uniform(bh * 0.05, bh * 0.95);
+    const col = sampleSubjectColor(x, y);
+    if (!col) continue;
+    // 65% pure white/cream droplets, 35% light-tinted subject pigment droplets
+    const rgb = i % 3 === 0
+      ? col.map((c) => Math.min(255, Math.round(c + (255 - c) * 0.62)))
+      : [252, 250, 246];
+    const sz = Math.round(Math.min(bw, bh) * rng.uniform(0.12, 0.32));
+    whiteDrops.push({ x, y, size: sz, rot: rng.uniform(0, 360), rgb, op: rng.uniform(0.38, 0.72) });
+  }
+
+  // 3. Dark / Deep-Pigment Splatter Specks (darkdots.png — like the dark watercolor specks on the Skoda & Dogs)
+  const numDark = 18;
+  for (let i = 0; i < numDark * 2 && darkDrops.length < numDark; i++) {
+    const x = rng.uniform(bw * 0.05, bw * 0.95);
+    const y = rng.uniform(bh * 0.05, bh * 0.95);
+    const col = sampleSubjectColor(x, y);
+    if (!col) continue;
+    const rgb = col.map((c) => Math.round(c * 0.32));
+    const sz = Math.round(Math.min(bw, bh) * rng.uniform(0.18, 0.42));
+    darkDrops.push({ x, y, size: sz, rot: rng.uniform(0, 360), rgb, op: rng.uniform(0.22, 0.45) });
+  }
+
+  cache.splatterData = { colorWashes, whiteDrops, darkDrops };
+  return cache.splatterData;
 }
 
 function rerenderLiveEdgeCurveLayer(skipComposite = false) {
@@ -932,6 +1026,46 @@ function rerenderLiveEdgeCurveLayer(skipComposite = false) {
     const ctx = lyr.baseCanvas.getContext("2d");
     ctx.clearRect(0, 0, cw, ch);
     ctx.drawImage(glCanvas, cache.bx, cache.by);
+
+    const splatData = getOrBuildSubjectSplatterStrokes(cache);
+    const bloomOn = p.wcBlooms !== undefined ? !!p.wcBlooms : true;
+    const bloomMult = ((p.wcBloomsIntensity ?? 75) / 100.0);
+    const splatOn = p.paintSplatter !== undefined ? !!p.paintSplatter : true;
+    const splatMult = ((p.splatterIntensity ?? 65) / 100.0);
+
+    // Draw interior Watercolor Wash Blotches + Paint Splatter Droplets clipped strictly to the Subject!
+    if ((bloomOn && bloomMult > 0.05) || (splatOn && splatMult > 0.05)) {
+      ctx.save();
+      ctx.globalCompositeOperation = "source-atop";
+
+      if (bloomOn && bloomMult > 0.05 && STATE.brushImages["brush2.png"]) {
+        const wC = drawStrokesWebGL(cache.bw, cache.bh, "brush2.png", STATE.brushImages["brush2.png"], splatData.colorWashes);
+        if (wC) {
+          ctx.globalAlpha = Math.min(1.0, bloomMult * 0.85);
+          ctx.drawImage(wC, cache.bx, cache.by);
+        }
+      }
+
+      if (splatOn && splatMult > 0.05) {
+        if (STATE.brushImages["darkdots.png"]) {
+          const dC = drawStrokesWebGL(cache.bw, cache.bh, "darkdots.png", STATE.brushImages["darkdots.png"], splatData.darkDrops);
+          if (dC) {
+            ctx.globalAlpha = Math.min(1.0, splatMult * 0.90);
+            ctx.drawImage(dC, cache.bx, cache.by);
+          }
+        }
+        if (STATE.brushImages["whitedots.png"]) {
+          const whC = drawStrokesWebGL(cache.bw, cache.bh, "whitedots.png", STATE.brushImages["whitedots.png"], splatData.whiteDrops);
+          if (whC) {
+            ctx.globalAlpha = Math.min(1.0, splatMult);
+            ctx.drawImage(whC, cache.bx, cache.by);
+          }
+        }
+      }
+
+      ctx.restore();
+    }
+
     if (_stack.id !== "edge_curve") invalidateStack();
     if (!skipComposite) compositeAllLayers();
   }

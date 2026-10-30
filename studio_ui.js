@@ -384,14 +384,84 @@ function renderSlidersForLayer(lyr) {
   }
 
   if (def.id === "edge_curve") {
-    addSlider(container, "Mask Detail (Coarse ↔ Max Detail)", p.maskDetail, 0, 200, "%", (val) => {
+    addSlider(container, "Mask Detail (Coarse ↔ Max Detail)", p.maskDetail ?? 135, 0, 200, "%", (val) => {
       p.maskDetail = val;
       scheduleEdgeCurveRerender();
     });
-    addSlider(container, "Segment Edge Thickness", p.edgeThickness, 0, 100, "%", (val) => {
+    addSlider(container, "Segment Edge Thickness", p.edgeThickness ?? 0, 0, 100, "%", (val) => {
       p.edgeThickness = val;
       scheduleEdgeCurveRerender();
     });
+
+    // --- Photoshop Action Extras (Toggleable in Edge Curve Layer Menu) ---
+    const addExtraToggle = (labelTitle, paramKey, onText, offText, sliderLabel, sliderKey, defVal) => {
+      if (p[paramKey] === undefined) p[paramKey] = true;
+      if (p[sliderKey] === undefined) p[sliderKey] = defVal;
+
+      const row = document.createElement("div");
+      row.className = "control-row";
+      const lbl = document.createElement("label");
+      lbl.innerHTML = `<span>${labelTitle}</span>`;
+      row.appendChild(lbl);
+
+      const btn = document.createElement("button");
+      const subWrap = document.createElement("div");
+      subWrap.style.marginTop = "8px";
+
+      const syncBtn = () => {
+        const isOn = !!p[paramKey];
+        btn.className = isOn ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+        btn.textContent = isOn ? onText : offText;
+        subWrap.classList.toggle("hidden", !isOn);
+      };
+      syncBtn();
+
+      btn.addEventListener("click", () => {
+        History.paramBegin();
+        p[paramKey] = !p[paramKey];
+        syncBtn();
+        scheduleEdgeCurveRerender();
+        History.paramCommit();
+      });
+
+      row.appendChild(btn);
+      addSlider(subWrap, sliderLabel, p[sliderKey], 10, 150, "%", (val) => {
+        p[sliderKey] = val;
+        scheduleEdgeCurveRerender();
+      });
+      row.appendChild(subWrap);
+      container.appendChild(row);
+    };
+
+    addExtraToggle(
+      "Watercolor Blooms & Pigment Washes",
+      "wcBlooms",
+      "💧 Watercolor Blooms & Washes: ON",
+      "💧 Watercolor Blooms & Washes: OFF",
+      "Bloom & Wash Intensity",
+      "wcBloomsIntensity",
+      75
+    );
+
+    addExtraToggle(
+      "Subject Paint Splatter & Droplets",
+      "paintSplatter",
+      "💦 Paint Splatter & Droplets: ON",
+      "💦 Paint Splatter & Droplets: OFF",
+      "Splatter & Droplet Amount",
+      "splatterIntensity",
+      65
+    );
+
+    addExtraToggle(
+      "Cold-Press Paper Grain & Tooth",
+      "paperGrain",
+      "📜 Paper Grain & Tooth: ON",
+      "📜 Paper Grain & Tooth: OFF",
+      "Paper Grain Strength",
+      "paperGrainIntensity",
+      55
+    );
   }
 
   if (def.type === "cool_swoosh") {

@@ -204,10 +204,16 @@ function buildInitialLayerParams(def, cfg) {
   }
   if (def.id === "edge_curve") {
     return {
-      opacity: cfg.EDGE_CURVE_ENABLED ? (cfg.EDGE_CURVE_OPACITY ?? 0.75) : 0.75,
+      opacity: cfg.EDGE_CURVE_ENABLED ? (cfg.EDGE_CURVE_OPACITY ?? 0.85) : 0.85,
       baseOpacity: 1.0,
-      maskDetail: 100,
+      maskDetail: 135,
       edgeThickness: 0,
+      wcBlooms: true,          // 💧 Watercolor Blooms & Washes (Red Audi / Skoda / Dogs)
+      wcBloomsIntensity: 75,
+      paintSplatter: true,     // 💦 Interior Paint Splatter & Micro-Droplets
+      splatterIntensity: 65,
+      paperGrain: true,        // 📜 Cold-Press Paper Grain & Tooth
+      paperGrainIntensity: 55,
       brightness: 100,
       contrast: 105,
       saturation: 105,
