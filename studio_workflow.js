@@ -37,6 +37,88 @@ const Workflow = (() => {
     pinchStartZoom: 97,
   };
 
+  // Detailed Concrete Workflow Timing Logger
+  const PERF_LOG = {
+    tUploadStart: 0,
+    events: {},
+    startUpload(fileName, w, h) {
+      this.tUploadStart = performance.now();
+      this.events = {};
+      console.log(
+        `%c⏱️ [Workflow Timer] START Upload "${fileName}" (${w}×${h}px)`,
+        "color:#3b82f6;font-weight:bold;"
+      );
+    },
+    markStart(name) {
+      this.events[name] = { t0: performance.now(), status: "running..." };
+    },
+    markEnd(name, note = "ok") {
+      const now = performance.now();
+      const ev = this.events[name] || { t0: this.tUploadStart };
+      const durMs = Math.round(now - ev.t0);
+      const sinceStartMs = Math.round(now - this.tUploadStart);
+      this.events[name] = {
+        duration_ms: durMs,
+        duration_sec: Number((durMs / 1000).toFixed(2)),
+        finished_at_ms: sinceStartMs,
+        status: note,
+      };
+      console.log(
+        `%c⏱️ [Workflow Timer] ${name}: ${durMs} ms (${(durMs / 1000).toFixed(2)}s) [at +${sinceStartMs}ms] — ${note}`,
+        "color:#0ea5e9;font-weight:600;"
+      );
+    },
+    printSummary(phaseTitle) {
+      const table = {};
+      for (const [k, v] of Object.entries(this.events)) {
+        table[k] = {
+          "Duration (ms)": v.duration_ms ?? "...",
+          "Duration (s)": v.duration_sec ?? "...",
+          "Finished (+ms)": v.finished_at_ms ?? "...",
+          Status: v.status,
+        };
+      }
+      console.log(`%c📊 [Workflow Summary — ${phaseTitle}]`, "color:#8b5cf6;font-weight:bold;");
+      console.table(table);
+    },
+  };
+
+  // Filter top preset dropdown options based on detected category ("portrait" | "car" | "all")
+  function filterPresetDropdownByCategory(category) {
+    const presetSelect = document.getElementById("presetSelect");
+    if (!presetSelect) return;
+
+    const groups = presetSelect.querySelectorAll("optgroup");
+    groups.forEach((grp) => {
+      const label = (grp.getAttribute("label") || "").toLowerCase();
+      if (category === "car") {
+        const show = label.includes("vehicle");
+        grp.style.display = show ? "" : "none";
+        grp.disabled = !show;
+        grp.querySelectorAll("option").forEach((opt) => {
+          opt.hidden = !show;
+          opt.disabled = !show;
+        });
+      } else if (category === "portrait") {
+        const show = label.includes("portrait") || label.includes("animal");
+        grp.style.display = show ? "" : "none";
+        grp.disabled = !show;
+        grp.querySelectorAll("option").forEach((opt) => {
+          opt.hidden = !show;
+          opt.disabled = !show;
+        });
+      } else {
+        // Unrecognized: show all options
+        grp.style.display = "";
+        grp.disabled = false;
+        grp.querySelectorAll("option").forEach((opt) => {
+          opt.hidden = false;
+          opt.disabled = false;
+        });
+      }
+    });
+  }
+
   function init() {
     if (_initialized) return;
     _initialized = true;
@@ -87,7 +169,6 @@ const Workflow = (() => {
     if (cropStage) cropStage.classList.toggle("hidden", stepId !== "crop");
     if (canvasContainer) canvasContainer.classList.toggle("hidden", stepId !== "studio");
     if (floatingZoom) floatingZoom.classList.toggle("hidden", stepId !== "studio");
-    // Show Undo/Redo history pill in both Step 2 ("crop") and Step 3 ("studio")
     if (floatingHistory) floatingHistory.classList.toggle("hidden", stepId === "upload");
 
     if (leftToolbar) leftToolbar.classList.toggle("step-disabled", stepId !== "studio");
@@ -125,7 +206,8 @@ const Workflow = (() => {
     init();
     STATE.uploadedFile = file;
     STATE.maskEditedByUser = false;
-    // Clear all previous image masks & caches so a new upload NEVER reuses the previous photo's mask!
+
+    // Reset all previous image masks & caches
     STATE.rawMaskBase64 = null;
     STATE.framedMaskBase64 = null;
     STATE.framedMaskCanvas = null;
@@ -135,19 +217,51 @@ const Workflow = (() => {
     STATE.detectedEyes = [];
     STATE.rawEyePatches = [];
     STATE.eyeBeautifierPatches = [];
-
+    STATE.eyeFetchPromise = null;
+    STATE.wheelTurnData = null;
+    STATE.wheelTurnPromise = null;
+    STATE.wheelTurnEnabled = true;
+    STATE.unturnedFramedPhotoCanvas = null;
+    STATE.unturnedFramedMaskCanvas = null;
+    STATE.turnedFramedPhotoCanvas = null;
+    STATE.turnedFramedMaskCanvas = null;
+    STATE.hqUnturnedPhotoCanvas = null;
+    STATE.hqTurnedPhotoCanvas = null;
+    STATE.lowResUnturnedPhotoCanvas = null;
+    STATE.lowResTurnedPhotoCanvas = null;
+    STATE.upscaleData = null;
+    STATE.upscalePromise = null;
+    STATE.upscaleEnabled = true;
+    STATE.isLowResPhoto = false;
+    STATE.detectedSubjectCategory = "all";
+    filterPresetDropdownByCategory("all");
 
     if (STATE.presetCache) STATE.presetCache.clear();
+    if (STATE.wheelVariantCache) STATE.wheelVariantCache.clear();
     if (STATE.presetUserEdits) STATE.presetUserEdits.clear();
     History.clear();
 
     const url = URL.createObjectURL(file);
     const rawImg = await loadImage(url);
+    const rawW = rawImg.naturalWidth || rawImg.width;
+    const rawH = rawImg.naturalHeight || rawImg.height;
+    PERF_LOG.startUpload(file.name, rawW, rawH);
+
+    const rawMaxDim = Math.max(rawW, rawH);
+    STATE.isLowResPhoto = rawMaxDim < 1600;
+    if (STATE.isLowResPhoto) {
+      // Delayed by 150ms so /cutout hits the network first and finishes in < 0.5s
+      STATE.upscalePromise = new Promise((resolve) => {
+        setTimeout(() => {
+          resolve(fetchUpscaledPhotoInBackground(rawImg));
+        }, 150);
+      });
+    }
 
     const maxDim = IS_MOBILE ? 1024 : 1400;
-    const scale = Math.min(1, maxDim / Math.max(rawImg.naturalWidth || rawImg.width, rawImg.naturalHeight || rawImg.height));
-    const sw = Math.max(1, Math.round((rawImg.naturalWidth || rawImg.width) * scale));
-    const sh = Math.max(1, Math.round((rawImg.naturalHeight || rawImg.height) * scale));
+    const scale = Math.min(1, maxDim / rawMaxDim);
+    const sw = Math.max(1, Math.round(rawW * scale));
+    const sh = Math.max(1, Math.round(rawH * scale));
 
     const srcC = createCanvas(sw, sh);
     const srcCtx = srcC.getContext("2d");
@@ -171,18 +285,61 @@ const Workflow = (() => {
     if (loadingSub) loadingSub.textContent = "Running AI face/eye & vehicle recognition in parallel";
 
     try {
-      const visionPromise = window.SubjectVision
+      const triggerBackgroundTaskFromVision = (vRes) => {
+        if (!vRes || mySessionId !== STATE.eyeSessionId) return;
+        let animalBoxes = [];
+        if (vRes.animals && vRes.animals.length > 0) {
+          animalBoxes = vRes.animals.map((a) => [a.box.x0, a.box.y0, a.box.x1, a.box.y1]);
+        } else if (vRes.primaryKind === "animal") {
+          animalBoxes = [[0.0, 0.0, 1.0, 1.0]];
+        }
+
+        const hasVehicles = vRes.vehicles && vRes.vehicles.length > 0;
+        const hasAnimals = vRes.animals && vRes.animals.length > 0;
+        const hasPeople = (vRes.faces && vRes.faces.length > 0) || (vRes.people && vRes.people.length > 0);
+
+        const isCar = hasVehicles || vRes.primaryKind === "car";
+        const isAnimal = !isCar && (hasAnimals || (!hasPeople && vRes.primaryKind === "animal"));
+
+        STATE.isCarPhoto = isCar;
+        STATE.isAnimalPhoto = isAnimal;
+
+        if (isCar && !STATE.wheelTurnPromise) {
+          STATE.wheelTurnPromise = fetchWheelTurnInBackground(rawImg);
+        } else if (isAnimal && !STATE.eyeFetchPromise) {
+          STATE.eyeFetchPromise = fetchEyePatchesInBackground(
+            rawImg,
+            animalBoxes.length > 0 ? animalBoxes : [[0.0, 0.0, 1.0, 1.0]]
+          );
+        }
+      };
+
+      PERF_LOG.markStart("1_SubjectVision_AI");
+      const visionPromise = (window.SubjectVision
         ? window.SubjectVision.detect(srcC, { timeoutMs: 4500 })
-        : Promise.resolve(null);
+        : Promise.resolve(null)
+      ).then((vRes) => {
+        PERF_LOG.markEnd(
+          "1_SubjectVision_AI",
+          vRes ? `kind=${vRes.primaryKind} (${vRes.ms}ms internal)` : "null"
+        );
+        triggerBackgroundTaskFromVision(vRes);
+        return vRes;
+      });
 
       let maskArr;
       if (isTransparentPng) {
+        PERF_LOG.markStart("2_Cutout_Alpha");
         maskArr = window.WatercolorFraming.maskFromImageData(photoData, "alpha");
+        PERF_LOG.markEnd("2_Cutout_Alpha", "local alpha");
         CROP.visionResult = await visionPromise;
       } else {
-        // Run /cutout and SubjectVision in parallel so Step 1 -> Step 2 is fast!
+        PERF_LOG.markStart("2_Server_Cutout_U2Net");
         const [maskImg, visionRes] = await Promise.all([
-          fetchSubjectMaskFromBackend(rawImg),
+          fetchSubjectMaskFromBackend(rawImg).then((m) => {
+            PERF_LOG.markEnd("2_Server_Cutout_U2Net", `${m.width}×${m.height}`);
+            return m;
+          }),
           visionPromise,
         ]);
         CROP.visionResult = visionRes;
@@ -193,22 +350,24 @@ const Workflow = (() => {
         maskArr = window.WatercolorFraming.maskFromImageData(mData, "luma");
       }
 
+      PERF_LOG.markStart("3_Framing_Solver");
       finalizeCropMask(maskArr, sw, sh);
+      PERF_LOG.markEnd("3_Framing_Solver", `profile=${getActiveProfileKey()}`);
 
-      // Fire Eye Beautifier in the background while the user is on Step 2 (zero upload delay!)
-      const vRes = CROP.visionResult;
-      let animalBoxes = [];
-      if (vRes) {
-        if (vRes.animals && vRes.animals.length > 0) {
-          animalBoxes = vRes.animals.map((a) => [a.box.x0, a.box.y0, a.box.x1, a.box.y1]);
-        } else if (vRes.primaryKind === "animal") {
-          animalBoxes = [[0.0, 0.0, 1.0, 1.0]];
+      // Fallback check after finalizeCropMask
+      const detectedProf = getActiveProfileKey();
+      const presetVal = (document.getElementById("presetSelect") && document.getElementById("presetSelect").value) || "";
+      if (!STATE.isCarPhoto && (detectedProf === "car" || presetVal.startsWith("cars"))) {
+        STATE.isCarPhoto = true;
+        if (!STATE.wheelTurnPromise) {
+          STATE.wheelTurnPromise = fetchWheelTurnInBackground(rawImg);
         }
+      } else if (!STATE.isCarPhoto && (detectedProf === "animal" || presetVal.startsWith("animals")) && !STATE.eyeFetchPromise) {
+        STATE.isAnimalPhoto = true;
+        STATE.eyeFetchPromise = fetchEyePatchesInBackground(rawImg, [[0.0, 0.0, 1.0, 1.0]]);
       }
-      STATE.isAnimalPhoto = animalBoxes.length > 0 || getActiveProfileKey() === "animal";
-      if (STATE.isAnimalPhoto) {
-        fetchEyePatchesInBackground(rawImg, animalBoxes);
-      }
+
+      PERF_LOG.printSummary("Step 1 → Step 2 (Upload to Move & Zoom)");
     } catch (err) {
       alert("Error analyzing subject: " + err.message);
       console.error(err);
@@ -217,11 +376,25 @@ const Workflow = (() => {
     }
   }
 
+  async function prepareFastCutoutBlob(img) {
+    const maxDim = 640;
+    let w = img.naturalWidth || img.width;
+    let h = img.naturalHeight || img.height;
+    if (w > maxDim || h > maxDim) {
+      const sc = Math.min(maxDim / w, maxDim / h);
+      w = Math.max(1, Math.round(w * sc));
+      h = Math.max(1, Math.round(h * sc));
+    }
+    const c = createCanvas(w, h);
+    c.getContext("2d").drawImage(img, 0, 0, w, h);
+    return new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.88));
+  }
+
   async function fetchSubjectMaskFromBackend(img) {
     const presetKey = document.getElementById("presetSelect").value;
-    const blob = await prepareOptimizedUploadBlob(img, presetKey);
+    const fastBlob = await prepareFastCutoutBlob(img);
     const fd = new FormData();
-    fd.append("image_file", blob, "upload.jpg");
+    fd.append("image_file", fastBlob, "upload.jpg");
     fd.append("preset_key", presetKey);
 
     try {
@@ -233,8 +406,9 @@ const Workflow = (() => {
       }
     } catch (_) {}
 
+    const fullBlob = await prepareOptimizedUploadBlob(img, presetKey);
     const fdGen = new FormData();
-    fdGen.append("image_file", blob, "upload.jpg");
+    fdGen.append("image_file", fullBlob, "upload.jpg");
     fdGen.append("preset_key", presetKey);
     const res = await fetch(`${STATE.apiUrl}/generate`, { method: "POST", body: fdGen });
     if (!res.ok) throw new Error(`Server status ${res.status}`);
@@ -256,16 +430,26 @@ const Workflow = (() => {
 
   async function fetchEyePatchesInBackground(img, animalBoxes) {
     const uploadRef = STATE.uploadedFile;
-    // Přidáno přesně podle zadání
     const targetSessionId = STATE.eyeSessionId;
+    PERF_LOG.markStart("BG_EyeBeautifier_RPC");
     try {
       const blob = await prepareOptimizedUploadBlob(img, "animals");
-      const fd = new FormData();
-      fd.append("image_file", blob, "upload.jpg");
-      fd.append("animal_boxes_json", JSON.stringify(animalBoxes));
-      const res = await fetch(`${STATE.apiUrl}/beautify_eyes`, { method: "POST", body: fd });
-      // Upraveno přesně podle zadání
-      if (!res.ok || STATE.eyeSessionId !== targetSessionId || STATE.uploadedFile !== uploadRef) return;
+      let res = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const fd = new FormData();
+          fd.append("image_file", blob, "upload.jpg");
+          fd.append("animal_boxes_json", JSON.stringify(animalBoxes));
+          res = await fetch(`${STATE.apiUrl}/beautify_eyes`, { method: "POST", body: fd });
+          if (res && res.ok) break;
+        } catch (err) {
+          if (attempt === 1) throw err;
+        }
+      }
+      if (!res || !res.ok || STATE.eyeSessionId !== targetSessionId || STATE.uploadedFile !== uploadRef) {
+        PERF_LOG.markEnd("BG_EyeBeautifier_RPC", "cancelled or status error");
+        return;
+      }
       const data = await res.json();
       if (Array.isArray(data.eye_patches) && data.eye_patches.length > 0 && STATE.uploadedFile === uploadRef) {
         STATE.rawEyePatches = await Promise.all(
@@ -274,6 +458,7 @@ const Workflow = (() => {
             img: await loadImage(ep.png),
           }))
         );
+        PERF_LOG.markEnd("BG_EyeBeautifier_RPC", `${STATE.rawEyePatches.length} eye(s) ready`);
         mapRawEyePatchesToCanvas();
         if (currentStep === "studio" && STATE.payload) {
           if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
@@ -283,13 +468,166 @@ const Workflow = (() => {
           }
           compositeAllLayers();
         }
+      } else {
+        PERF_LOG.markEnd("BG_EyeBeautifier_RPC", "0 eyes found");
       }
     } catch (e) {
+      PERF_LOG.markEnd("BG_EyeBeautifier_RPC", `error: ${e.message}`);
       console.warn("Background eye beautifier skipped:", e);
     }
   }
 
-  // Builds CROP.cutoutCanvas and CROP.maskTintCanvas (solid black where removed; drawn at 0.5 alpha)
+  async function fetchWheelTurnInBackground(img) {
+    const uploadRef = STATE.uploadedFile;
+    const targetSessionId = STATE.eyeSessionId;
+    PERF_LOG.markStart("BG_WheelTurn_GPU_RPC");
+    try {
+      const blob = await prepareOptimizedUploadBlob(img, "cars_black");
+      const fd = new FormData();
+      fd.append("image_file", blob, "upload.jpg");
+      const res = await fetch(`${STATE.apiUrl}/steer_wheel`, { method: "POST", body: fd });
+      if (!res.ok || STATE.eyeSessionId !== targetSessionId || STATE.uploadedFile !== uploadRef) {
+        PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", "cancelled or failed");
+        return null;
+      }
+      const data = await res.json();
+      if (data && data.turned && data.patch_rgb_webp && data.patch_mask_webp) {
+        const [patchRgbImg, patchMaskImg] = await Promise.all([
+          loadImage(data.patch_rgb_webp),
+          loadImage(data.patch_mask_webp),
+        ]);
+        STATE.wheelTurnData = { ...data, patchRgbImg, patchMaskImg };
+        PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `${data.turn} ${data.angle}° (server ${data.elapsed_sec}s)`);
+        return STATE.wheelTurnData;
+      } else {
+        PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `skipped (${data ? data.reason : "unknown"})`);
+      }
+    } catch (e) {
+      PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `error: ${e.message}`);
+      console.warn("Background wheel turn skipped:", e);
+    }
+    return null;
+  }
+
+  async function fetchUpscaledPhotoInBackground(img) {
+    const uploadRef = STATE.uploadedFile;
+    const targetSessionId = STATE.eyeSessionId;
+    PERF_LOG.markStart("BG_Cloudinary_2x_Upscale");
+    try {
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      const c = createCanvas(w, h);
+      c.getContext("2d").drawImage(img, 0, 0, w, h);
+      const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.93));
+
+      const fd = new FormData();
+      fd.append("image_file", blob, "upload.jpg");
+      const res = await fetch(`${STATE.apiUrl}/upscale_subject`, { method: "POST", body: fd });
+      if (!res.ok || STATE.eyeSessionId !== targetSessionId || STATE.uploadedFile !== uploadRef) {
+        PERF_LOG.markEnd("BG_Cloudinary_2x_Upscale", "cancelled or failed");
+        return null;
+      }
+      const data = await res.json();
+      if (data && data.upscaled && data.upscaled_webp) {
+        const upscaledImg = await loadImage(data.upscaled_webp);
+        STATE.upscaleData = { ...data, upscaledImg };
+        PERF_LOG.markEnd("BG_Cloudinary_2x_Upscale", `${data.width}×${data.height} (server ${data.elapsed_sec}s)`);
+        return STATE.upscaleData;
+      } else {
+        PERF_LOG.markEnd("BG_Cloudinary_2x_Upscale", `skipped (${data ? data.reason : "unknown"})`);
+      }
+    } catch (e) {
+      PERF_LOG.markEnd("BG_Cloudinary_2x_Upscale", `error: ${e.message}`);
+      console.warn("Background AI upscale skipped:", e);
+    }
+    return null;
+  }
+
+  // Helper that composites the turned wheel patch onto ANY baseFramedPhotoCanvas with feathered pixel-diff
+  function buildTurnedPhotoAndMaskFromBase(baseFramedPhotoC, baseFramedMaskC, wt, px, outW, outH) {
+    const dstX = Math.round(px.x + wt.x0Frac * px.w);
+    const dstY = Math.round(px.y + wt.y0Frac * px.h);
+    const dstW = Math.max(1, Math.round(wt.wFrac * px.w));
+    const dstH = Math.max(1, Math.round(wt.hFrac * px.h));
+
+    const turnedPhotoC = createCanvas(outW, outH);
+    const tpCtx = turnedPhotoC.getContext("2d");
+    tpCtx.drawImage(baseFramedPhotoC, 0, 0);
+
+    const origPatch = tpCtx.getImageData(dstX, dstY, dstW, dstH);
+    const oD = origPatch.data;
+
+    const patchC = createCanvas(dstW, dstH);
+    const pCtx = patchC.getContext("2d");
+    pCtx.drawImage(wt.patchRgbImg, 0, 0, dstW, dstH);
+    const pD = pCtx.getImageData(0, 0, dstW, dstH).data;
+
+    const maskPatchC = createCanvas(dstW, dstH);
+    const mpCtx = maskPatchC.getContext("2d");
+    mpCtx.drawImage(wt.patchMaskImg, 0, 0, dstW, dstH);
+    const mpD = mpCtx.getImageData(0, 0, dstW, dstH).data;
+
+    const turnedMaskC = createCanvas(outW, outH);
+    const tmCtx = turnedMaskC.getContext("2d");
+    tmCtx.drawImage(baseFramedMaskC, 0, 0);
+    const origMaskImg = tmCtx.getImageData(dstX, dstY, dstW, dstH);
+    const omD = origMaskImg.data;
+
+    const featherPx = Math.max(6, Math.round(Math.min(dstW, dstH) * 0.04));
+    for (let y = 0; y < dstH; y++) {
+      const fy = Math.min(1, Math.min(y, dstH - 1 - y) / featherPx);
+      for (let x = 0; x < dstW; x++) {
+        const fx = Math.min(1, Math.min(x, dstW - 1 - x) / featherPx);
+        const borderW = fx * fy;
+        const idx = (y * dstW + x) * 4;
+        const diff = Math.max(
+          Math.abs(pD[idx] - oD[idx]),
+          Math.abs(pD[idx + 1] - oD[idx + 1]),
+          Math.abs(pD[idx + 2] - oD[idx + 2])
+        );
+        const changeW = Math.min(1, Math.max(0, (diff - 1.5) / 8.0)) * borderW;
+        if (changeW > 0) {
+          oD[idx] = Math.round(oD[idx] + (pD[idx] - oD[idx]) * changeW);
+          oD[idx + 1] = Math.round(oD[idx + 1] + (pD[idx + 1] - oD[idx + 1]) * changeW);
+          oD[idx + 2] = Math.round(oD[idx + 2] + (pD[idx + 2] - oD[idx + 2]) * changeW);
+          if (!STATE.maskEditedByUser && mpD[idx] > omD[idx]) {
+            const newM = Math.round(omD[idx] + (mpD[idx] - omD[idx]) * changeW);
+            omD[idx] = newM;
+            omD[idx + 1] = newM;
+            omD[idx + 2] = newM;
+          }
+        }
+      }
+    }
+    tpCtx.putImageData(origPatch, dstX, dstY);
+    tmCtx.putImageData(origMaskImg, dstX, dstY);
+    patchC.width = 1; patchC.height = 1;
+    maskPatchC.width = 1; maskPatchC.height = 1;
+
+    return { turnedPhotoC, turnedMaskC };
+  }
+
+  // Synchronizes STATE.unturnedFramedPhotoCanvas, STATE.turnedFramedPhotoCanvas, and STATE.framedPhotoCanvas
+  // whenever AI Upscale is toggled ON/OFF in Studio, preventing any mask/wheel desync (fixes arti.jpg!)
+  function syncActiveResolutionAndWheelCanvases() {
+    const useHq = !!(STATE.upscaleEnabled !== false && STATE.hqUnturnedPhotoCanvas);
+    const unturnedPhoto = useHq ? STATE.hqUnturnedPhotoCanvas : STATE.lowResUnturnedPhotoCanvas;
+    const turnedPhoto = useHq ? STATE.hqTurnedPhotoCanvas : STATE.lowResTurnedPhotoCanvas;
+
+    if (!unturnedPhoto) return;
+    STATE.unturnedFramedPhotoCanvas = unturnedPhoto;
+    STATE.turnedFramedPhotoCanvas = turnedPhoto || null;
+
+    if (STATE.uncroppedPlacement) {
+      STATE.uncroppedPlacement.sourceImg = useHq && STATE.upscaleData ? STATE.upscaleData.upscaledImg : CROP.sourceImg;
+    }
+
+    const hasTurned = !!(turnedPhoto && STATE.turnedFramedMaskCanvas);
+    const useTurnedNow = hasTurned && STATE.wheelTurnEnabled !== false;
+    STATE.framedPhotoCanvas = useTurnedNow ? turnedPhoto : unturnedPhoto;
+    STATE.framedMaskCanvas = useTurnedNow ? STATE.turnedFramedMaskCanvas : STATE.unturnedFramedMaskCanvas;
+  }
+
   function rebuildCutoutAndTintFromMaskCanvas() {
     if (!CROP.sourceCanvas || !CROP.maskCanvas) return;
     const sw = CROP.sourceCanvas.width;
@@ -321,7 +659,6 @@ const Workflow = (() => {
       const v = mData[p];
       CROP.maskArr[i] = v;
       cData[p + 3] = Math.min(cData[p + 3], v);
-      // Store full black with alpha = (255 - v), then composite at globalAlpha = 0.5
       tData[p] = 0;
       tData[p + 1] = 0;
       tData[p + 2] = 0;
@@ -347,6 +684,21 @@ const Workflow = (() => {
 
     rebuildCutoutAndTintFromMaskCanvas();
     rebuildAnalysisWithVision(true);
+
+    // Determine whether the subject is a known Car, known Animal/Person, or Unrecognized
+    const vRes = CROP.visionResult;
+    const hasConfidentVehicle = !!(vRes && vRes.vehicles && vRes.vehicles.length > 0);
+    const hasConfidentPerson = !!(vRes && ((vRes.faces && vRes.faces.length > 0) || (vRes.people && vRes.people.length > 0)));
+    const hasConfidentAnimal = !!(vRes && ((vRes.animals && vRes.animals.length > 0) || (vRes.animalPoses && vRes.animalPoses.length > 0)));
+
+    let dropdownCat = "all";
+    if (hasConfidentVehicle) {
+      dropdownCat = "car";
+    } else if (hasConfidentPerson || hasConfidentAnimal) {
+      dropdownCat = "portrait";
+    }
+    STATE.detectedSubjectCategory = dropdownCat;
+    filterPresetDropdownByCategory(dropdownCat);
 
     const presetSelect = document.getElementById("presetSelect");
     if (presetSelect && CROP.analysis && !CROP.analysis.empty) {
@@ -516,7 +868,6 @@ const Workflow = (() => {
     const availH = stageEl && stageEl.clientHeight > 100 ? (isNarrow ? stageEl.clientHeight * 0.48 : stageEl.clientHeight - 80) : 520;
     const maxW = Math.max(240, Math.min(580, availW));
     const maxH = Math.max(240, Math.min(560, availH));
-    // Never force a minimum k that exceeds maxW or maxH so wide/tall 16:9 ratios stay 100% proportional
     const k = Math.min(maxW / cm.width, maxH / cm.height);
 
     cv.width = Math.max(120, Math.round(cm.width * k));
@@ -634,7 +985,6 @@ const Workflow = (() => {
     const rawCx = (clientX - rect.left) * (cv.width / Math.max(1, rect.width));
     const rawCy = (clientY - rect.top) * (cv.height / Math.max(1, rect.height));
 
-    // Map inverse of maskViewZoom & maskViewPan so zoomed-in painting hits the exact pixel under cursor
     const z = CROP.maskViewZoom || 1.0;
     const cx = (rawCx - (CROP.maskViewPanX || 0)) / z;
     const cy = (rawCy - (CROP.maskViewPanY || 0)) / z;
@@ -707,6 +1057,7 @@ const Workflow = (() => {
 
   async function confirmCropAndGenerate() {
     if (!CROP.sourceCanvas || !CROP.maskCanvas || !CROP.lastFraming) return;
+    PERF_LOG.markStart("Step2_to_Step3_Total");
 
     if (CROP.maskEditMode) {
       toggleStep2MaskMode(false);
@@ -717,6 +1068,41 @@ const Workflow = (() => {
     const presetKey = document.getElementById("presetSelect").value;
     const isCar = presetKey.startsWith("cars");
     const profileKey = getActiveProfileKey();
+    const isAnimal = !isCar && (profileKey === "animal" || presetKey.startsWith("animals") || STATE.isAnimalPhoto);
+
+    // 1. Wait for AI Upscale if still running
+    if (STATE.upscalePromise && !STATE.upscaleData) {
+      startProgressBar(false);
+      const loadingText = document.getElementById("loadingText");
+      if (loadingText) loadingText.textContent = "Enhancing subject resolution with AI (2x)...";
+      await STATE.upscalePromise;
+    }
+
+    // 2. If this is a car, ensure /steer_wheel has finished
+    if (isCar || profileKey === "car" || STATE.isCarPhoto) {
+      if (!STATE.wheelTurnPromise && !STATE.wheelTurnData && CROP.sourceImg) {
+        STATE.wheelTurnPromise = fetchWheelTurnInBackground(CROP.sourceImg);
+      }
+      if (STATE.wheelTurnPromise && !STATE.wheelTurnData) {
+        startProgressBar(false);
+        const loadingText = document.getElementById("loadingText");
+        if (loadingText) loadingText.textContent = "Steering front wheel in 3D...";
+        await STATE.wheelTurnPromise;
+      }
+    }
+
+    // 3. If this is an animal, ensure /beautify_eyes has finished so eyes NEVER miss on first load!
+    if (isAnimal) {
+      if (!STATE.eyeFetchPromise && (!STATE.rawEyePatches || STATE.rawEyePatches.length === 0) && CROP.sourceImg) {
+        STATE.eyeFetchPromise = fetchEyePatchesInBackground(CROP.sourceImg, [[0.0, 0.0, 1.0, 1.0]]);
+      }
+      if (STATE.eyeFetchPromise && (!STATE.rawEyePatches || STATE.rawEyePatches.length === 0)) {
+        startProgressBar(false);
+        const loadingText = document.getElementById("loadingText");
+        if (loadingText) loadingText.textContent = "Enhancing pet eyes & reflections...";
+        await STATE.eyeFetchPromise;
+      }
+    }
 
     const refCm = isCar ? { width: 141.421356, height: 100 } : { width: 100, height: 141.421356 };
     const outW = isCar ? 1782 : 1260;
@@ -743,27 +1129,71 @@ const Workflow = (() => {
 
     mapRawEyePatchesToCanvas();
 
+    // 4. Build Unturned Framed Photo Canvases (for both HQ Upscaled and Low-Res Original) & Mask Canvas
+    const buildFramedPhotoFromSource = (srcImage) => {
+      const c = createCanvas(outW, outH);
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = isCar ? "#ffffff" : "#faf8f4";
+      ctx.fillRect(0, 0, outW, outH);
+      ctx.save();
+      ctx.filter = "blur(24px)";
+      ctx.drawImage(srcImage, 0, 0, outW, outH);
+      ctx.restore();
+      ctx.drawImage(srcImage, px.x, px.y, px.w, px.h);
+      return c;
+    };
 
-    const framedPhotoC = createCanvas(outW, outH);
-    const fpCtx = framedPhotoC.getContext("2d");
-    fpCtx.fillStyle = isCar ? "#ffffff" : "#faf8f4";
-    fpCtx.fillRect(0, 0, outW, outH);
-    fpCtx.save();
-    fpCtx.filter = "blur(24px)";
-    fpCtx.drawImage(CROP.sourceImg, 0, 0, outW, outH);
-    fpCtx.restore();
-    fpCtx.drawImage(CROP.sourceImg, px.x, px.y, px.w, px.h);
+    const hasUpscaled = !!(STATE.upscaleData && STATE.upscaleData.upscaledImg);
+    STATE.lowResUnturnedPhotoCanvas = buildFramedPhotoFromSource(CROP.sourceImg);
+    STATE.hqUnturnedPhotoCanvas = hasUpscaled
+      ? buildFramedPhotoFromSource(STATE.upscaleData.upscaledImg)
+      : null;
 
     const framedMaskC = createCanvas(outW, outH);
     const fmCtx = framedMaskC.getContext("2d");
     fmCtx.fillStyle = "#000000";
     fmCtx.fillRect(0, 0, outW, outH);
     fmCtx.drawImage(CROP.maskCanvas, px.x, px.y, px.w, px.h);
+    STATE.unturnedFramedMaskCanvas = framedMaskC;
 
-    STATE.framedPhotoCanvas = framedPhotoC;
-    STATE.framedMaskCanvas = framedMaskC;
-    STATE.originalImg = await loadImage(framedPhotoC.toDataURL("image/jpeg", 0.95));
-    STATE.rawMaskBase64 = framedMaskC.toDataURL("image/png");
+    // 5. Build Turned Framed Photo Canvases (for both HQ Upscaled and Low-Res Original) & Turned Mask Canvas
+    if (STATE.wheelTurnData && STATE.wheelTurnData.turned) {
+      const wt = STATE.wheelTurnData;
+      const lowResTurned = buildTurnedPhotoAndMaskFromBase(
+        STATE.lowResUnturnedPhotoCanvas,
+        framedMaskC,
+        wt,
+        px,
+        outW,
+        outH
+      );
+      STATE.lowResTurnedPhotoCanvas = lowResTurned.turnedPhotoC;
+      STATE.turnedFramedMaskCanvas = lowResTurned.turnedMaskC;
+
+      if (STATE.hqUnturnedPhotoCanvas) {
+        const hqTurned = buildTurnedPhotoAndMaskFromBase(
+          STATE.hqUnturnedPhotoCanvas,
+          framedMaskC,
+          wt,
+          px,
+          outW,
+          outH
+        );
+        STATE.hqTurnedPhotoCanvas = hqTurned.turnedPhotoC;
+        STATE.turnedFramedMaskCanvas = hqTurned.turnedMaskC;
+      } else {
+        STATE.hqTurnedPhotoCanvas = null;
+      }
+    } else {
+      STATE.lowResTurnedPhotoCanvas = null;
+      STATE.hqTurnedPhotoCanvas = null;
+      STATE.turnedFramedMaskCanvas = null;
+    }
+
+    syncActiveResolutionAndWheelCanvases();
+
+    STATE.originalImg = await loadImage(STATE.framedPhotoCanvas.toDataURL("image/jpeg", 0.95));
+    STATE.rawMaskBase64 = STATE.framedMaskCanvas.toDataURL("image/png");
     STATE.framedMaskBase64 = STATE.rawMaskBase64;
     STATE.detectedEyes = px.eyes || [];
     STATE.detectedEyesRefSize = [outW, outH];
@@ -780,7 +1210,11 @@ const Workflow = (() => {
 
     STATE.hasViewportPosition = false;
     goTo("studio");
+    PERF_LOG.markStart("4_Studio_GPU_Generate");
     await runModalGeneration(false, false);
+    PERF_LOG.markEnd("4_Studio_GPU_Generate", "all layers ready");
+    PERF_LOG.markEnd("Step2_to_Step3_Total", "studio interactive");
+    PERF_LOG.printSummary("Step 2 → Step 3 (Generate Painting)");
   }
 
   function toggleStep2MaskMode(forceState) {
@@ -911,7 +1345,6 @@ const Workflow = (() => {
 
       cv.addEventListener("wheel", (e) => {
         e.preventDefault();
-        // While editing the cutout mask, mouse wheel zooms the USER VIEW (not the subject!)
         if (CROP.maskEditMode) {
           const rect = cv.getBoundingClientRect();
           const mx = (e.clientX - rect.left) * (cv.width / Math.max(1, rect.width));
@@ -941,7 +1374,6 @@ const Workflow = (() => {
         CROP.isDragging = true;
         try { cv.setPointerCapture(e.pointerId); } catch (_) {}
         if (CROP.maskEditMode) {
-          // Space+drag, middle-click, or right-click pans the zoomed mask view
           if (CROP.spacePressed || e.button === 1 || e.button === 2) {
             CROP.isPanningMaskView = true;
             CROP.dragStart = {
@@ -1041,6 +1473,11 @@ const Workflow = (() => {
     _lastProfileCategory = newCat;
     syncOrientationButtonsUI();
 
+    if (newCat === "car" && CROP.sourceImg && !STATE.wheelTurnPromise && !STATE.wheelTurnData) {
+      STATE.isCarPhoto = true;
+      STATE.wheelTurnPromise = fetchWheelTurnInBackground(CROP.sourceImg);
+    }
+
     if (currentStep === "crop" && CROP.maskArr) {
       rebuildAnalysisWithVision();
       resetCropToSmartDefault();
@@ -1062,6 +1499,7 @@ const Workflow = (() => {
     getCropMaskCursorDiameter,
     getCropMaskCanvas: () => CROP.maskCanvas,
     onCropMaskHistorySwap,
+    syncActiveResolutionAndWheelCanvases,
   };
 })();
 

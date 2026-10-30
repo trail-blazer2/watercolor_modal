@@ -433,53 +433,58 @@
     return { tex, fbo };
   }
 
-  function renderSubjectAndOilGPU(origC, maskCleanCanvas, w, h, cw, ch, offset, cfg) {
+  function renderSubjectAndOilGPU(origC, maskCleanCanvas, w, h, cw, ch, offset, cfg, sharedLumRef = null) {
     const eng = getGPUFilterEngine();
     const [offX, offY] = offset;
     if (!eng) return null;
     const { gl, canvas, vao, progCC, progOilTone, progOilLIC, progOilBlur, progOilComp } = eng;
 
+    let lumSmallC, meanL;
+    if (sharedLumRef && sharedLumRef.lumSmallC) {
+      lumSmallC = sharedLumRef.lumSmallC;
+      meanL = sharedLumRef.meanL;
+    } else {
+      const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
+      const subSmallC = createCanvas(sw4, sh4);
+      subSmallC.getContext("2d").drawImage(origC, 0, 0, sw4, sh4);
+      const subSmData = subSmallC.getContext("2d").getImageData(0, 0, sw4, sh4).data;
 
-    const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
-    const subSmallC = createCanvas(sw4, sh4);
-    subSmallC.getContext("2d").drawImage(origC, 0, 0, sw4, sh4);
-    const subSmData = subSmallC.getContext("2d").getImageData(0, 0, sw4, sh4).data;
+      const maskSmallC = createCanvas(sw4, sh4);
+      maskSmallC.getContext("2d").drawImage(maskCleanCanvas, 0, 0, sw4, sh4);
+      const maskSmData = maskSmallC.getContext("2d").getImageData(0, 0, sw4, sh4).data;
+      maskSmallC.width = 1; maskSmallC.height = 1;
 
-    const maskSmallC = createCanvas(sw4, sh4);
-    maskSmallC.getContext("2d").drawImage(maskCleanCanvas, 0, 0, sw4, sh4);
-    const maskSmData = maskSmallC.getContext("2d").getImageData(0, 0, sw4, sh4).data;
-    maskSmallC.width = 1; maskSmallC.height = 1;
-
-    const n4 = sw4 * sh4;
-    const lum4 = new Float32Array(n4);
-    const in4 = new Float32Array(n4);
-    let sumL = 0, cntL = 0;
-    for (let i = 0; i < n4; i++) {
-      const p = i * 4;
-      const l = 0.299 * subSmData[p] + 0.587 * subSmData[p + 1] + 0.114 * subSmData[p + 2];
-      lum4[i] = l;
-      if (maskSmData[p] > 200) {
-        in4[i] = 1.0;
-        sumL += l;
-        cntL++;
+      const n4 = sw4 * sh4;
+      const lum4 = new Float32Array(n4);
+      const in4 = new Float32Array(n4);
+      let sumL = 0, cntL = 0;
+      for (let i = 0; i < n4; i++) {
+        const p = i * 4;
+        const l = 0.299 * subSmData[p] + 0.587 * subSmData[p + 1] + 0.114 * subSmData[p + 2];
+        lum4[i] = l;
+        if (maskSmData[p] > 200) {
+          in4[i] = 1.0;
+          sumL += l;
+          cntL++;
+        }
       }
-    }
-    const meanL = (cntL > 0 ? sumL / cntL : 128.0) / 255.0;
+      meanL = (cntL > 0 ? sumL / cntL : 128.0) / 255.0;
 
-    const den6 = boxBlurFloat32(in4, sw4, sh4, 6);
-    let lumBlur4 = normalizedBlurFloat32(lum4, in4, sw4, sh4, 6, den6);
-    lumBlur4 = normalizedBlurFloat32(lumBlur4, in4, sw4, sh4, 5);
+      const den6 = boxBlurFloat32(in4, sw4, sh4, 6);
+      let lumBlur4 = normalizedBlurFloat32(lum4, in4, sw4, sh4, 6, den6);
+      lumBlur4 = normalizedBlurFloat32(lumBlur4, in4, sw4, sh4, 5);
 
-    const lumSmallC = createCanvas(sw4, sh4);
-    const lsCtx = lumSmallC.getContext("2d");
-    const lsImg = lsCtx.createImageData(sw4, sh4);
-    for (let i = 0; i < n4; i++) {
-      const v = Math.max(0, Math.min(255, Math.round(lumBlur4[i])));
-      const p = i * 4;
-      lsImg.data[p] = v; lsImg.data[p + 1] = v; lsImg.data[p + 2] = v; lsImg.data[p + 3] = 255;
+      lumSmallC = createCanvas(sw4, sh4);
+      const lsCtx = lumSmallC.getContext("2d");
+      const lsImg = lsCtx.createImageData(sw4, sh4);
+      for (let i = 0; i < n4; i++) {
+        const v = Math.max(0, Math.min(255, Math.round(lumBlur4[i])));
+        const p = i * 4;
+        lsImg.data[p] = v; lsImg.data[p + 1] = v; lsImg.data[p + 2] = v; lsImg.data[p + 3] = 255;
+      }
+      lsCtx.putImageData(lsImg, 0, 0);
+      subSmallC.width = 1; subSmallC.height = 1;
     }
-    lsCtx.putImageData(lsImg, 0, 0);
-    subSmallC.width = 1; subSmallC.height = 1;
 
 
     const texOrig = uploadTex2D(gl, origC, false);
@@ -645,9 +650,7 @@
     gl.deleteTexture(texMask);
     if (texWc !== texOrig) gl.deleteTexture(texWc);
     canvas.width = 1; canvas.height = 1;
-    lumSmallC.width = 1; lumSmallC.height = 1;
-
-    return { cleanCcCrop, subCcFull, subTexFull, oilFull };
+    return { cleanCcCrop, subCcFull, subTexFull, oilFull, lumSmallC, meanL };
   }
 
   // ==========================================================================
@@ -1049,7 +1052,65 @@
     });
   }
 
-  function buildShadowLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg) {
+  function sampleBottomWheelShadowColor(pts, cleanCcCrop, maskClean, w, h, cfg) {
+    const fallbackGray = Math.trunc(255 * (cfg.SHADOW_BRUSH_LIGHTNESS ?? 0.0));
+    const fallbackRgb = [fallbackGray, fallbackGray, fallbackGray];
+    if (!pts || pts.length < 4 || !cleanCcCrop || !maskClean) return fallbackRgb;
+
+    const imgData = cleanCcCrop.getContext("2d").getImageData(0, 0, w, h).data;
+    const ys = pts.map((p) => p[1]);
+    const maxY = Math.max(...ys);
+    const minY = Math.min(...ys);
+    // Focus on the lowest 35% of the bottom outline (where the bottoms of the front & rear tires sit)
+    const yThresh = maxY - Math.max(18, (maxY - minY) * 0.35);
+
+    const rSamples = [];
+    const gSamples = [];
+    const bSamples = [];
+
+    for (const [x, y, nx, ny] of pts) {
+      if (y < yThresh) continue;
+      // Sample 10px to 28px inward along the inward normal (-nx, -ny) into the bottom tire rubber
+      for (const d of [10, 16, 22, 28]) {
+        const sx = Math.max(0, Math.min(w - 1, Math.round(x - nx * d)));
+        const sy = Math.max(0, Math.min(h - 1, Math.round(y - ny * d)));
+        if (maskClean[sy * w + sx] < 180) continue;
+        const p = (sy * w + sx) * 4;
+        const r = imgData[p], g = imgData[p + 1], b = imgData[p + 2];
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        const chr = Math.max(r, g, b) - Math.min(r, g, b);
+        // Only accept dark/charcoal tire rubber (ignore white/light-gray tires L > 75 or colourful bodywork chr > 36)
+        if (lum >= 6 && lum <= 75 && chr <= 36) {
+          rSamples.push(r);
+          gSamples.push(g);
+          bSamples.push(b);
+        }
+      }
+    }
+
+    if (rSamples.length < 6) return fallbackRgb;
+    rSamples.sort((a, b) => a - b);
+    gSamples.sort((a, b) => a - b);
+    bSamples.sort((a, b) => a - b);
+    const mid = (rSamples.length * 0.4) | 0; // 40th percentile for rich dark tire contact tone
+    const medR = rSamples[mid];
+    const medG = gSamples[mid];
+    const medB = bSamples[mid];
+    const medLum = 0.299 * medR + 0.587 * medG + 0.114 * medB;
+
+    // If the tire is light gray or white, do not match it — keep standard dark shadow
+    if (medLum > 68) return fallbackRgb;
+
+    // Slightly deepen (0.88x) so the ground shadow blends seamlessly into the bottom of the tire
+    const scale = 0.88;
+    return [
+      Math.min(62, Math.round(medR * scale)),
+      Math.min(62, Math.round(medG * scale)),
+      Math.min(62, Math.round(medB * scale)),
+    ];
+  }
+
+  function buildShadowLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg, cleanCcCrop = null, maskClean = null, w = 0, h = 0) {
     if (!cfg.SHADOW_BRUSH_ENABLED) return null;
     const rng = new PythonRandom((cfg.RANDOM_SEED || 42) + 800);
     const pts = getBottomOutlinePointsFast(
@@ -1067,8 +1128,7 @@
     const sizeJit = cfg.SHADOW_BRUSH_SIZE_JITTER ?? 0.2;
     const rotOff = cfg.SHADOW_BRUSH_ROTATION_OFFSET ?? 0;
     const rotJit = cfg.SHADOW_BRUSH_ROTATION_JITTER ?? 0.1;
-    const gray = Math.trunc(255 * (cfg.SHADOW_BRUSH_LIGHTNESS ?? 0.0));
-    const rgb = [gray, gray, gray];
+    const rgb = sampleBottomWheelShadowColor(pts, cleanCcCrop, maskClean, w, h, cfg);
     const endTurn = cfg.SHADOW_BRUSH_END_TURN_ANGLE ?? 45;
 
     const xs = pts.map((p) => p[0]);
@@ -1191,11 +1251,13 @@
     const offset = [offX, offY];
 
     // 2. WebGL2 GPU Color Correction + WebGL2 GPU 4-Pass LIC Oil Paint
+    // 2. WebGL2 GPU Color Correction + WebGL2 GPU 4-Pass LIC Oil Paint
     tStep = performance.now();
     const gpuOut = renderSubjectAndOilGPU(origC, maskC, w, h, cw, ch, offset, cfg);
     if (!gpuOut) throw new Error("WebGL2 GPU filter context unavailable");
     const { cleanCcCrop, subCcFull, subTexFull, oilFull } = gpuOut;
 
+    // FIRST: Create subRawFull!
     const subRawFull = createCanvas(cw, ch);
     const origCtx = origC.getContext("2d");
     const origImgData = origCtx.getImageData(0, 0, w, h);
@@ -1204,68 +1266,135 @@
     origCtx.putImageData(origImgData, 0, 0);
     subRawFull.getContext("2d").drawImage(origC, offX, offY);
     origC.width = 1; origC.height = 1;
-    timings["2_gpu_cc_and_oil_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
 
-    // 3. Half-Scale Normal Pyramid, Full-Res Edges, Accents & Auxiliary Layers
-    tStep = performance.now();
-    const {
-      averageColor,
-      dominantColor,
-      edges,
-      edgePixelsX,
-      edgePixelsY,
-      normXHalf,
-      normYHalf,
-      hw,
-      hh,
-      candidates,
-      spots,
-    } = computeEdgesPaletteAndAccentsFast(cleanCcCrop, maskClean, w, h, offset, cfg);
+    // SECOND: Build unturned layer canvases if this is a car with a turned wheel
+ let unturnedLayerBlobs = null;
+ if (
+   isCar &&
+   STATE.wheelTurnData &&
+   STATE.wheelTurnData.turned &&
+   STATE.unturnedFramedPhotoCanvas &&
+   STATE.turnedFramedPhotoCanvas
+ ) {
+   const uOrigC = createCanvas(w, h);
+   uOrigC.getContext("2d").drawImage(STATE.unturnedFramedPhotoCanvas, 0, 0, w, h);
 
-    const paperC = buildPaperLayerClient(cw, ch, cfg);
-    const blurBgC = buildBlurBgLayerClient(cleanCcCrop, cw, ch, cfg);
-    cleanCcCrop.width = 1; cleanCcCrop.height = 1;
+   const uMaskC = createCanvas(w, h);
+   const umCtx = uMaskC.getContext("2d");
+   if (useEditedMask && STATE.maskCanvas) {
+     umCtx.filter = "blur(1.5px)";
+     umCtx.drawImage(STATE.maskCanvas, 0, 0, w, h);
+     umCtx.filter = "none";
+   } else if (STATE.unturnedFramedMaskCanvas) {
+     umCtx.drawImage(STATE.unturnedFramedMaskCanvas, 0, 0, w, h);
+   } else {
+     umCtx.drawImage(maskC, 0, 0);
+   }
+   const uRawMaskData = umCtx.getImageData(0, 0, w, h).data;
+   const uRawU8 = new Uint8Array(w * h);
+   for (let i = 0, p = 0; i < uRawU8.length; i++, p += 4) uRawU8[i] = uRawMaskData[p];
+   const uMaskClean = erodeMaskFastUint8(uRawU8, w, h, trim);
+   const uCleanImg = umCtx.createImageData(w, h);
+   for (let i = 0, p = 0; i < uMaskClean.length; i++, p += 4) {
+     const v = uMaskClean[i];
+     uCleanImg.data[p] = v; uCleanImg.data[p + 1] = v; uCleanImg.data[p + 2] = v; uCleanImg.data[p + 3] = 255;
+   }
+   umCtx.putImageData(uCleanImg, 0, 0);
 
-    const shadowC = buildShadowLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg);
-    const colordropC = buildColordropLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg);
-    timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
+   const uGpu = renderSubjectAndOilGPU(uOrigC, uMaskC, w, h, cw, ch, offset, cfg, {
+     lumSmallC: gpuOut.lumSmallC,
+     meanL: gpuOut.meanL,
+   });
+   if (uGpu) {
+     uGpu.cleanCcCrop.width = 1; uGpu.cleanCcCrop.height = 1;
+     const uRawFull = createCanvas(cw, ch);
+     const uoCtx = uOrigC.getContext("2d");
+     const uoImg = uoCtx.getImageData(0, 0, w, h);
+     for (let i = 0, p = 3; i < uMaskClean.length; i++, p += 4) uoImg.data[p] = uMaskClean[i];
+     uoCtx.putImageData(uoImg, 0, 0);
+     uRawFull.getContext("2d").drawImage(uOrigC, offX, offY);
 
-    const elapsedSec = Number(((performance.now() - t0) / 1000).toFixed(2));
-    timings["total_client_sec"] = elapsedSec;
-    STATE.lastEngineSource = "Local GPU";
+     unturnedLayerBlobs = {
+       subject_raw: uRawFull,
+       subject_cc: uGpu.subCcFull,
+       subject_tex: uGpu.subTexFull,
+       oil_paint_full: uGpu.oilFull,
+     };
+   }
+   uOrigC.width = 1; uOrigC.height = 1;
+   uMaskC.width = 1; uMaskC.height = 1;
+ }
+ if (gpuOut.lumSmallC) {
+   gpuOut.lumSmallC.width = 1;
+   gpuOut.lumSmallC.height = 1;
+ }
 
-    const payload = {
-      _isCompact: true,
-      preset_key: key,
-      canvas_size: [cw, ch],
-      offset: [offX, offY],
-      subject_size: [w, h],
-      preset_settings: cfg,
-      average_color: cfg.BG_BRUSH_MIX_AVERAGE ? averageColor : [128, 128, 128],
-      dominant_color: dominantColor,
-      elapsed_sec: elapsedSec,
-      timings,
-      maskBlob: maskC,
-      layerBlobs: {
-        bg_paper: paperC,
-        subject_raw: subRawFull,
-        subject_cc: subCcFull,
-        subject_tex: subTexFull,
-        blur_bg: blurBgC,
-        oil_paint_full: oilFull,
-        shadow: shadowC,
-        colordrop: colordropC,
-      },
-      stroke_data: {
-        edges,
-        accent_candidates: candidates,
-        accent_spots: spots,
-      },
-    };
-    rebuildEdgeSpatialIndex(payload.stroke_data);
-    setTimeout(() => StudioProfiler.report(), 60);
-    return payload;
-  }
+ timings["2_gpu_cc_and_oil_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
 
-  window.ClientWatercolorEngine = { generate };
+ // 3. Half-Scale Normal Pyramid, Full-Res Edges, Accents & Auxiliary Layers
+ tStep = performance.now();
+ const {
+   averageColor,
+   dominantColor,
+   edges,
+   edgePixelsX,
+   edgePixelsY,
+   normXHalf,
+   normYHalf,
+   hw,
+   hh,
+   candidates,
+   spots,
+ } = computeEdgesPaletteAndAccentsFast(cleanCcCrop, maskClean, w, h, offset, cfg);
+
+ const paperC = buildPaperLayerClient(cw, ch, cfg);
+const blurBgC = buildBlurBgLayerClient(cleanCcCrop, cw, ch, cfg);
+const shadowC = buildShadowLayerClient(
+    edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg,
+    cleanCcCrop, maskClean, w, h
+);
+cleanCcCrop.width = 1; cleanCcCrop.height = 1;
+
+const colordropC = buildColordropLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg);
+timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
+
+ const elapsedSec = Number(((performance.now() - t0) / 1000).toFixed(2));
+ timings["total_client_sec"] = elapsedSec;
+ STATE.lastEngineSource = "Local GPU";
+
+ const payload = {
+   _isCompact: true,
+   preset_key: key,
+   canvas_size: [cw, ch],
+   offset: [offX, offY],
+   subject_size: [w, h],
+   preset_settings: cfg,
+   average_color: cfg.BG_BRUSH_MIX_AVERAGE ? averageColor : [128, 128, 128],
+   dominant_color: dominantColor,
+   elapsed_sec: elapsedSec,
+   timings,
+   maskBlob: maskC,
+   unturnedLayerBlobs,
+   layerBlobs: {
+     bg_paper: paperC,
+     subject_raw: subRawFull,
+     subject_cc: subCcFull,
+     subject_tex: subTexFull,
+     blur_bg: blurBgC,
+     oil_paint_full: oilFull,
+     shadow: shadowC,
+     colordrop: colordropC,
+   },
+   stroke_data: {
+     edges,
+     accent_candidates: candidates,
+     accent_spots: spots,
+   },
+ };
+ rebuildEdgeSpatialIndex(payload.stroke_data);
+ setTimeout(() => StudioProfiler.report(), 60);
+ return payload;
+}
+
+window.ClientWatercolorEngine = { generate };
 })();

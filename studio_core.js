@@ -88,6 +88,7 @@ const LAYER_DEFINITIONS = [
   { id: "subject", name: "🦁 Subject & Color Correction", group: "Subject & Oil", type: "subject", prefix: "CC" },
   { id: "shadow", name: "🌑 Bottom Shadow Brush", group: "Under Subject", type: "effect", prefix: "SHADOW_BRUSH" },
   { id: "colordrop", name: "💧 Bottom Color Drops", group: "Under Subject", type: "effect", prefix: "COLORDROP_BRUSH" },
+  { id: "cool_brush", name: "🌊 Cool Brush", group: "Under Subject", type: "cool_swoosh", prefix: "COOL_BRUSH" },
   { id: "glow", name: "☀️ Subject Rim Glow", group: "Under Subject", type: "glow", prefix: "GLOW" },
   { id: "dark_dots", name: "⚫ Dark Splatter Dots", group: "Under Subject", type: "brush_dots", seedOffset: 400, prefix: "DARK_DOTS" },
   { id: "white_dots", name: "⚪ White Splatter Dots", group: "Under Subject", type: "brush_dots", seedOffset: 300, prefix: "WHITE_DOTS" },
@@ -145,7 +146,7 @@ const canvasContainer = document.getElementById("canvasContainer");
 const viewport = document.getElementById("viewport");
 const brushCursor = document.getElementById("brushCursor");
 
-const BRUSH_CACHE_KEY = "wc_cached_brushes_v5";
+const BRUSH_CACHE_KEY = "wc_cached_brushes_v7";
 
 // ============================================================================
 // 4. PRE-WARMER, PROGRESS BAR & LIGHTWEIGHT BRUSH CACHE
@@ -172,7 +173,7 @@ function prewarmModalServer() {
 }
 
 function startFilePickerPrewarm() {
-  prewarmModalServer();
+  fetch(`${STATE.apiUrl}/health?warm_gpu=1`, { mode: "cors" }).catch(() => {});
   loadCachedBrushes();
   if (window.SubjectVision && window.SubjectVision.init) {
     window.SubjectVision.init();
@@ -247,8 +248,15 @@ function finishProgressBar() {
 }
 
 async function loadCachedBrushes() {
-  if (Object.keys(STATE.brushImages).length >= 9) return;
+  if (Object.keys(STATE.brushImages).length >= 10) return;
   try {
+    // Purge any older brush cache versions so localStorage 5MB quota never overflows!
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("wc_cached_brushes_") && k !== BRUSH_CACHE_KEY) {
+        localStorage.removeItem(k);
+      }
+    }
     const cachedStr = localStorage.getItem(BRUSH_CACHE_KEY);
     if (cachedStr) {
       const data = JSON.parse(cachedStr);
@@ -262,10 +270,10 @@ async function loadCachedBrushes() {
   await fetchBrushTextures();
 }
 
-async function fetchBrushTextures() {
-  if (Object.keys(STATE.brushImages).length >= 9) return;
+async function fetchBrushTextures(forceRefresh = false) {
+  if (!forceRefresh && Object.keys(STATE.brushImages).length >= 9) return;
   try {
-    const res = await fetch(`${STATE.apiUrl}/brushes`);
+    const res = await fetch(`${STATE.apiUrl}/brushes?v=${encodeURIComponent(BRUSH_CACHE_KEY)}`, { cache: "no-store" });
     if (!res.ok) return;
     const data = await res.json();
     for (const [name, b64] of Object.entries(data)) {
@@ -503,6 +511,7 @@ function compactifyPayloadForCache(rawPayload) {
     timings: rawPayload.timings || {},
     maskBlob,
     layerBlobs,
+    wheelPatchBlobs: rawPayload.wheelPatchBlobs || null,
     stroke_data: {
       edges: (rawPayload.stroke_data.edges || []).map((e) => [...e]),
       accent_candidates: (rawPayload.stroke_data.accent_candidates || []).map((c) => ({ ...c, color: [...c.color] })),
@@ -673,6 +682,80 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false,
     finishProgressBar();
   }
 }
+
+
+
+
+function applyWheelPatchToSubjectLayers(enableTurned, skipComposite = false) {
+  if (!STATE.payload || !STATE.wheelSubjectPatches || !STATE.serverImages) {
+    console.warn("Wheel patches not available to toggle:", !!STATE.wheelSubjectPatches);
+    return;
+  }
+  STATE.wheelTurnEnabled = !!enableTurned;
+  if (STATE.layers && STATE.layers.subject && STATE.layers.subject.params) {
+    STATE.layers.subject.params.wheelTurned = STATE.wheelTurnEnabled;
+  }
+
+  const wp = STATE.wheelSubjectPatches;
+  const srcSet = STATE.wheelTurnEnabled ? wp.turned : wp.unturned;
+  if (!srcSet) return;
+
+  const { ox, oy, ow, oh } = wp;
+
+  // 1. Swap the wheel rectangle on subject_raw, subject_cc, and subject_tex in Overscan Space
+  for (const k of ["subject_raw", "subject_cc", "subject_tex"]) {
+    const targetC = STATE.serverImages[k];
+    const patchC = srcSet[k];
+    if (targetC && targetC.getContext && patchC) {
+      const ctx = targetC.getContext("2d");
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      ctx.clearRect(ox, oy, ow, oh);
+      ctx.drawImage(patchC, ox, oy, ow, oh);
+      ctx.restore();
+    }
+  }
+
+  // 2. Swap the pre-faded oil_crop_patch directly into STATE.oilDetailCache.oilCrop
+  if (srcSet.oil_crop_patch && STATE.oilDetailCache && STATE.oilDetailCache.oilCrop) {
+    const { bx, by, oilCrop, popCanvas } = STATE.oilDetailCache;
+    const locX = ox - bx;
+    const locY = oy - by;
+    const oCtx = oilCrop.getContext("2d");
+    oCtx.clearRect(locX, locY, ow, oh);
+    oCtx.drawImage(srcSet.oil_crop_patch, locX, locY);
+    if (popCanvas) {
+      const pCtx = popCanvas.getContext("2d");
+      pCtx.clearRect(locX, locY, ow, oh);
+      pCtx.filter = "contrast(165%) saturate(80%)";
+      pCtx.drawImage(oilCrop, locX, locY, ow, oh, locX, locY, ow, oh);
+      pCtx.filter = "none";
+    }
+    if (STATE.layers.oil_paint && STATE.layers.oil_paint.vis) {
+      rerenderLiveOilLayer(true);
+    }
+  }
+
+  // 3. Rebuild Edge Curve cache cleanly so Tri-Tone segmentation has zero box seam
+  STATE.edgeCurveCache = null;
+  destroyGLEdgeCurveResources();
+  if (STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
+    rerenderLiveEdgeCurveLayer(true);
+    if (typeof freeEdgeCurveCpuUploadBuffers === "function") freeEdgeCurveCpuUploadBuffers();
+  }
+
+  // 4. Force stack rebuild & composite so the canvas updates immediately
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+  invalidateStack();
+  if (!skipComposite) {
+    compositeAllLayers();
+  }
+}
+
+async function toggleSteeredWheelInStudio(enableTurned) {
+  applyWheelPatchToSubjectLayers(enableTurned, false);
+}
+window.toggleSteeredWheelInStudio = toggleSteeredWheelInStudio;
 
 const _EDGE_CHUNK_SHIFT = 6;
 const _EDGE_CHUNK_SIZE = 1 << _EDGE_CHUNK_SHIFT;
@@ -1385,6 +1468,8 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   STATE.oilDetailCache = null;
   STATE.edgeCurveCache = null;
   STATE.glowCache = null;
+  STATE.swooshCarAnalysis = null;
+  STATE._colorizedSwooshCache = null;
   destroyGLEdgeCurveResources();
   _blurTmpA = new Float32Array(0);
   _colSumA = new Float32Array(0);
@@ -1440,6 +1525,7 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
 
   STATE.payload = workPayload;
   STATE.ServerLayerBlobs = compact.layerBlobs || {};
+  STATE.wheelPatchBlobs = compact.wheelPatchBlobs || null;
 
   document.getElementById("emptyState").classList.add("hidden");
   canvasContainer.classList.remove("hidden");
@@ -1497,6 +1583,95 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   rebuildEdgeSpatialIndex(workPayload.stroke_data);
 
   STATE.serverImages = rawImgs;
+
+  // Build oilDetailCache now (which also frees the 20.7 MB rawImgs.oil_paint_full canvas!)
+  if (typeof getOrBuildOilDetailCache === "function") {
+    getOrBuildOilDetailCache();
+  }
+
+  // Build overscan-matched wheel patches so toggling ON -> OFF -> ON is 100% bit-exact!
+  STATE.wheelSubjectPatches = null;
+  if (compact.unturnedLayerBlobs && STATE.wheelTurnData && STATE.wheelTurnData.turned) {
+    const unturnedOverscan = buildOverscanServerImages(
+      compact.unturnedLayerBlobs,
+      workPayload,
+      compact.offset,
+      baseW,
+      baseH,
+      overW,
+      overH,
+      padX,
+      padY
+    );
+    const up = STATE.uncroppedPlacement;
+    const wt = STATE.wheelTurnData;
+    const [subW, subH] = workPayload.subject_size;
+    const scX = up ? subW / up.refSize[0] : 1;
+    const scY = up ? subH / up.refSize[1] : 1;
+    const carX = workPayload.offset[0] + (up ? up.px.x * scX : 0);
+    const carY = workPayload.offset[1] + (up ? up.px.y * scY : 0);
+    const carW = up ? up.px.w * scX : subW;
+    const carH = up ? up.px.h * scY : subH;
+
+    const ox = Math.max(0, Math.floor(carX + wt.x0Frac * carW - 16));
+    const oy = Math.max(0, Math.floor(carY + wt.y0Frac * carH - 16));
+    const ow = Math.min(overW - ox, Math.ceil(wt.wFrac * carW + 32));
+    const oh = Math.min(overH - oy, Math.ceil(wt.hFrac * carH + 32));
+
+    const cropOverscan = (srcC) => {
+      if (!srcC) return null;
+      const pc = createCanvas(ow, oh);
+      pc.getContext("2d").drawImage(srcC, ox, oy, ow, oh, 0, 0, ow, oh);
+      return pc;
+    };
+
+    // Build faded oil patch for unturned so it matches oilDetailCache.oilCrop 1:1
+    let unturnedOilPatch = null;
+    let turnedOilPatch = null;
+    if (STATE.oilDetailCache && STATE.oilDetailCache.oilCrop && unturnedOverscan.oil_paint_full) {
+      const { bx, by, bw, bh, oilCrop } = STATE.oilDetailCache;
+      turnedOilPatch = createCanvas(ow, oh);
+      turnedOilPatch.getContext("2d").drawImage(oilCrop, ox - bx, oy - by, ow, oh, 0, 0, ow, oh);
+
+      const uOilCrop = createCanvas(bw, bh);
+      uOilCrop.getContext("2d").drawImage(unturnedOverscan.oil_paint_full, bx, by, bw, bh, 0, 0, bw, bh);
+      if (typeof applyOilSilhouetteFadeToCrop === "function") {
+        // Temporarily swap subject_cc so unturned oil fade uses unturned subject_cc
+        const savedCc = STATE.serverImages.subject_cc;
+        STATE.serverImages.subject_cc = unturnedOverscan.subject_cc;
+        applyOilSilhouetteFadeToCrop(uOilCrop, bx, by, bw, bh);
+        STATE.serverImages.subject_cc = savedCc;
+      }
+      unturnedOilPatch = createCanvas(ow, oh);
+      unturnedOilPatch.getContext("2d").drawImage(uOilCrop, ox - bx, oy - by, ow, oh, 0, 0, ow, oh);
+      uOilCrop.width = 1; uOilCrop.height = 1;
+    }
+
+    STATE.wheelSubjectPatches = {
+      ox, oy, ow, oh,
+      turned: {
+        subject_raw: cropOverscan(rawImgs.subject_raw),
+        subject_cc: cropOverscan(rawImgs.subject_cc),
+        subject_tex: cropOverscan(rawImgs.subject_tex),
+        oil_crop_patch: turnedOilPatch,
+      },
+      unturned: {
+        subject_raw: cropOverscan(unturnedOverscan.subject_raw),
+        subject_cc: cropOverscan(unturnedOverscan.subject_cc),
+        subject_tex: cropOverscan(unturnedOverscan.subject_tex),
+        oil_crop_patch: unturnedOilPatch,
+      },
+    };
+
+    for (const c of Object.values(unturnedOverscan)) {
+      if (c && c.tagName === "CANVAS") { c.width = 1; c.height = 1; }
+    }
+    for (const c of Object.values(compact.unturnedLayerBlobs)) {
+      if (c && c.tagName === "CANVAS") { c.width = 1; c.height = 1; }
+    }
+    compact.unturnedLayerBlobs = null;
+  }
+
   STATE.viewRect = computeViewRectInOverscanSpace(STATE.aspectRatioKey, STATE.aspectOrientation);
   resizeDisplayCanvasKeepViewportPosition(STATE.viewRect.w, STATE.viewRect.h);
 
@@ -1513,6 +1688,8 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
       enabled = !!cfg.OIL_PAINT_ENABLED;
     } else if (def.id === "bg_paper") {
       enabled = true;
+    } else if (def.id === "cool_brush") {
+      enabled = (compact.preset_key || "").startsWith("cars") && !!cfg.COOL_BRUSH_ENABLED;
     } else {
       const enKey = `${def.prefix}_ENABLED`;
       enabled = cfg[enKey] !== undefined ? !!cfg[enKey] : true;
@@ -1525,7 +1702,7 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
     }
 
     let baseCanvas = null;
-    if (enabled && ["edge_curve", "oil_paint", "glow"].includes(def.id)) {
+    if (enabled && ["edge_curve", "glow"].includes(def.id)) {
       baseCanvas = createCanvas(overW, overH);
     }
 
@@ -1572,6 +1749,15 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   _blurTmpA = new Float32Array(0);
   _colSumA = new Float32Array(0);
 
+  
+  if (STATE.wheelSubjectPatches && STATE.wheelTurnEnabled === false) {
+    applyWheelPatchToSubjectLayers(false, true);
+  }
+
+  if (STATE.layers.cool_brush && STATE.layers.cool_brush.vis) {
+    rerenderCoolSwooshLayer(true);
+  }
+  
   invalidateStack();
   renderLayerListUI();
   selectLayer(STATE.selectedLayerId || "bg_brush");
@@ -1580,9 +1766,12 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
 
 function freeEdgeCurveCpuUploadBuffers() {
   if (typeof _glEC !== "undefined" && _glEC && STATE.edgeCurveCache && _glEC.uploadedCache === STATE.edgeCurveCache) {
-    STATE.edgeCurveCache.smoothRgba = null;
-    STATE.edgeCurveCache.rawZonesRgba = null;
-    STATE.edgeCurveCache.staticWeightsRgba = null;
+    STATE.edgeCurveCache.darkPaintRgba = null;
+    STATE.edgeCurveCache.midPaintRgba = null;
+    STATE.edgeCurveCache.lightPaintRgba = null;
+    STATE.edgeCurveCache.zonePyrARgba = null;
+    STATE.edgeCurveCache.zonePyrBRgba = null;
+    STATE.edgeCurveCache.zonePyrFloat = null;
     if (STATE.serverImages && STATE.serverImages.edge_curve) {
       if (STATE.serverImages.edge_curve.tagName === "CANVAS") {
         STATE.serverImages.edge_curve.width = 1;

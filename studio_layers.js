@@ -9,6 +9,7 @@ const _pendingRerender = new Set();
 let _pendingOil = false;
 let _pendingEdgeCurve = false;
 let _pendingGlow = false;
+let _pendingCoolSwoosh = false;
 let _pendingComposite = false;
 let _rafId = 0;
 
@@ -17,6 +18,7 @@ function cancelPendingSchedules() {
   _pendingOil = false;
   _pendingEdgeCurve = false;
   _pendingGlow = false;
+  _pendingCoolSwoosh = false;
   _pendingComposite = false;
   if (_rafId) {
     cancelAnimationFrame(_rafId);
@@ -64,6 +66,12 @@ function _ensureRaf() {
       invalidateMoveFastStack();
       needsComp = true;
     }
+    if (_pendingCoolSwoosh) {
+      _pendingCoolSwoosh = false;
+      if (typeof rerenderCoolSwooshLayer === "function") rerenderCoolSwooshLayer(true);
+      invalidateMoveFastStack();
+      needsComp = true;
+    }
     if (needsComp) {
       compositeAllLayers();
     }
@@ -72,6 +80,11 @@ function _ensureRaf() {
 
 function scheduleGlowRerender() {
   scheduleRerender("glow");
+}
+
+function scheduleCoolSwooshRerender() {
+  _pendingCoolSwoosh = true;
+  _ensureRaf();
 }
 
 function scheduleRerender(layerId) {
@@ -118,6 +131,7 @@ function ensureSubjectParams(p) {
   }
   if (p.wcTexture === undefined) p.wcTexture = !!cfg.WATERCOLOR_TEXTURE_ENABLED;
   if (p.eyeBeautifier === undefined) p.eyeBeautifier = isAnimalPresetOrPhoto();
+  if (p.wheelTurned === undefined) p.wheelTurned = true;
   if (p.underWindowEnabled === undefined) p.underWindowEnabled = false;
   if (p.underWindowColor === undefined) p.underWindowColor = cfg.DARK_BACKGROUND_ENABLED ? "black" : "white";
   if (p.underWindowOpacity === undefined || Number.isNaN(p.underWindowOpacity)) p.underWindowOpacity = 85;
@@ -192,7 +206,7 @@ function buildInitialLayerParams(def, cfg) {
     return {
       opacity: cfg.EDGE_CURVE_ENABLED ? (cfg.EDGE_CURVE_OPACITY ?? 0.75) : 0.75,
       baseOpacity: 1.0,
-      maskDetail: 85,
+      maskDetail: 100,
       edgeThickness: 0,
       brightness: 100,
       contrast: 105,
@@ -228,6 +242,9 @@ function buildInitialLayerParams(def, cfg) {
       contrast: 100,
       saturation: 100,
     });
+  }
+  if (def.type === "cool_swoosh" && typeof buildInitialCoolSwooshParams === "function") {
+    return buildInitialCoolSwooshParams(cfg);
   }
   return {
     opacity: 1.0,
@@ -395,6 +412,8 @@ function ensureLayerCanvasRendered(lyr) {
     rerenderLiveOilLayer(true);
   } else if (def.id === "glow" && !lyr.baseCanvas) {
     rerenderLiveGlowLayer(true);
+  } else if (def.id === "cool_brush" && !lyr.baseCanvas) {
+    if (typeof rerenderCoolSwooshLayer === "function") rerenderCoolSwooshLayer(true);
   }
 }
 
@@ -447,6 +466,18 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
     targetCtx.restore();
     return;
   }
+  if (def.id === "oil_paint") {
+    const cache = getOrBuildOilDetailCache();
+    if (cache && cache.oilCrop) {
+      targetCtx.save();
+      applyOverscanToViewportTransform(targetCtx, vr, movable);
+      targetCtx.drawImage(cache.oilCrop, cache.bx, cache.by);
+      drawEyeBeautifierPatchesInOverscan(targetCtx);
+      targetCtx.restore();
+      return;
+    }
+  }
+
 
   // Memory-saving direct WebGL render for non-selected procedural layers
   if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "accent"].includes(def.type)) {
@@ -616,6 +647,17 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
     subMain = renderProceduralStrokesToSharedGL(lyr);
     isDirectGL = true;
   }
+  if (!subMain && def.id === "oil_paint") {
+    const cache = getOrBuildOilDetailCache();
+    if (cache && cache.oilCrop) {
+      targetCtx.save();
+      targetCtx.globalAlpha = Math.min(1, op);
+      targetCtx.drawImage(cache.oilCrop, cache.bx, cache.by);
+      targetCtx.restore();
+      drawEyeBeautifierPatchesInOverscan(targetCtx);
+      return;
+    }
+  }
   if (!subMain) return;
 
   const effOp = isDirectGL && def.type !== "accent" ? op * (p.baseOpacity ?? 1.0) : op;
@@ -783,7 +825,7 @@ function ensureMoveFastStackReady() {
   oCtx.clearRect(0, 0, overW, overH);
 
   // 1. Movable Under Subject (indices 17..8: bg_brush .. shadow)
-  for (let i = 17; i >= 8; i--) {
+  for (let i = LAYER_DEFINITIONS.length - 2; i >= 8; i--) {
     drawLayerInOverscanSpaceUntransformed(uCtx, LAYER_DEFINITIONS[i]);
   }
   // 2. Subject + Oil + EdgeCurve un-faded (indices 7..5)
@@ -972,10 +1014,42 @@ function sampleEdgePointsJS(edges, spacing) {
   return out;
 }
 
+function applyOilSilhouetteFadeToCrop(oilCrop, bx, by, bw, bh) {
+  if (!STATE.serverImages || !STATE.serverImages.subject_cc) return;
+  const oCtx = oilCrop.getContext("2d");
+  const oilImg = oCtx.getImageData(0, 0, bw, bh);
+  const oData = oilImg.data;
+  const subC = createCanvas(bw, bh);
+  subC.getContext("2d").drawImage(STATE.serverImages.subject_cc, bx, by, bw, bh, 0, 0, bw, bh);
+  const sData = subC.getContext("2d").getImageData(0, 0, bw, bh).data;
+  subC.width = 1; subC.height = 1;
+
+  const n = bw * bh;
+  const outerSil = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    outerSil[i] = oData[i * 4 + 3] < 245 ? 1.0 : 0.0;
+  }
+  let silBlur = boxBlurFloat32(outerSil, bw, bh, 5);
+  silBlur = boxBlurFloat32(silBlur, bw, bh, 5);
+
+  for (let i = 0; i < n; i++) {
+    const p = i * 4;
+    if (oData[p + 3] === 0) continue;
+    const keepOil = Math.max(0, Math.min(1, (0.20 - silBlur[i]) / 0.17));
+    if (keepOil < 0.999) {
+      const inv = 1 - keepOil;
+      oData[p] = Math.round(sData[p] * inv + oData[p] * keepOil);
+      oData[p + 1] = Math.round(sData[p + 1] * inv + oData[p + 1] * keepOil);
+      oData[p + 2] = Math.round(sData[p + 2] * inv + oData[p + 2] * keepOil);
+      oData[p + 3] = Math.round(oData[p + 3] * keepOil);
+    }
+  }
+  oCtx.putImageData(oilImg, 0, 0);
+}
+
 function getOrBuildOilDetailCache() {
   if (STATE.oilDetailCache) return STATE.oilDetailCache;
   if (!STATE.serverImages || !STATE.serverImages.oil_paint_full) return null;
-  const [cw, ch] = STATE.payload.canvas_size;
   const [bx, by, bw, bh] = STATE.payload.full_subject_box || [
     Math.max(0, STATE.payload.offset[0]),
     Math.max(0, STATE.payload.offset[1]),
@@ -985,40 +1059,8 @@ function getOrBuildOilDetailCache() {
   if (bw <= 0 || bh <= 0) return null;
 
   const oilCrop = createCanvas(bw, bh);
-  const oCtx = oilCrop.getContext("2d");
-  oCtx.drawImage(STATE.serverImages.oil_paint_full, bx, by, bw, bh, 0, 0, bw, bh);
-
-  if (STATE.serverImages.subject_cc) {
-    const oilImg = oCtx.getImageData(0, 0, bw, bh);
-    const oData = oilImg.data;
-    const subC = createCanvas(bw, bh);
-    subC.getContext("2d").drawImage(STATE.serverImages.subject_cc, bx, by, bw, bh, 0, 0, bw, bh);
-    const sData = subC.getContext("2d").getImageData(0, 0, bw, bh).data;
-    subC.width = 1; subC.height = 1;
-
-    const n = bw * bh;
-    const outerSil = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      outerSil[i] = oData[i * 4 + 3] < 245 ? 1.0 : 0.0;
-    }
-    let silBlur = boxBlurFloat32(outerSil, bw, bh, 5);
-    silBlur = boxBlurFloat32(silBlur, bw, bh, 5);
-
-    for (let i = 0; i < n; i++) {
-      const p = i * 4;
-      if (oData[p + 3] === 0) continue;
-      // Smoothly inset oil layer slightly from the outer edge and fade both RGB and Alpha!
-      const keepOil = Math.max(0, Math.min(1, (0.20 - silBlur[i]) / 0.17));
-      if (keepOil < 0.999) {
-        const inv = 1 - keepOil;
-        oData[p] = Math.round(sData[p] * inv + oData[p] * keepOil);
-        oData[p + 1] = Math.round(sData[p + 1] * inv + oData[p + 1] * keepOil);
-        oData[p + 2] = Math.round(sData[p + 2] * inv + oData[p + 2] * keepOil);
-        oData[p + 3] = Math.round(oData[p + 3] * keepOil);
-      }
-    }
-    oCtx.putImageData(oilImg, 0, 0);
-  }
+  oilCrop.getContext("2d").drawImage(STATE.serverImages.oil_paint_full, bx, by, bw, bh, 0, 0, bw, bh);
+  applyOilSilhouetteFadeToCrop(oilCrop, bx, by, bw, bh);
 
   const popCanvas = createCanvas(bw, bh);
   const pCtx = popCanvas.getContext("2d");
@@ -1026,13 +1068,12 @@ function getOrBuildOilDetailCache() {
   pCtx.drawImage(oilCrop, 0, 0);
   pCtx.filter = "none";
 
-  if (STATE.serverImages && STATE.serverImages.oil_paint_full) {
-    if (STATE.serverImages.oil_paint_full.tagName === "CANVAS") {
-      STATE.serverImages.oil_paint_full.width = 1;
-      STATE.serverImages.oil_paint_full.height = 1;
-    }
-    STATE.serverImages.oil_paint_full = null;
+  // Free the 20.7 MB full-overscan oil_paint_full canvas now that oilCrop (cropped) is built!
+  if (STATE.serverImages.oil_paint_full.tagName === "CANVAS") {
+    STATE.serverImages.oil_paint_full.width = 1;
+    STATE.serverImages.oil_paint_full.height = 1;
   }
+  STATE.serverImages.oil_paint_full = null;
 
   STATE.oilDetailCache = { bx, by, bw, bh, oilCrop, popCanvas };
   return STATE.oilDetailCache;
@@ -1040,43 +1081,55 @@ function getOrBuildOilDetailCache() {
 
 function rerenderLiveOilLayer(skipComposite = false) {
   const lyr = STATE.layers.oil_paint;
-  if (!lyr || (!STATE.serverImages.oil_paint_full && !STATE.oilDetailCache)) return;
-  const [w, h] = STATE.payload.canvas_size;
-  if (!lyr.baseCanvas) lyr.baseCanvas = createCanvas(w, h);
+  if (!lyr) return;
+  const cache = getOrBuildOilDetailCache();
+  if (!cache) return;
 
   const p = lyr.params;
+  // Memory optimization: when thickness == 0 and detailPop == 0, don't allocate a 20.7 MB baseCanvas!
+  // drawLayerSourceInViewport and drawLayerInOverscanSpaceUntransformed will draw cache.oilCrop at (bx, by) directly!
+  if (p.thickness === 0 && p.detailPop === 0) {
+    if (lyr.baseCanvas) {
+      lyr.baseCanvas.width = 1;
+      lyr.baseCanvas.height = 1;
+      lyr.baseCanvas = null;
+    }
+    if (_stack.id !== "oil_paint") invalidateStack();
+    if (!skipComposite) compositeAllLayers();
+    return;
+  }
+
+  const [w, h] = STATE.payload.canvas_size;
+  if (!lyr.baseCanvas || lyr.baseCanvas.width !== w || lyr.baseCanvas.height !== h) {
+    lyr.baseCanvas = createCanvas(w, h);
+  }
   const ctx = lyr.baseCanvas.getContext("2d");
   ctx.clearRect(0, 0, w, h);
 
-  const cache = getOrBuildOilDetailCache();
-  if (!cache) {
-    ctx.drawImage(STATE.serverImages.oil_paint_full, 0, 0);
-  } else {
-    const { bx, by, oilCrop, popCanvas } = cache;
+  const { bx, by, oilCrop, popCanvas } = cache;
+  ctx.drawImage(oilCrop, bx, by);
+
+  if (p.thickness > 0) {
+    const blurPx = (p.thickness / 100) * 3.5;
+    ctx.save();
+    ctx.globalCompositeOperation = "source-atop";
+    ctx.filter = `blur(${blurPx.toFixed(1)}px) contrast(${100 + p.thickness * 0.25}%)`;
     ctx.drawImage(oilCrop, bx, by);
+    ctx.restore();
+  } else if (p.thickness < 0 && STATE.serverImages.subject_cc) {
+    ctx.save();
+    ctx.globalCompositeOperation = "source-atop";
+    ctx.globalAlpha = Math.abs(p.thickness) / 100;
+    ctx.drawImage(STATE.serverImages.subject_cc, 0, 0);
+    ctx.restore();
+  }
 
-    if (p.thickness > 0) {
-      const blurPx = (p.thickness / 100) * 3.5;
-      ctx.save();
-      ctx.globalCompositeOperation = "source-atop";
-      ctx.filter = `blur(${blurPx.toFixed(1)}px) contrast(${100 + p.thickness * 0.25}%)`;
-      ctx.drawImage(oilCrop, bx, by);
-      ctx.restore();
-    } else if (p.thickness < 0 && STATE.serverImages.subject_cc) {
-      ctx.save();
-      ctx.globalCompositeOperation = "source-atop";
-      ctx.globalAlpha = Math.abs(p.thickness) / 100;
-      ctx.drawImage(STATE.serverImages.subject_cc, 0, 0);
-      ctx.restore();
-    }
-
-    if (p.detailPop > 0) {
-      ctx.save();
-      ctx.globalCompositeOperation = "overlay";
-      ctx.globalAlpha = (p.detailPop / 100) * 0.55;
-      ctx.drawImage(popCanvas, bx, by);
-      ctx.restore();
-    }
+  if (p.detailPop > 0) {
+    ctx.save();
+    ctx.globalCompositeOperation = "overlay";
+    ctx.globalAlpha = (p.detailPop / 100) * 0.55;
+    ctx.drawImage(popCanvas, bx, by);
+    ctx.restore();
   }
 
   if (_stack.id !== "oil_paint") invalidateStack();
@@ -1216,6 +1269,9 @@ function rerenderLiveGlowLayer(skipComposite = false) {
   if (_stack.id !== "glow") invalidateStack();
   if (!skipComposite) compositeAllLayers();
 }
+
+
+
 
 // ============================================================================
 // 8C. CONTOUR SEARCH & OVERSCAN PROCEDURAL BRUSH ENGINE

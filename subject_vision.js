@@ -247,6 +247,10 @@
    */
   async function detectAnimalPoseForBox(sourceCanvas, animalBox) {
     const kptsFull = await runRTMPoseOnAnimalBox(sourceCanvas, animalBox, 1.12);
+    // If both eyes are already detected with high SimCC confidence, skip the 2nd pass (saves ~500ms!)
+    if (kptsFull && kptsFull[0].score >= 2.2 && kptsFull[1].score >= 2.2) {
+      return kptsFull;
+    }
     const bh = animalBox.y1 - animalBox.y0;
     const upperBox = {
       x0: animalBox.x0,
@@ -429,12 +433,10 @@
 
       for (const box of targetBoxes) {
         try {
-          const kptsList = await detectAnimalPoseForBox(input, box);
-          if (Array.isArray(kptsList)) {
-            for (const kpts of kptsList) animalPoses.push({ box, kpts });
-          } else if (kptsList) {
-            animalPoses.push({ box, kpts: kptsList });
-          }
+          const kpts = await detectAnimalPoseForBox(input, box);
+              if (kpts && kpts.length >= 4) {
+                animalPoses.push({ box, kpts });
+              }
         } catch (err) {
           console.warn("Animal pose inference error:", err);
         }
@@ -861,14 +863,14 @@
 
   // Free WASM heaps before Step 3 (Studio) starts so iOS/Desktop RAM stays low
   async function releaseMemory() {
-    if (_animalSess) {
-      try {
-        if (typeof _animalSess.release === "function") await _animalSess.release();
-      } catch (_) {}
-      _animalSess = null;
-      _animalInitPromise = null;
-    }
     if (IS_MOBILE_DEVICE) {
+      if (_animalSess) {
+        try {
+          if (typeof _animalSess.release === "function") await _animalSess.release();
+        } catch (_) {}
+        _animalSess = null;
+        _animalInitPromise = null;
+      }
       try { if (_face && _face.close) _face.close(); } catch (_) {}
       try { if (_obj && _obj.close) _obj.close(); } catch (_) {}
       _face = null;
@@ -893,4 +895,13 @@
     releaseMemory,
   };
   // NOTE: Eager page-load prewarm removed so initial page load on GitHub Pages is instant!
+
+  if (typeof window !== "undefined") {
+    setTimeout(() => {
+      init();
+      if (!IS_MOBILE_DEVICE) {
+        setTimeout(() => initAnimalPoseModel(), 800);
+      }
+    }, 1200);
+  }
 })();

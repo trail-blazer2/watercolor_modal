@@ -222,6 +222,7 @@ function renderLayerListUI() {
   let currentGroup = "";
 
   for (const def of LAYER_DEFINITIONS) {
+    if (def.id === "cool_brush" && !isCarPresetActive()) continue;
     const lyr = STATE.layers[def.id];
     if (!lyr) continue;
 
@@ -383,7 +384,7 @@ function renderSlidersForLayer(lyr) {
   }
 
   if (def.id === "edge_curve") {
-    addSlider(container, "Mask Detail (Coarse ↔ Max Detail)", p.maskDetail, 0, 150, "%", (val) => {
+    addSlider(container, "Mask Detail (Coarse ↔ Max Detail)", p.maskDetail, 0, 200, "%", (val) => {
       p.maskDetail = val;
       scheduleEdgeCurveRerender();
     });
@@ -391,6 +392,47 @@ function renderSlidersForLayer(lyr) {
       p.edgeThickness = val;
       scheduleEdgeCurveRerender();
     });
+  }
+
+  if (def.type === "cool_swoosh") {
+    addSlider(container, "Swoosh Size", p.sizeTrim ?? 100, 50, 160, "%", (val) => {
+      p.sizeTrim = val;
+      scheduleCoolSwooshRerender();
+    });
+    addSlider(container, "Horizontal Offset (Rear ↔ Front)", p.dxTrim ?? 0, -25, 25, "%", (val) => {
+      p.dxTrim = val;
+      scheduleCoolSwooshRerender();
+    });
+    addSlider(container, "Roof Clearance Gap", p.gapTrim ?? 0, -25, 25, "%", (val) => {
+      p.gapTrim = val;
+      scheduleCoolSwooshRerender();
+    });
+    addSlider(container, "Rotation Angle", p.angTrim ?? 0, -25, 25, "°", (val) => {
+      p.angTrim = val;
+      scheduleCoolSwooshRerender();
+    });
+
+    const dirRow = document.createElement("div");
+    dirRow.className = "control-row";
+    const dirBtn = document.createElement("button");
+    const syncDirBtn = () => {
+      const an = typeof analyzeCarSilhouetteAndColorForSwoosh === "function" ? analyzeCarSilhouetteAndColorForSwoosh() : null;
+      const curFacing = p.facingOverride === "LEFT" || p.facingOverride === "RIGHT" ? p.facingOverride : (an ? an.facingAuto : "LEFT");
+      dirBtn.className = "btn btn-sm btn-outline full-width";
+      dirBtn.textContent = `⇄ Facing Direction: ${curFacing} (Click to Flip)`;
+    };
+    syncDirBtn();
+    dirBtn.addEventListener("click", () => {
+      History.paramBegin();
+      const an = typeof analyzeCarSilhouetteAndColorForSwoosh === "function" ? analyzeCarSilhouetteAndColorForSwoosh() : null;
+      const curFacing = p.facingOverride === "LEFT" || p.facingOverride === "RIGHT" ? p.facingOverride : (an ? an.facingAuto : "LEFT");
+      p.facingOverride = curFacing === "LEFT" ? "RIGHT" : "LEFT";
+      syncDirBtn();
+      scheduleCoolSwooshRerender();
+      History.paramCommit();
+    });
+    dirRow.appendChild(dirBtn);
+    container.appendChild(dirRow);
   }
 
   // Brightness, Contrast, and Saturation are hidden for the Glow layer
@@ -413,6 +455,52 @@ function renderSlidersForLayer(lyr) {
 }
 
 function addSubjectOverlayAndWindowControls(container, def, p) {
+  const showUpscaleToggle = !!(STATE.upscaleData && STATE.upscaleData.upscaledImg);
+  if (showUpscaleToggle) {
+    const upRow = document.createElement("div");
+    upRow.className = "control-row";
+    const upLbl = document.createElement("label");
+    upLbl.innerHTML = `<span>AI Subject Super-Resolution (${STATE.upscaleData.width}×${STATE.upscaleData.height})</span>`;
+    upRow.appendChild(upLbl);
+
+    const upBtn = document.createElement("button");
+    const syncUpBtn = () => {
+      const isOn = STATE.upscaleEnabled !== false;
+      p.upscaleEnabled = isOn;
+      upBtn.className = isOn ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+      upBtn.textContent = isOn
+        ? "✨ AI Upscale Quality (2x): ON"
+        : "✨ AI Upscale Quality (2x): OFF (Original)";
+    };
+    syncUpBtn();
+
+    upBtn.addEventListener("click", async () => {
+      upBtn.disabled = true;
+      STATE.upscaleEnabled = !(STATE.upscaleEnabled !== false);
+      syncUpBtn();
+      try {
+        if (window.Workflow && typeof Workflow.syncActiveResolutionAndWheelCanvases === "function") {
+          Workflow.syncActiveResolutionAndWheelCanvases();
+          if (STATE.presetCache) STATE.presetCache.clear();
+          // Always generate from the Turned base first so STATE.wheelSubjectPatches builds both turned & unturned at the new resolution!
+          const userWantedWheelOn = STATE.wheelTurnEnabled !== false;
+          if (STATE.turnedFramedPhotoCanvas && STATE.turnedFramedMaskCanvas) {
+            STATE.framedPhotoCanvas = STATE.turnedFramedPhotoCanvas;
+            STATE.framedMaskCanvas = STATE.turnedFramedMaskCanvas;
+            STATE.wheelTurnEnabled = true;
+          }
+          await runModalGeneration(Boolean(STATE.maskEditedByUser), true, true);
+          if (!userWantedWheelOn && typeof window.toggleSteeredWheelInStudio === "function") {
+            await window.toggleSteeredWheelInStudio(false);
+          }
+        }
+      } finally {
+        upBtn.disabled = false;
+      }
+    });
+    upRow.appendChild(upBtn);
+    container.appendChild(upRow);
+  }
   const showEyeToggle =
     (typeof isAnimalPresetOrPhoto === "function" && isAnimalPresetOrPhoto()) ||
     (Array.isArray(STATE.eyeBeautifierPatches) && STATE.eyeBeautifierPatches.length > 0);
@@ -444,7 +532,48 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
     });
     eyeRow.appendChild(eyeBtn);
     container.appendChild(eyeRow);
-  }  const hasWcTex = !!(STATE.serverImages && (STATE.serverImages.subject_tex || STATE.serverImages.edge_curve));
+  }
+
+
+  
+  const showWheelToggle =
+    isCarPresetActive() &&
+    !!(STATE.wheelTurnData && STATE.wheelTurnData.turned && STATE.turnedFramedPhotoCanvas);
+
+  if (showWheelToggle) {
+    const wheelRow = document.createElement("div");
+    wheelRow.className = "control-row";
+    const dirTxt = STATE.wheelTurnData.turn === "right" ? "Right" : "Left";
+    const wheelLbl = document.createElement("label");
+    wheelLbl.innerHTML = `<span>3D Front Wheel Steering (${dirTxt} ${Math.round(STATE.wheelTurnData.angle || 25)}°)</span>`;
+    wheelRow.appendChild(wheelLbl);
+
+    const wheelBtn = document.createElement("button");
+    const syncWheelBtn = () => {
+      const isOn = STATE.wheelTurnEnabled !== false;
+      p.wheelTurned = isOn;
+      wheelBtn.className = isOn ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+      wheelBtn.textContent = isOn
+        ? "🛞 Turned Front Wheel: ON"
+        : "🛞 Turned Front Wheel: OFF (Original)";
+    };
+    syncWheelBtn();
+
+    wheelBtn.addEventListener("click", async () => {
+      wheelBtn.disabled = true;
+      const nextState = !(STATE.wheelTurnEnabled !== false);
+      try {
+        await window.toggleSteeredWheelInStudio(nextState);
+        syncWheelBtn();
+      } finally {
+        wheelBtn.disabled = false;
+      }
+    });
+    wheelRow.appendChild(wheelBtn);
+    container.appendChild(wheelRow);
+  }
+  
+  const hasWcTex = !!(STATE.serverImages && (STATE.serverImages.subject_tex || STATE.serverImages.edge_curve));
 
   if (hasWcTex) {
     const wcRow = document.createElement("div");
@@ -755,6 +884,8 @@ function resetLayerToOriginal(layerId) {
     rerenderLiveOilLayer(true);
   } else if (layerId === "subject" && STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
     rerenderLiveEdgeCurveLayer(true);
+  } else if (layerId === "cool_brush" && lyr.vis) {
+    rerenderCoolSwooshLayer(true);
   }
 
   renderSlidersForLayer(lyr);

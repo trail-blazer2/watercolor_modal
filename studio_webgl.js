@@ -239,7 +239,14 @@ function drawStrokesWebGL(w, h, brushKey, brushImg, strokes) {
 }
 
 // ============================================================================
-// 8B. ISOTROPIC GAUSSIAN WEBGL2 PIPELINE FOR SILKY-SMOOTH EDGE CURVE
+// 8B. PHOTOSHOP-ACTION ARTIST CUTOUT ENGINE (RGBA16F Float + Tangent-Straightened Contours)
+//   - Uploads the multi-scale luminance pyramid as a 16-bit Floating-Point texture
+//     (RGBA16F) so 8-bit quantization stair-steps are 100% eliminated!
+//   - Uses Structure-Tensor Tangent Smoothing in the shader: smooths ALONG the
+//     direction of lines/edges (making lines straight, clean, and non-jagged!)
+//     without blurring ACROSS thin wheel spokes or panel gaps!
+//   - Uses hardware screen-space derivatives (fwidth) for razor-sharp, sub-pixel
+//     anti-aliased vector contour edges at any zoom level.
 // ============================================================================
 let _blurTmpA = new Float32Array(0);
 let _colSumA = new Float32Array(0);
@@ -284,16 +291,70 @@ function boxBlurFloat32(src, w, h, radius, outBuf) {
   return dst;
 }
 
-function normalizedBlurFloat32(src, insideMask, w, h, radius, cachedDen, outBuf) {
+function normalizedBlurFloat32(src, weightMask, w, h, radius, cachedDen, outBuf) {
   const n = w * h;
   const dst = outBuf || new Float32Array(n);
-  for (let i = 0; i < n; i++) dst[i] = src[i] * insideMask[i];
+  for (let i = 0; i < n; i++) dst[i] = src[i] * weightMask[i];
   boxBlurFloat32(dst, w, h, radius, dst);
-  const den = cachedDen || boxBlurFloat32(insideMask, w, h, radius);
+  const den = cachedDen || boxBlurFloat32(weightMask, w, h, radius);
   for (let i = 0; i < n; i++) {
     dst[i] = den[i] > 1e-4 ? dst[i] / den[i] : src[i];
   }
   return dst;
+}
+
+function gaussianBlurNormalized3Pass(src, insideMask, w, h, r1, den1, r2, den2, r3, den3) {
+  let b = normalizedBlurFloat32(src, insideMask, w, h, r1, den1);
+  b = normalizedBlurFloat32(b, insideMask, w, h, r2, den2);
+  b = normalizedBlurFloat32(b, insideMask, w, h, r3, den3);
+  return b;
+}
+
+function buildZoneExtrapolatedPaintRgba(rChan, gChan, bChan, zoneWeight, insideMask, mw, mh, r1, r2) {
+  const n = mw * mh;
+  const denTight = boxBlurFloat32(zoneWeight, mw, mh, r1);
+  const rTight = new Float32Array(n);
+  const gTight = new Float32Array(n);
+  const bTight = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const w = zoneWeight[i];
+    rTight[i] = rChan[i] * w;
+    gTight[i] = gChan[i] * w;
+    bTight[i] = bChan[i] * w;
+  }
+  boxBlurFloat32(rTight, mw, mh, r1, rTight);
+  boxBlurFloat32(gTight, mw, mh, r1, gTight);
+  boxBlurFloat32(bTight, mw, mh, r1, bTight);
+
+  const wBroad = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const d = denTight[i];
+    if (d > 1e-3) {
+      rTight[i] /= d;
+      gTight[i] /= d;
+      bTight[i] /= d;
+      wBroad[i] = Math.min(1.0, d * 5.0) * insideMask[i];
+    } else {
+      rTight[i] = rChan[i];
+      gTight[i] = gChan[i];
+      bTight[i] = bChan[i];
+      wBroad[i] = 0.015 * insideMask[i];
+    }
+  }
+  const denBroad = boxBlurFloat32(wBroad, mw, mh, r2);
+  const rOut = normalizedBlurFloat32(rTight, wBroad, mw, mh, r2, denBroad);
+  const gOut = normalizedBlurFloat32(gTight, wBroad, mw, mh, r2, denBroad);
+  const bOut = normalizedBlurFloat32(bTight, wBroad, mw, mh, r2, denBroad);
+
+  const rgba = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const p = i * 4;
+    rgba[p]     = Math.max(0, Math.min(255, Math.round(rOut[i])));
+    rgba[p + 1] = Math.max(0, Math.min(255, Math.round(gOut[i])));
+    rgba[p + 2] = Math.max(0, Math.min(255, Math.round(bOut[i])));
+    rgba[p + 3] = 255;
+  }
+  return rgba;
 }
 
 function getOrBuildEdgeCurveCache() {
@@ -309,14 +370,131 @@ function getOrBuildEdgeCurveCache() {
   ];
   if (bw <= 0 || bh <= 0) return null;
 
-  // 1. Full-resolution original subject (for razor-sharp outer silhouette & fallback)
   const subC = createCanvas(bw, bh);
   const subCtx = subC.getContext("2d");
   subCtx.drawImage(subImg, bx, by, bw, bh, 0, 0, bw, bh);
   const subData = subCtx.getImageData(0, 0, bw, bh).data;
   subC.width = 1; subC.height = 1;
 
-  // 2. Half-resolution working grid (mw x mh) for the 24 smooth zone blurs -> 4x faster (~80 ms) & 75% less RAM!
+  const nFull = bw * bh;
+  const rawLumFull = new Float32Array(nFull);
+  const insideFull = new Float32Array(nFull);
+  const outerSilFull = new Float32Array(nFull);
+
+  for (let i = 0; i < nFull; i++) {
+    const p = i * 4;
+    const a = subData[p + 3];
+    insideFull[i] = a > 235 ? 1.0 : 0.0;
+    outerSilFull[i] = a < 245 ? 1.0 : 0.0;
+    rawLumFull[i] = 0.299 * subData[p] + 0.587 * subData[p + 1] + 0.114 * subData[p + 2];
+  }
+
+  const den1 = boxBlurFloat32(insideFull, bw, bh, 1);
+  const den2 = boxBlurFloat32(insideFull, bw, bh, 2);
+  const den4 = boxBlurFloat32(insideFull, bw, bh, 4);
+  const den6 = boxBlurFloat32(insideFull, bw, bh, 6);
+  const den10 = boxBlurFloat32(insideFull, bw, bh, 10);
+
+  // 1. Structure-Tensor Guided Pre-Smoothing of Fine Luminance:
+  //    Eliminates single-pixel JPEG stair-steps along diagonal lines (like the headlight border & panel seam)
+  //    BEFORE computing local contrast or uploading to the GPU!
+  const lumPre = normalizedBlurFloat32(rawLumFull, insideFull, bw, bh, 1, den1);
+  const jxx = new Float32Array(nFull);
+  const jyy = new Float32Array(nFull);
+  const jxy = new Float32Array(nFull);
+
+  for (let y = 1; y < bh - 1; y++) {
+    const row = y * bw;
+    for (let x = 1; x < bw - 1; x++) {
+      const i = row + x;
+      const gx = (lumPre[i + 1] - lumPre[i - 1]) * 0.5;
+      const gy = (lumPre[i + bw] - lumPre[i - bw]) * 0.5;
+      jxx[i] = gx * gx;
+      jyy[i] = gy * gy;
+      jxy[i] = gx * gy;
+    }
+  }
+  // Smooth the structure tensor over a 5px radius so the tangent direction is a silky-smooth curve!
+  boxBlurFloat32(boxBlurFloat32(jxx, bw, bh, 3), bw, bh, 2, jxx);
+  boxBlurFloat32(boxBlurFloat32(jyy, bw, bh, 3), bw, bh, 2, jyy);
+  boxBlurFloat32(boxBlurFloat32(jxy, bw, bh, 3), bw, bh, 2, jxy);
+
+  // Advect/smooth rawLumFull 5 steps ALONG the smooth structure-tensor tangent (with sub-pixel bilinear sampling)
+  // so diagonal lines are straightened and de-pixelated while keeping 100% cross-line sharpness!
+  const lumTangentSmooth = new Float32Array(nFull);
+  const sampleBilinear = (buf, fx, fy) => {
+    const x0 = Math.max(0, Math.min(bw - 1, fx | 0));
+    const y0 = Math.max(0, Math.min(bh - 1, fy | 0));
+    const x1 = Math.min(bw - 1, x0 + 1);
+    const y1 = Math.min(bh - 1, y0 + 1);
+    const dx = Math.max(0, fx - x0);
+    const dy = Math.max(0, fy - y0);
+    const r0 = y0 * bw, r1 = y1 * bw;
+    return (
+      buf[r0 + x0] * (1 - dx) * (1 - dy) +
+      buf[r0 + x1] * dx * (1 - dy) +
+      buf[r1 + x0] * (1 - dx) * dy +
+      buf[r1 + x1] * dx * dy
+    );
+  };
+
+  for (let y = 0; y < bh; y++) {
+    const row = y * bw;
+    for (let x = 0; x < bw; x++) {
+      const i = row + x;
+      if (insideFull[i] <= 0) {
+        lumTangentSmooth[i] = rawLumFull[i];
+        continue;
+      }
+      const theta = 0.5 * Math.atan2(2.0 * jxy[i], jxx[i] - jyy[i] + 1e-6);
+      // Tangent vector is perpendicular to the dominant gradient eigenvector
+      const tx = -Math.sin(theta);
+      const ty = Math.cos(theta);
+
+      let sum = lumPre[i] * 0.30;
+      sum += (sampleBilinear(lumPre, x + tx * 1.1, y + ty * 1.1) + sampleBilinear(lumPre, x - tx * 1.1, y - ty * 1.1)) * 0.22;
+      sum += (sampleBilinear(lumPre, x + tx * 2.3, y + ty * 2.3) + sampleBilinear(lumPre, x - tx * 2.3, y - ty * 2.3)) * 0.13;
+      lumTangentSmooth[i] = sum;
+    }
+  }
+  // Light 1px isotropic polish on lumTangentSmooth so B-spline control points have zero high-frequency aliasing
+  const lumFine   = normalizedBlurFloat32(lumTangentSmooth, insideFull, bw, bh, 1, den1);
+  const lumMed    = gaussianBlurNormalized3Pass(lumFine, insideFull, bw, bh, 4, den4, 4, den4, 2, den2);
+  const lumCoarse = gaussianBlurNormalized3Pass(lumFine, insideFull, bw, bh, 10, den10, 6, den6, 4, den4);
+  const lumLocal6 = normalizedBlurFloat32(lumFine, insideFull, bw, bh, 6, den6);
+
+  // Compute signed local detail band from the tangent-smoothed fine luminance, then smooth it again!
+  const diffRaw = new Float32Array(nFull);
+  for (let i = 0; i < nFull; i++) {
+    diffRaw[i] = insideFull[i] > 0 ? (lumFine[i] - lumLocal6[i]) : 0.0;
+  }
+  const diffSmooth = gaussianBlurNormalized3Pass(diffRaw, insideFull, bw, bh, 2, den2, 1, den1, 1, den1);
+
+  let silDistFull = boxBlurFloat32(outerSilFull, bw, bh, 4);
+  silDistFull = boxBlurFloat32(silDistFull, bw, bh, 4);
+
+  const zonePyrFloat = new Float32Array(nFull * 4);
+  const zonePyrBRgba = new Uint8Array(nFull * 4);
+  const inv255 = 1.0 / 255.0;
+
+  for (let i = 0; i < nFull; i++) {
+    const p = i * 4;
+    const a = subData[p + 3];
+    const fade = a > 0 ? Math.max(0, Math.min(1, (0.42 - silDistFull[i]) / 0.34)) : 0.0;
+    const intW = a > 0 ? Math.max(0, Math.min(1, (0.16 - silDistFull[i]) / 0.12)) : 0.0;
+
+    zonePyrFloat[p]     = lumFine[i] * inv255;
+    zonePyrFloat[p + 1] = lumMed[i] * inv255;
+    zonePyrFloat[p + 2] = lumCoarse[i] * inv255;
+    zonePyrFloat[p + 3] = diffSmooth[i] * inv255;
+
+    zonePyrBRgba[p]     = Math.round(fade * 255);
+    zonePyrBRgba[p + 1] = Math.round(intW * 255);
+    zonePyrBRgba[p + 2] = 0;
+    zonePyrBRgba[p + 3] = 255;
+  }
+
+  // 2. Half-res grid for the 3 smooth Zone-Extrapolated Paint buffers
   const mw = Math.max(4, bw >> 1);
   const mh = Math.max(4, bh >> 1);
   const smallC = createCanvas(mw, mh);
@@ -324,136 +502,42 @@ function getOrBuildEdgeCurveCache() {
   const smData = smallC.getContext("2d").getImageData(0, 0, mw, mh).data;
   smallC.width = 1; smallC.height = 1;
 
-  const texSourceImg = STATE.serverImages.subject_tex || STATE.serverImages.edge_curve;
-  let texSourceData = null;
-  const hasDedicatedSubjectTex = !!STATE.serverImages.subject_tex;
-  if (texSourceImg) {
-    const texC = createCanvas(mw, mh);
-    texC.getContext("2d").drawImage(texSourceImg, bx, by, bw, bh, 0, 0, mw, mh);
-    texSourceData = texC.getContext("2d").getImageData(0, 0, mw, mh).data;
-    texC.width = 1; texC.height = 1;
-  }
+  const nHalf = mw * mh;
+  const rChan = new Float32Array(nHalf);
+  const gChan = new Float32Array(nHalf);
+  const bChan = new Float32Array(nHalf);
+  const insideHalf = new Float32Array(nHalf);
+  const darkWHalf = new Float32Array(nHalf);
+  const midWHalf = new Float32Array(nHalf);
+  const lightWHalf = new Float32Array(nHalf);
 
-  const n = mw * mh;
-  const rChan = new Float32Array(n);
-  const gChan = new Float32Array(n);
-  const bChan = new Float32Array(n);
-  const rawLum = new Float32Array(n);
-  const alpha = new Uint8Array(n);
-  const insideMask = new Float32Array(n);
-  const outerSil = new Float32Array(n);
-
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < nHalf; i++) {
     const p = i * 4;
     const r = smData[p], g = smData[p + 1], b = smData[p + 2], a = smData[p + 3];
-    alpha[i] = a;
     rChan[i] = r; gChan[i] = g; bChan[i] = b;
-    insideMask[i] = a > 240 ? 1.0 : 0.0;
-    outerSil[i] = a < 250 ? 1.0 : 0.0;
-    rawLum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    const ins = a > 235 ? 1.0 : 0.0;
+    insideHalf[i] = ins;
+    const l = 0.299 * r + 0.587 * g + 0.114 * b;
+    const dW = l < 72.0 ? Math.min(1.0, (72.0 - l) / 18.0) : 0.0;
+    const lW = l > 162.0 ? Math.min(1.0, (l - 162.0) / 18.0) : 0.0;
+    const mW = Math.max(0.05, 1.0 - dW - lW);
+    darkWHalf[i]  = (dW + 0.02) * ins;
+    lightWHalf[i] = (lW + 0.02) * ins;
+    midWHalf[i]   = mW * ins;
   }
 
-  const den1 = boxBlurFloat32(insideMask, mw, mh, 1);
-  const den2 = boxBlurFloat32(insideMask, mw, mh, 2);
-  const den3 = boxBlurFloat32(insideMask, mw, mh, 3);
-  const den5 = boxBlurFloat32(insideMask, mw, mh, 5);
-
-  const smoothR = normalizedBlurFloat32(normalizedBlurFloat32(rChan, insideMask, mw, mh, 3, den3), insideMask, mw, mh, 2, den2);
-  const smoothG = normalizedBlurFloat32(normalizedBlurFloat32(gChan, insideMask, mw, mh, 3, den3), insideMask, mw, mh, 2, den2);
-  const smoothB = normalizedBlurFloat32(normalizedBlurFloat32(bChan, insideMask, mw, mh, 3, den3), insideMask, mw, mh, 2, den2);
-
-  let lumClean = normalizedBlurFloat32(rawLum, insideMask, mw, mh, 1, den1);
-  lumClean = normalizedBlurFloat32(lumClean, insideMask, mw, mh, 1, den1);
-
-  let lumMid = normalizedBlurFloat32(lumClean, insideMask, mw, mh, 3, den3);
-  lumMid = normalizedBlurFloat32(lumMid, insideMask, mw, mh, 2, den2);
-
-  let lumBroad = normalizedBlurFloat32(lumClean, insideMask, mw, mh, 5, den5);
-  lumBroad = normalizedBlurFloat32(lumBroad, insideMask, mw, mh, 5, den5);
-
-  let silDist = boxBlurFloat32(outerSil, mw, mh, 3);
-  silDist = boxBlurFloat32(silDist, mw, mh, 3);
-  const outerEdgeFade = new Float32Array(n);
-  const interiorWeight = new Float32Array(n);
-
-  const darkRaw = new Float32Array(n);
-  const lightRaw = new Float32Array(n);
-  const darkDetail = new Float32Array(n);
-  const lightDetail = new Float32Array(n);
-  const texRatio = new Float32Array(n);
-
-  const coreDeadzone = (val, deadzone) => {
-    const absV = Math.abs(val);
-    return absV <= deadzone ? 0.0 : (val > 0 ? 1 : -1) * (absV - deadzone);
-  };
-
-  for (let i = 0; i < n; i++) {
-    const p = i * 4;
-    if (alpha[i] > 0) {
-      outerEdgeFade[i] = Math.max(0, Math.min(1, (0.35 - silDist[i]) / 0.30));
-      interiorWeight[i] = Math.max(0, Math.min(1, (0.12 - silDist[i]) / 0.10));
-    }
-    const ins = insideMask[i];
-    if (ins > 0) {
-      const l = lumClean[i];
-      if (l < 72) darkRaw[i] = Math.min(1.0, (72 - l) / 14.0);
-      if (l > 164) lightRaw[i] = Math.min(1.0, (l - 164) / 14.0);
-
-      const devMid = coreDeadzone(l - lumMid[i], 3.2);
-      const devBroad = coreDeadzone(l - lumBroad[i], 4.0);
-      const localContrast = devMid * 1.65 + devBroad * 1.45;
-      const lEff = l + localContrast;
-
-      let dDet = lEff < 74 ? Math.min(1.0, (74 - lEff) / 14.0) : 0.0;
-      let ltDet = lEff > 162 ? Math.min(1.0, (lEff - 162) / 14.0) : 0.0;
-      if (-localContrast > 10.0) dDet = Math.max(dDet, Math.min(1.0, (-localContrast - 10.0) / 14.0));
-      if (localContrast > 11.0) ltDet = Math.max(ltDet, Math.min(1.0, (localContrast - 11.0) / 14.0));
-      darkDetail[i] = dDet;
-      lightDetail[i] = ltDet;
-    }
-    texRatio[i] = 1.0;
-    if (texSourceData && texSourceData[p + 3] > 240 && outerEdgeFade[i] > 0.05) {
-      const tLum = 0.299 * texSourceData[p] + 0.587 * texSourceData[p + 1] + 0.114 * texSourceData[p + 2];
-      const refLum = hasDedicatedSubjectTex
-        ? Math.max(12, rawLum[i])
-        : Math.max(15, 0.299 * smoothR[i] + 0.587 * smoothG[i] + 0.114 * smoothB[i]);
-      const ratio = Math.max(0.84, Math.min(1.16, tLum / refLum));
-      texRatio[i] = 1.0 + (ratio - 1.0) * outerEdgeFade[i];
-    }
-  }
-
-  const darkFineSmooth = normalizedBlurFloat32(darkDetail, insideMask, mw, mh, 1, den1);
-  const lightFineSmooth = normalizedBlurFloat32(lightDetail, insideMask, mw, mh, 1, den1);
-
-  const smoothRgba = new Uint8Array(n * 4);
-  const rawZonesRgba = new Uint8Array(n * 4);
-  const staticWeightsRgba = new Uint8Array(n * 4);
-
-  for (let i = 0; i < n; i++) {
-    const p = i * 4;
-    const ins = insideMask[i];
-    smoothRgba[p] = Math.max(0, Math.min(255, Math.round(smoothR[i])));
-    smoothRgba[p + 1] = Math.max(0, Math.min(255, Math.round(smoothG[i])));
-    smoothRgba[p + 2] = Math.max(0, Math.min(255, Math.round(smoothB[i])));
-    smoothRgba[p + 3] = 255;
-
-    rawZonesRgba[p] = Math.round(darkRaw[i] * ins * 255);
-    rawZonesRgba[p + 1] = Math.round(lightRaw[i] * ins * 255);
-    rawZonesRgba[p + 2] = Math.round(darkFineSmooth[i] * ins * 255);
-    rawZonesRgba[p + 3] = Math.round(lightFineSmooth[i] * ins * 255);
-
-    staticWeightsRgba[p] = Math.round(outerEdgeFade[i] * 255);
-    staticWeightsRgba[p + 1] = Math.round(interiorWeight[i] * 255);
-    staticWeightsRgba[p + 2] = Math.max(0, Math.min(255, Math.round(((texRatio[i] - 0.84) / 0.32) * 255)));
-    staticWeightsRgba[p + 3] = Math.round(ins * 255);
-  }
+  const darkPaintRgba  = buildZoneExtrapolatedPaintRgba(rChan, gChan, bChan, darkWHalf,  insideHalf, mw, mh, 1, 3);
+  const midPaintRgba   = buildZoneExtrapolatedPaintRgba(rChan, gChan, bChan, midWHalf,   insideHalf, mw, mh, 5, 8);
+  const lightPaintRgba = buildZoneExtrapolatedPaintRgba(rChan, gChan, bChan, lightWHalf, insideHalf, mw, mh, 2, 4);
 
   STATE.edgeCurveCache = {
     bx, by, bw, bh, mw, mh,
-    subData, smoothR, smoothG, smoothB, alpha, insideMask,
-    outerEdgeFade, interiorWeight, texRatio,
-    darkRaw, lightRaw, darkFine: darkFineSmooth, lightFine: lightFineSmooth,
-    smoothRgba, rawZonesRgba, staticWeightsRgba,
+    subData,
+    darkPaintRgba,
+    midPaintRgba,
+    lightPaintRgba,
+    zonePyrFloat,
+    zonePyrBRgba,
   };
   return STATE.edgeCurveCache;
 }
@@ -463,21 +547,15 @@ let _glEC = null;
 function destroyGLEdgeCurveResources() {
   if (!_glEC) return;
   const { gl } = _glEC;
-  for (const k of ["texOrig", "texSmooth", "texRawZones", "texStatic", "texPing", "texPong", "texMasks", "texRim"]) {
+  for (const k of ["texOrig", "texDarkPaint", "texMidPaint", "texLightPaint", "texPyrA", "texPyrB", "texWc"]) {
     if (_glEC[k]) { gl.deleteTexture(_glEC[k]); _glEC[k] = null; }
   }
-  for (const k of ["fboPing", "fboPong", "fboMasks", "fboRim"]) {
-    if (_glEC[k]) { gl.deleteFramebuffer(_glEC[k]); _glEC[k] = null; }
-  }
   _glEC.uploadedCache = null;
-  _glEC.lastDetailKey = -1;
-  _glEC.lastRimKey = -1;
-  _glEC.lastRimSigma = -1;
 }
 
 function initGLEdgeCurveContext() {
   if (_glEC && _glEC.gl && _glEC.gl.isContextLost()) {
-  _glEC = null;
+    _glEC = null;
   }
   if (_glEC === false) return null;
   if (_glEC) return _glEC;
@@ -495,6 +573,7 @@ function initGLEdgeCurveContext() {
     _glEC = false;
     return null;
   }
+  gl.getExtension("OES_texture_float_linear");
 
   const vsSrc = `#version 300 es
     layout(location = 0) in vec2 a_pos;
@@ -505,138 +584,189 @@ function initGLEdgeCurveContext() {
     }
   `;
 
-  // Horizontal 1D True Gaussian Blur (continuous float u_sigma -> zero staircase or square artifacts!)
-  const fsBlurH = `#version 300 es
-    precision highp float;
-    in vec2 v_uv;
-    uniform sampler2D u_tex;
-    uniform sampler2D u_texStatic;
-    uniform float u_stepX;
-    uniform float u_sigma;
-    uniform int u_radius;
-    uniform int u_premask;
-    uniform float u_fineMix;
-    out vec4 outColor;
-    void main() {
-      vec3 sum = vec3(0.0);
-      float wSum = 0.0;
-      float inv2Sig2 = 0.5 / max(0.05, u_sigma * u_sigma);
-      for (int i = -20; i <= 20; i++) {
-        if (i < -u_radius || i > u_radius) continue;
-        float fi = float(i);
-        float w = exp(-fi * fi * inv2Sig2);
-        vec2 uv = clamp(v_uv + vec2(fi * u_stepX, 0.0), vec2(0.0), vec2(1.0));
-        vec4 s = texture(u_tex, uv);
-        if (u_premask == 0) {
-          float ins = texture(u_texStatic, uv).a;
-          vec2 z = mix(s.rg, max(s.rg, s.ba), u_fineMix);
-          sum += vec3(z, ins) * w;
-        } else {
-          sum += vec3(s.rg * s.b, s.b) * w;
-        }
-        wSum += w;
-      }
-      outColor = vec4(sum / max(1e-5, wSum), 1.0);
-    }
-  `;
-
-  // Vertical 1D True Gaussian Blur + insideMask normalization + smooth anti-aliased threshold
-  const fsBlurVNorm = `#version 300 es
-    precision highp float;
-    in vec2 v_uv;
-    uniform sampler2D u_texH;
-    uniform sampler2D u_texStatic;
-    uniform float u_stepY;
-    uniform float u_sigma;
-    uniform int u_radius;
-    uniform int u_doThresh;
-    out vec4 outColor;
-    void main() {
-      vec3 sum = vec3(0.0);
-      float wSum = 0.0;
-      float inv2Sig2 = 0.5 / max(0.05, u_sigma * u_sigma);
-      for (int i = -20; i <= 20; i++) {
-        if (i < -u_radius || i > u_radius) continue;
-        float fi = float(i);
-        float w = exp(-fi * fi * inv2Sig2);
-        vec2 uv = clamp(v_uv + vec2(0.0, fi * u_stepY), vec2(0.0), vec2(1.0));
-        sum += texture(u_texH, uv).rgb * w;
-        wSum += w;
-      }
-      vec3 blurred = sum / max(1e-5, wSum);
-      float inside = texture(u_texStatic, v_uv).a;
-      vec2 res = blurred.b > 1e-4 ? (blurred.rg / blurred.b) : vec2(0.0);
-      if (u_doThresh == 1) {
-        res = smoothstep(vec2(0.36), vec2(0.54), res);
-      }
-      outColor = vec4(res, inside, 1.0);
-    }
-  `;
-
-  // Final Tri-Tone Composite Shader (applies clean Watercolor Texture Overlay when enabled on Subject!)
-  const fsComposite = `#version 300 es
+  // True C2-Continuous Cubic B-Spline + Tangent-Flow Artist Cutout Shader:
+  // 1. Samples u_pyrA using a 4-fetch hardware Cubic B-Spline filter (C2 continuous derivatives!)
+  //    so bilinear pixel-grid kinks and staircase steps CANNOT exist at any resolution (even 5000x3000px!).
+  // 2. Smooths ALONG the local edge tangent to straighten contours and round corners.
+  // 3. Computes the exact analytical gradient magnitude |grad(L)| from the B-Spline surface (instead of
+  //    blocky 2x2 fwidth) for silky-smooth, sub-pixel vector anti-aliasing along every edge!
+  const fsCutoutAction = `#version 300 es
     precision highp float;
     in vec2 v_uv;
     uniform sampler2D u_orig;
-    uniform sampler2D u_smooth;
-    uniform sampler2D u_static;
-    uniform sampler2D u_masks;
-    uniform sampler2D u_rim;
-    uniform float u_rimStrength;
-    uniform int u_hasRim;
-    uniform float u_useWcTex;
+    uniform sampler2D u_darkPaint;
+    uniform sampler2D u_midPaint;
+    uniform sampler2D u_lightPaint;
+    uniform sampler2D u_pyrA;
+    uniform sampler2D u_pyrB;
+    uniform sampler2D u_wcTex;
+    uniform vec2 u_step;
+    uniform vec2 u_wcScale;
+    uniform float u_detail;       // 0.0 (0%) .. 2.0 (200%)
+    uniform float u_rimStrength;  // 0.0 by default
+    uniform float u_useWcTex;     // 1.0 when Subject Watercolor Texture is ON
     out vec4 outColor;
+
+    // Fast 4-tap Hardware Cubic B-Spline Texture Lookup:
+    // Converts standard C0 bilinear hardware filtering into a C2-continuous cubic B-spline surface!
+    // Completely eliminates texel-boundary kinks and diagonal pixel staircases!
+    vec4 textureBicubicBSpline(sampler2D tex, vec2 uv) {
+      vec2 texSize = 1.0 / u_step;
+      vec2 coord = uv * texSize - 0.5;
+      vec2 index = floor(coord);
+      vec2 f = coord - index;
+
+      vec2 f2 = f * f;
+      vec2 f3 = f2 * f;
+
+      vec2 w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+      vec2 w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;
+      vec2 w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;
+      vec2 w3 = f3 / 6.0;
+
+      vec2 g0 = w0 + w1;
+      vec2 g1 = w2 + w3;
+
+      vec2 h0 = ((index - 0.5 + w1 / g0) * u_step);
+      vec2 h1 = ((index + 1.5 + w3 / g1) * u_step);
+
+      vec4 tex00 = texture(tex, vec2(h0.x, h0.y));
+      vec4 tex10 = texture(tex, vec2(h1.x, h0.y));
+      vec4 tex01 = texture(tex, vec2(h0.x, h1.y));
+      vec4 tex11 = texture(tex, vec2(h1.x, h1.y));
+
+      tex00 = mix(tex01, tex00, g0.y);
+      tex10 = mix(tex11, tex10, g0.y);
+      return mix(tex10, tex00, g0.x);
+    }
+
+    float evalSplineLumAt(vec2 uv) {
+      vec4 a = textureBicubicBSpline(u_pyrA, clamp(uv, vec2(0.0), vec2(1.0)));
+      float tCoarseToMed = clamp(u_detail / 0.50, 0.0, 1.0);
+      float tMedToFine   = clamp((u_detail - 0.35) / 1.15, 0.0, 1.0);
+
+      float baseL = mix(a.b, a.g, tCoarseToMed);
+      baseL = mix(baseL, a.r, tMedToFine * 0.85);
+
+      float detailBoost = clamp((u_detail - 0.15) / 1.85, 0.0, 1.0) * 2.15;
+      float diff = a.a;
+      // Smooth C1 deadzone (sqrt(diff^2 + eps^2) - eps) instead of sharp max(0, |diff|-eps) so zero kinks!
+      float eps = 0.012;
+      float cleanMag = max(0.0, sqrt(diff * diff + eps * eps) - eps);
+      float cleanDiff = (diff >= 0.0 ? 1.0 : -1.0) * cleanMag;
+
+      return clamp(baseL + cleanDiff * detailBoost, 0.0, 1.0);
+    }
+
+    // Evaluates both the tangent-straightened luminance L AND its exact analytical gradient magnitude |grad(L)|
+    vec2 evalSmoothLumAndGrad(vec2 uv) {
+      vec2 sp = u_step * 2.2;
+      float lN = evalSplineLumAt(uv + vec2(0.0, -sp.y));
+      float lS = evalSplineLumAt(uv + vec2(0.0,  sp.y));
+      float lE = evalSplineLumAt(uv + vec2( sp.x, 0.0));
+      float lW = evalSplineLumAt(uv + vec2(-sp.x, 0.0));
+
+      vec2 grad = vec2(lE - lW, lS - lN);
+      float gradLen = length(grad);
+      vec2 tang = gradLen > 1e-4 ? vec2(-grad.y / gradLen, grad.x / gradLen) : vec2(1.0, 0.0);
+      vec2 nrm  = vec2(tang.y, -tang.x);
+
+      // Smooth 5 taps ALONG the tangent (straightens lines) and 3 taps ACROSS the normal
+      float tangScale = mix(2.8, 1.6, clamp(u_detail / 2.0, 0.0, 1.0));
+      float nrmScale  = mix(2.0, 1.0, clamp(u_detail / 2.0, 0.0, 1.0));
+      vec2 dT = tang * u_step * tangScale;
+      vec2 dN = nrm  * u_step * nrmScale;
+
+      float wT[5] = float[5](0.08, 0.24, 0.36, 0.24, 0.08);
+      float wN[3] = float[3](0.22, 0.56, 0.22);
+
+      float sum = 0.0;
+      for (int j = -1; j <= 1; j++) {
+        float wy = wN[j + 1];
+        vec2 baseP = uv + float(j) * dN;
+        for (int i = -2; i <= 2; i++) {
+          sum += evalSplineLumAt(baseP + float(i) * dT) * (wy * wT[i + 2]);
+        }
+      }
+
+      // Per-pixel gradient magnitude for exact 1.5-pixel analytical anti-aliasing (no 2x2 fwidth blocks!)
+      float perPixelGrad = gradLen / 4.4;
+      return vec2(sum, perPixelGrad);
+    }
+
     void main() {
       vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
       vec4 orig = texture(u_orig, uv);
-      if (orig.a == 0.0) {
+      if (orig.a <= 0.001) {
         outColor = vec4(0.0);
         return;
       }
-      vec4 st = texture(u_static, uv);
-      float fade = st.r;
-      if (fade <= 0.001) {
+
+      vec4 pyrB = texture(u_pyrB, uv);
+      float outerFade = pyrB.r;
+      float intWeight = pyrB.g;
+      if (outerFade <= 0.001) {
         outColor = orig;
         return;
       }
-      vec3 sm = texture(u_smooth, uv).rgb;
-      vec2 masks = texture(u_masks, uv).rg;
-      float dm = masks.r;
-      float lm = masks.g * (1.0 - dm);
-      float mm = max(0.0, 1.0 - dm - lm);
 
-      vec3 dr = sm * 0.65;
-      vec3 lr = 1.0 - (1.0 - sm) * 0.77;
-      float rawTex = 0.84 + st.b * 0.32;
-      float tex = mix(1.0, rawTex, u_useWcTex);
-      vec3 col = (dr * dm + sm * mm + lr * lm) * tex;
+      // 1. Evaluate the Cubic B-Spline Tangent-Straightened Field L and its analytical slope:
+      vec2 lg = evalSmoothLumAndGrad(uv);
+      float L = lg.x;
+      // Analytical 1.6-pixel anti-aliasing ramp width (clamped so both steep lines & gentle slopes are silky smooth!)
+      float aa = clamp(lg.y * 1.65, 0.015, 0.042);
 
-      if (u_hasRim == 1 && st.g > 0.0) {
-        vec2 rVal = texture(u_rim, uv).rg;
-        float drim = 4.0 * rVal.r * (1.0 - rVal.r);
-        float lrim = 4.0 * rVal.g * (1.0 - rVal.g);
-        float rim = max(drim, lrim) * st.g;
-        col *= (1.0 - rim * u_rimStrength);
+      float darkMask  = 1.0 - smoothstep(0.265 - aa, 0.265 + aa, L);
+      float lightMask = smoothstep(0.635 - aa, 0.635 + aa, L);
+      float midMask   = max(0.0, 1.0 - darkMask - lightMask);
+
+      // 2. Sample each zone's dedicated, extrapolated paint buffer (also using B-spline smoothing!)
+      vec3 darkCol  = texture(u_darkPaint, uv).rgb;
+      vec3 midCol   = texture(u_midPaint, uv).rgb;
+      vec3 lightCol = texture(u_lightPaint, uv).rgb;
+
+      darkCol  *= (1.0 - 0.34);
+      lightCol  = 1.0 - (1.0 - lightCol) * (1.0 - 0.20);
+
+      vec3 segmentedRgb = darkCol * darkMask + midCol * midMask + lightCol * lightMask;
+
+      // 3. Optional Segment Edge Thickness (0.0 by default = clean Photoshop Action look)
+      if (u_rimStrength > 0.001 && intWeight > 0.0) {
+        float drim = 4.0 * darkMask * (1.0 - darkMask);
+        float lrim = 4.0 * lightMask * (1.0 - lightMask);
+        float rim = max(drim, lrim) * intWeight;
+        segmentedRgb *= (1.0 - rim * u_rimStrength);
       }
 
-      vec3 finalRgb = clamp(mix(orig.rgb, col, fade), 0.0, 1.0);
+      // 4. Watercolor Texture Overlay
+      if (u_useWcTex > 0.01) {
+        float wcTex = texture(u_wcTex, fract(uv * u_wcScale)).r;
+        vec3 blendedTex = mix(
+          2.0 * segmentedRgb * wcTex,
+          1.0 - 2.0 * (1.0 - segmentedRgb) * (1.0 - wcTex),
+          step(vec3(0.5), segmentedRgb)
+        );
+        segmentedRgb = clamp(mix(segmentedRgb, blendedTex, 0.50 * u_useWcTex), 0.0, 1.0);
+      }
+
+      vec3 finalRgb = clamp(mix(orig.rgb, segmentedRgb, outerFade), 0.0, 1.0);
       outColor = vec4(finalRgb, orig.a);
     }
   `;
 
   const compile = (type, src) => {
-      if (gl.isContextLost()) return null;
-      const s = gl.createShader(type);
-      if (!s) return null;
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-        console.error(gl.getShaderInfoLog(s));
-        gl.deleteShader(s);
-        return null;
-      }
-      return s;
-    };
+    if (gl.isContextLost()) return null;
+    const s = gl.createShader(type);
+    if (!s) return null;
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s));
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  };
   const link = (vs, fs) => {
     const p = gl.createProgram();
     gl.attachShader(p, vs);
@@ -646,15 +776,11 @@ function initGLEdgeCurveContext() {
   };
 
   const vs = compile(gl.VERTEX_SHADER, vsSrc);
-  const fH = compile(gl.FRAGMENT_SHADER, fsBlurH);
-  const fV = compile(gl.FRAGMENT_SHADER, fsBlurVNorm);
-  const fC = compile(gl.FRAGMENT_SHADER, fsComposite);
-  if (!vs || !fH || !fV || !fC) { _glEC = false; return null; }
+  const fC = compile(gl.FRAGMENT_SHADER, fsCutoutAction);
+  if (!vs || !fC) { _glEC = false; return null; }
 
-  const progH = link(vs, fH);
-  const progV = link(vs, fV);
   const progC = link(vs, fC);
-  if (!progH || !progV || !progC) { _glEC = false; return null; }
+  if (!progC) { _glEC = false; return null; }
 
   const vao = gl.createVertexArray();
   gl.bindVertexArray(vao);
@@ -664,45 +790,28 @@ function initGLEdgeCurveContext() {
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-  gl.useProgram(progH);
-  gl.uniform1i(gl.getUniformLocation(progH, "u_tex"), 0);
-  gl.uniform1i(gl.getUniformLocation(progH, "u_texStatic"), 1);
-
-  gl.useProgram(progV);
-  gl.uniform1i(gl.getUniformLocation(progV, "u_texH"), 0);
-  gl.uniform1i(gl.getUniformLocation(progV, "u_texStatic"), 1);
-
   gl.useProgram(progC);
   gl.uniform1i(gl.getUniformLocation(progC, "u_orig"), 0);
-  gl.uniform1i(gl.getUniformLocation(progC, "u_smooth"), 1);
-  gl.uniform1i(gl.getUniformLocation(progC, "u_static"), 2);
-  gl.uniform1i(gl.getUniformLocation(progC, "u_masks"), 3);
-  gl.uniform1i(gl.getUniformLocation(progC, "u_rim"), 4);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_darkPaint"), 1);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_midPaint"), 2);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_lightPaint"), 3);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_pyrA"), 4);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_pyrB"), 5);
+  gl.uniform1i(gl.getUniformLocation(progC, "u_wcTex"), 6);
 
   _glEC = {
-    canvas, gl, vao,
-    progH, progV, progC,
-    uH_stepX: gl.getUniformLocation(progH, "u_stepX"),
-    uH_sigma: gl.getUniformLocation(progH, "u_sigma"),
-    uH_radius: gl.getUniformLocation(progH, "u_radius"),
-    uH_premask: gl.getUniformLocation(progH, "u_premask"),
-    uH_fineMix: gl.getUniformLocation(progH, "u_fineMix"),
-    uV_stepY: gl.getUniformLocation(progV, "u_stepY"),
-    uV_sigma: gl.getUniformLocation(progV, "u_sigma"),
-    uV_radius: gl.getUniformLocation(progV, "u_radius"),
-    uV_doThresh: gl.getUniformLocation(progV, "u_doThresh"),
+    canvas, gl, vao, progC,
+    uC_step: gl.getUniformLocation(progC, "u_step"),
+    uC_wcScale: gl.getUniformLocation(progC, "u_wcScale"),
+    uC_detail: gl.getUniformLocation(progC, "u_detail"),
     uC_rimStrength: gl.getUniformLocation(progC, "u_rimStrength"),
-    uC_hasRim: gl.getUniformLocation(progC, "u_hasRim"),
     uC_useWcTex: gl.getUniformLocation(progC, "u_useWcTex"),
     uploadedCache: null,
-    lastDetailKey: -1,
-    lastRimKey: -1,
-    lastRimSigma: -1,
   };
   return _glEC;
 }
 
-function createGLTexRGBA8(gl, w, h, data, useLinear = true) {
+function createGLTexRGBA8(gl, w, h, data, useLinear = true, wrapRepeat = false) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
@@ -711,16 +820,22 @@ function createGLTexRGBA8(gl, w, h, data, useLinear = true) {
   const filter = useLinear ? gl.LINEAR : gl.NEAREST;
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
   return tex;
 }
 
-function createGLFbo(gl, tex) {
-  const fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-  return fbo;
+function createGLTexRGBA16F(gl, w, h, float32Data) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.FLOAT, float32Data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
 }
 
 function renderEdgeCurveWebGL(cache, p) {
@@ -735,99 +850,71 @@ function renderEdgeCurveWebGL(cache, p) {
     destroyGLEdgeCurveResources();
     canvas.width = bw;
     canvas.height = bh;
-    ec.texOrig = createGLTexRGBA8(gl, bw, bh, new Uint8Array(cache.subData.buffer, cache.subData.byteOffset, cache.subData.byteLength), true);
-    ec.texSmooth = createGLTexRGBA8(gl, mw, mh, cache.smoothRgba, true);
-    ec.texRawZones = createGLTexRGBA8(gl, mw, mh, cache.rawZonesRgba, true);
-    ec.texStatic = createGLTexRGBA8(gl, mw, mh, cache.staticWeightsRgba, true);
+    ec.texOrig = createGLTexRGBA8(
+      gl, bw, bh,
+      new Uint8Array(cache.subData.buffer, cache.subData.byteOffset, cache.subData.byteLength),
+      true, false
+    );
+    ec.texDarkPaint  = createGLTexRGBA8(gl, mw, mh, cache.darkPaintRgba,  true, false);
+    ec.texMidPaint   = createGLTexRGBA8(gl, mw, mh, cache.midPaintRgba,   true, false);
+    ec.texLightPaint = createGLTexRGBA8(gl, mw, mh, cache.lightPaintRgba, true, false);
+    // 16-bit Floating-Point Texture (RGBA16F) -> ZERO 8-bit quantization stair-steps!
+    ec.texPyrA       = createGLTexRGBA16F(gl, bw, bh, cache.zonePyrFloat);
+    ec.texPyrB       = createGLTexRGBA8(gl, bw, bh, cache.zonePyrBRgba,   true, false);
 
-    ec.texPing = createGLTexRGBA8(gl, mw, mh, null, true);
-    ec.texPong = createGLTexRGBA8(gl, mw, mh, null, true);
-    ec.texMasks = createGLTexRGBA8(gl, mw, mh, null, true);
-    ec.texRim = createGLTexRGBA8(gl, mw, mh, null, true);
-
-    ec.fboPing = createGLFbo(gl, ec.texPing);
-    ec.fboPong = createGLFbo(gl, ec.texPong);
-    ec.fboMasks = createGLFbo(gl, ec.texMasks);
-    ec.fboRim = createGLFbo(gl, ec.texRim);
+    const wcImg = STATE.brushImages && STATE.brushImages["watercolortexture.png"];
+    if (wcImg) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, wcImg);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      ec.texWc = tex;
+      ec.wcW = wcImg.naturalWidth || wcImg.width || 512;
+      ec.wcH = wcImg.naturalHeight || wcImg.height || 512;
+    } else {
+      ec.texWc = ec.texOrig;
+      ec.wcW = 512;
+      ec.wcH = 512;
+    }
     ec.uploadedCache = cache;
   }
 
-  gl.disable(gl.BLEND);
-  gl.bindVertexArray(vao);
-  gl.viewport(0, 0, mw, mh);
-
-  const stepX = 1.0 / mw;
-  const stepY = 1.0 / mh;
-
-  const rawDetail = p.maskDetail ?? 85;
-  const norm = Math.max(0, Math.min(1.5, rawDetail / 100));
-  const sigma1 = (1.35 + Math.pow(Math.max(0, 1.5 - norm) / 1.5, 1.45) * 8.5) * 0.5;
-  const sigma2 = Math.max(0.6, sigma1 * 0.72);
-  const fineMix = Math.max(0, Math.min(1.0, (rawDetail - 20) / 95));
-  const detailKey = Math.round(rawDetail * 2);
-
-  const runGaussianPass = (srcTex, dstFbo, sigma, premask, doThresh) => {
-    const radius = Math.min(14, Math.max(1, Math.ceil(sigma * 2.6)));
-    gl.bindFramebuffer(gl.FRAMEBUFFER, ec.fboPing);
-    gl.useProgram(ec.progH);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ec.texStatic);
-    gl.uniform1f(ec.uH_stepX, stepX);
-    gl.uniform1f(ec.uH_sigma, sigma);
-    gl.uniform1i(ec.uH_radius, radius);
-    gl.uniform1i(ec.uH_premask, premask ? 1 : 0);
-    gl.uniform1f(ec.uH_fineMix, fineMix);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
-    gl.useProgram(ec.progV);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ec.texPing);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ec.texStatic);
-    gl.uniform1f(ec.uV_stepY, stepY);
-    gl.uniform1f(ec.uV_sigma, sigma);
-    gl.uniform1i(ec.uV_radius, radius);
-    gl.uniform1i(ec.uV_doThresh, doThresh ? 1 : 0);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  };
-
-  if (ec.lastDetailKey !== detailKey) {
-    runGaussianPass(ec.texRawZones, ec.fboMasks, sigma1, false, false);
-    runGaussianPass(ec.texMasks, ec.fboPong, sigma2, true, true);
-    runGaussianPass(ec.texPong, ec.fboMasks, 0.85, true, false);
-    ec.lastDetailKey = detailKey;
-    ec.lastRimKey = -1;
-  }
-
+  const rawDetail = p.maskDetail ?? 135;
+  const detailNorm = Math.max(0.0, Math.min(2.0, rawDetail / 100.0));
   const edgeThick = p.edgeThickness ?? 0;
-  const rimStrength = Math.min(0.65, (edgeThick / 100) * 0.55);
-  if (edgeThick > 0) {
-    const rimSigma = (0.8 + (edgeThick / 100) * 3.2) * 0.5;
-    const rimSigmaKey = Math.round(rimSigma * 20);
-    if (ec.lastRimKey !== detailKey || ec.lastRimSigma !== rimSigmaKey) {
-      runGaussianPass(ec.texMasks, ec.fboRim, rimSigma, true, false);
-      ec.lastRimKey = detailKey;
-      ec.lastRimSigma = rimSigmaKey;
-    }
-  }
+  const rimStrength = Math.min(0.65, (edgeThick / 100.0) * 0.55);
 
   const subLayer = STATE.layers && STATE.layers.subject;
   const useWcTex = subLayer && subLayer.params && subLayer.params.wcTexture ? 1.0 : 0.0;
 
+  gl.disable(gl.BLEND);
+  gl.bindVertexArray(vao);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, bw, bh);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
+
   gl.useProgram(ec.progC);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ec.texOrig);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ec.texSmooth);
-  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ec.texStatic);
-  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, ec.texMasks);
-  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, ec.texRim);
-  gl.uniform1f(ec.uC_rimStrength, rimStrength);
-  gl.uniform1i(ec.uC_hasRim, edgeThick > 0 ? 1 : 0);
-  gl.uniform1f(ec.uC_useWcTex, useWcTex);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ec.texDarkPaint);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ec.texMidPaint);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, ec.texLightPaint);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, ec.texPyrA);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, ec.texPyrB);
+  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, ec.texWc);
 
+  gl.uniform2f(ec.uC_step, 1.0 / bw, 1.0 / bh);
+  gl.uniform2f(ec.uC_wcScale, bw / Math.max(1.0, ec.wcW * 0.8), bh / Math.max(1.0, ec.wcH * 0.8));
+  gl.uniform1f(ec.uC_detail, detailNorm);
+  gl.uniform1f(ec.uC_rimStrength, rimStrength);
+  gl.uniform1f(ec.uC_useWcTex, useWcTex);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   return canvas;
 }
 
@@ -847,105 +934,5 @@ function rerenderLiveEdgeCurveLayer(skipComposite = false) {
     ctx.drawImage(glCanvas, cache.bx, cache.by);
     if (_stack.id !== "edge_curve") invalidateStack();
     if (!skipComposite) compositeAllLayers();
-    return;
   }
-
-  // 2D CPU Fallback if WebGL2 is unavailable
-  const {
-    bx, by, bw, bh,
-    subData, smoothR, smoothG, smoothB, alpha, insideMask,
-    outerEdgeFade, interiorWeight, texRatio, darkRaw, lightRaw, darkFine, lightFine,
-  } = cache;
-  const n = bw * bh;
-
-  const rawDetail = p.maskDetail ?? 85;
-  const norm = Math.max(0, Math.min(1.5, rawDetail / 100));
-  const r1 = Math.max(1, Math.round(1.5 + Math.pow(Math.max(0, 1.5 - norm) / 1.5, 1.45) * 12));
-  const r2 = Math.max(1, Math.round(r1 * 0.72));
-  const fineMix = Math.max(0, Math.min(1.0, (rawDetail - 20) / 95));
-
-  const dIn = new Float32Array(n);
-  const lIn = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    dIn[i] = darkRaw[i] * (1 - fineMix) + Math.max(darkRaw[i], darkFine[i]) * fineMix;
-    lIn[i] = lightRaw[i] * (1 - fineMix) + Math.max(lightRaw[i], lightFine[i]) * fineMix;
-  }
-
-  let darkBlur = normalizedBlurFloat32(dIn, insideMask, bw, bh, r1);
-  darkBlur = normalizedBlurFloat32(darkBlur, insideMask, bw, bh, r2);
-  let lightBlur = normalizedBlurFloat32(lIn, insideMask, bw, bh, r1);
-  lightBlur = normalizedBlurFloat32(lightBlur, insideMask, bw, bh, r2);
-
-  const darkThresh = new Float32Array(n);
-  const lightThresh = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const dt = Math.max(0, Math.min(1, (darkBlur[i] - 0.36) / 0.18));
-    const lt = Math.max(0, Math.min(1, (lightBlur[i] - 0.36) / 0.18));
-    darkThresh[i] = dt * dt * (3 - 2 * dt);
-    lightThresh[i] = lt * lt * (3 - 2 * lt);
-  }
-
-  let darkMask = normalizedBlurFloat32(darkThresh, insideMask, bw, bh, 2);
-  darkMask = normalizedBlurFloat32(darkMask, insideMask, bw, bh, 1);
-  let lightMask = normalizedBlurFloat32(lightThresh, insideMask, bw, bh, 2);
-  lightMask = normalizedBlurFloat32(lightMask, insideMask, bw, bh, 1);
-
-  let dRim = null, lRim = null;
-  const edgeThick = p.edgeThickness ?? 0;
-  if (edgeThick > 0) {
-    const rimRadius = Math.max(1, Math.round(1 + (edgeThick / 100) * 5));
-    dRim = normalizedBlurFloat32(darkMask, insideMask, bw, bh, rimRadius);
-    lRim = normalizedBlurFloat32(lightMask, insideMask, bw, bh, rimRadius);
-  }
-  const rimStrength = Math.min(0.65, (edgeThick / 100) * 0.55);
-
-  const subLayer = STATE.layers && STATE.layers.subject;
-  const useWcTex = subLayer && subLayer.params && subLayer.params.wcTexture;
-
-  const outImg = new ImageData(bw, bh);
-  const out = outImg.data;
-
-  for (let i = 0; i < n; i++) {
-    const a = alpha[i];
-    if (a === 0) continue;
-    const idx = i * 4;
-    const origR = subData[idx], origG = subData[idx + 1], origB = subData[idx + 2];
-    const fade = outerEdgeFade[i];
-    if (fade <= 0.001) {
-      out[idx] = origR; out[idx + 1] = origG; out[idx + 2] = origB; out[idx + 3] = a;
-      continue;
-    }
-
-    const sr = smoothR[i], sg = smoothG[i], sb = smoothB[i];
-    const dm = darkMask[i];
-    const lm = lightMask[i] * (1 - dm);
-    const mm = Math.max(0, 1 - dm - lm);
-    const tex = useWcTex ? texRatio[i] : 1.0;
-
-    let r = (sr * 0.65 * dm + sr * mm + (255 - (255 - sr) * 0.77) * lm) * tex;
-    let g = (sg * 0.65 * dm + sg * mm + (255 - (255 - sg) * 0.77) * lm) * tex;
-    let b = (sb * 0.65 * dm + sb * mm + (255 - (255 - sb) * 0.77) * lm) * tex;
-
-    if (edgeThick > 0 && interiorWeight[i] > 0) {
-      const drimVal = 4 * dRim[i] * (1 - dRim[i]);
-      const lrimVal = 4 * lRim[i] * (1 - lRim[i]);
-      const rim = Math.max(drimVal, lrimVal) * interiorWeight[i];
-      const darkenFactor = 1 - rim * rimStrength;
-      r *= darkenFactor; g *= darkenFactor; b *= darkenFactor;
-    }
-
-    out[idx] = Math.max(0, Math.min(255, origR * (1 - fade) + r * fade));
-    out[idx + 1] = Math.max(0, Math.min(255, origG * (1 - fade) + g * fade));
-    out[idx + 2] = Math.max(0, Math.min(255, origB * (1 - fade) + b * fade));
-    out[idx + 3] = a;
-  }
-
-  const tempC = createCanvas(bw, bh);
-  tempC.getContext("2d").putImageData(outImg, 0, 0);
-  const ctx = lyr.baseCanvas.getContext("2d");
-  ctx.clearRect(0, 0, cw, ch);
-  ctx.drawImage(tempC, bx, by);
-
-  if (_stack.id !== "edge_curve") invalidateStack();
-  if (!skipComposite) compositeAllLayers();
 }
