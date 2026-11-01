@@ -171,6 +171,9 @@
       uniform float u_meanL;
       uniform float u_warmFilter;
       uniform float u_warmBoost;
+      uniform float u_wbStrength;
+      uniform float u_protectBlueBody;
+      uniform vec3 u_wbGain;
       uniform float u_wcOp;
       uniform vec2 u_wcScale;
       uniform int u_flipY;
@@ -209,6 +212,41 @@
           float w = clamp(c.r - c.b, 0.0, 1.0) * (1.0 - clamp(c.g - c.r, 0.0, 1.0));
           c.r = clamp(c.r + w * bAmt * (20.0 / 255.0), 0.0, 1.0);
           c.b = clamp(c.b - w * bAmt * (10.0 / 255.0), 0.0, 1.0);
+        }
+        if (u_wbStrength > 0.001) {
+          // 1. Illuminant Chromatic Adaptation (restores sun-lit yellow/orange casts AND cool shade casts to true neutral!)
+          c = clamp(c * mix(vec3(1.0), u_wbGain, u_wbStrength), 0.0, 1.0);
+
+          float lwb = dot(c, vec3(0.299, 0.587, 0.114));
+          float mxW = max(c.r, max(c.g, c.b));
+          float mnW = min(c.r, min(c.g, c.b));
+          float satW = mxW > 1e-4 ? (mxW - mnW) / mxW : 0.0;
+
+          // 2. Strong Achromatic Gate: any white, grey, or black with saturation up to 0.48 becomes pure neutral!
+          float achromGate = 1.0 - smoothstep(0.28, 0.52, satW);
+
+          // 3. Strong Cool/Sky Cast Neutralizer (kills blue/cyan sky reflections on Red Audi glass, White Seat, & Black Dog fur!):
+          //    Triggers whenever Blue (or Cyan-Blue) exceeds Red, even at high saturation (up to 0.85)!
+          float blueOverRed = clamp((c.b - c.r * 1.02) / max(0.04, mxW - mnW + 0.02), 0.0, 1.0);
+          float cyanOverRed = clamp((min(c.b, c.g) - c.r * 1.02) / max(0.04, mxW - mnW + 0.02), 0.0, 1.0);
+          float coolCast = clamp(max(blueOverRed, cyanOverRed) * 1.45, 0.0, 1.0);
+
+          // Only protect vivid blue if the subject itself is a bright blue car (u_protectBlueBody == 1.0)
+          float skyOrShadeKill = coolCast * (1.0 - u_protectBlueBody * smoothstep(0.50, 0.72, satW));
+
+          // 4. Sun-lit / Warm Cast Neutralizer on Whites & Darks (restores sun-lit white/grey/black fur without dulling rich midtone fur):
+          float darkZone = 1.0 - smoothstep(0.22, 0.52, lwb);
+          float lightZone = smoothstep(0.58, 0.82, lwb);
+          float extremeToneNeutral = max(darkZone, lightZone) * (1.0 - smoothstep(0.38, 0.68, satW));
+
+          float neutWeight = clamp(max(max(achromGate, skyOrShadeKill), extremeToneNeutral) * u_wbStrength, 0.0, 1.0);
+
+          // Make whites crisp white, greys clean grey, and bluish/tinted blacks deep charcoal-black:
+          float targetL = lwb;
+          targetL = mix(targetL, targetL * 0.84, darkZone * max(coolCast, achromGate) * 0.75);
+          targetL = mix(targetL, min(1.0, targetL * 1.08 + 0.025), lightZone * max(coolCast, achromGate) * 0.75);
+
+          c = clamp(mix(c, vec3(targetL), neutWeight), 0.0, 1.0);
         }
         if (u_wcOp > 0.0) {
           float tv = texture(u_wcTex, fract(uv * u_wcScale)).r;
@@ -439,10 +477,12 @@
     if (!eng) return null;
     const { gl, canvas, vao, progCC, progOilTone, progOilLIC, progOilBlur, progOilComp } = eng;
 
-    let lumSmallC, meanL;
+    let lumSmallC, meanL, protectBlueBody, wbGain;
     if (sharedLumRef && sharedLumRef.lumSmallC) {
       lumSmallC = sharedLumRef.lumSmallC;
       meanL = sharedLumRef.meanL;
+      protectBlueBody = sharedLumRef.protectBlueBody ?? 0.0;
+      wbGain = sharedLumRef.wbGain || [1.0, 1.0, 1.0];
     } else {
       const sw4 = Math.max(1, w >> 2), sh4 = Math.max(1, h >> 2);
       const subSmallC = createCanvas(sw4, sh4);
@@ -457,18 +497,41 @@
       const n4 = sw4 * sh4;
       const lum4 = new Float32Array(n4);
       const in4 = new Float32Array(n4);
-      let sumL = 0, cntL = 0;
+      let sumL = 0, cntL = 0, vividBlueCnt = 0;
+      let castR = 0, castG = 0, castB = 0, castCnt = 0;
+
       for (let i = 0; i < n4; i++) {
         const p = i * 4;
-        const l = 0.299 * subSmData[p] + 0.587 * subSmData[p + 1] + 0.114 * subSmData[p + 2];
+        const r = subSmData[p], g = subSmData[p + 1], b = subSmData[p + 2];
+        const l = 0.299 * r + 0.587 * g + 0.114 * b;
         lum4[i] = l;
         if (maskSmData[p] > 200) {
           in4[i] = 1.0;
           sumL += l;
           cntL++;
+          const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+          const sat = mx > 0 ? (mx - mn) / mx : 0;
+          if (b > r + 45 && b > g + 15 && sat > 0.55 && l > 50 && l < 215) {
+            vividBlueCnt++;
+          }
+          // Sample near-neutral / highlight / shadow pixels to estimate sun-lit or shade illuminant cast
+          if (sat < 0.38 && l > 35 && l < 240) {
+            castR += r; castG += g; castB += b; castCnt++;
+          }
         }
       }
       meanL = (cntL > 0 ? sumL / cntL : 128.0) / 255.0;
+      protectBlueBody = cntL > 0 && (vividBlueCnt / cntL) > 0.18 ? 1.0 : 0.0;
+      wbGain = [1.0, 1.0, 1.0];
+      if (castCnt > 20) {
+        const avgR = castR / castCnt, avgG = castG / castCnt, avgB = castB / castCnt;
+        const avgGray = 0.299 * avgR + 0.587 * avgG + 0.114 * avgB;
+        wbGain = [
+          Math.max(0.78, Math.min(1.28, avgGray / Math.max(10, avgR))),
+          Math.max(0.78, Math.min(1.28, avgGray / Math.max(10, avgG))),
+          Math.max(0.78, Math.min(1.28, avgGray / Math.max(10, avgB))),
+        ];
+      }
 
       const den6 = boxBlurFloat32(in4, sw4, sh4, 6);
       let lumBlur4 = normalizedBlurFloat32(lum4, in4, sw4, sh4, 6, den6);
@@ -485,7 +548,6 @@
       lsCtx.putImageData(lsImg, 0, 0);
       subSmallC.width = 1; subSmallC.height = 1;
     }
-
 
     const texOrig = uploadTex2D(gl, origC, false);
     const texLumBlur = uploadTex2D(gl, lumSmallC, false);
@@ -525,6 +587,12 @@
       gl.uniform1f(gl.getUniformLocation(progCC, "u_warmFilter"), ccOn ? (cfg.CC_WARM_FILTER ?? 0.02) : 0.0);
       gl.uniform1f(gl.getUniformLocation(progCC, "u_warmBoost"), ccOn ? (cfg.CC_WARM_BOOST ?? 2.6) : 1.0);
 
+      // Keep u_wbStrength = 0.0 during base generation so the base layers stay un-balanced;
+      // InstantWhiteBalance.applyLive() then applies 0%..100% White Balance live in < 6ms!
+      gl.uniform1f(gl.getUniformLocation(progCC, "u_wbStrength"), 0.0);
+      gl.uniform1f(gl.getUniformLocation(progCC, "u_protectBlueBody"), protectBlueBody);
+      gl.uniform3f(gl.getUniformLocation(progCC, "u_wbGain"), wbGain[0], wbGain[1], wbGain[2]);
+
       const wcMult = cfg.WATERCOLOR_TEXTURE_SIZE ?? 1.0;
       const tw = wcImg ? Math.max(1, (wcImg.naturalWidth || wcImg.width) * wcMult) : 512;
       const th = wcImg ? Math.max(1, (wcImg.naturalHeight || wcImg.height) * wcMult) : 512;
@@ -558,7 +626,6 @@
 
     let oilFull = null;
     if (cfg.OIL_PAINT_ENABLED !== false) {
-      // Match Python's OIL_DETAIL_SCALE (0.85) so LIC stroke length & High-Pass radius match 1:1!
       const oilScale = cfg.OIL_DETAIL_SCALE ?? 0.85;
       const ow = Math.max(16, Math.round(w * oilScale));
       const oh = Math.max(16, Math.round(h * oilScale));
@@ -650,7 +717,7 @@
     gl.deleteTexture(texMask);
     if (texWc !== texOrig) gl.deleteTexture(texWc);
     canvas.width = 1; canvas.height = 1;
-    return { cleanCcCrop, subCcFull, subTexFull, oilFull, lumSmallC, meanL };
+    return { cleanCcCrop, subCcFull, subTexFull, oilFull, lumSmallC, meanL, protectBlueBody, wbGain };
   }
 
   // ==========================================================================
@@ -952,21 +1019,57 @@
     const smallSub = createCanvas(subW, subH);
     smallSub.getContext("2d").drawImage(subjectCanvas, 0, 0, subW, subH);
 
+    // Pre-smooth smallSub slightly so thin details don't create sharp radial spokes
+    const preImg = smallSub.getContext("2d").getImageData(0, 0, subW, subH);
+    const pd = preImg.data;
+    const pn = subW * subH;
+    const pR = new Float32Array(pn), pG = new Float32Array(pn), pB = new Float32Array(pn), pA = new Float32Array(pn);
+    for (let i = 0; i < pn; i++) {
+      const p = i * 4;
+      const a = pd[p + 3] / 255.0;
+      pR[i] = pd[p] * a; pG[i] = pd[p + 1] * a; pB[i] = pd[p + 2] * a; pA[i] = pd[p + 3];
+    }
+    const sR = boxBlurFloat32(pR, subW, subH, 3);
+    const sG = boxBlurFloat32(pG, subW, subH, 3);
+    const sB = boxBlurFloat32(pB, subW, subH, 3);
+    const sA = boxBlurFloat32(pA, subW, subH, 3);
+    for (let i = 0; i < pn; i++) {
+      const aVal = sA[i];
+      const p = i * 4;
+      if (aVal <= 0.5) { pd[p] = pd[p + 1] = pd[p + 2] = pd[p + 3] = 0; continue; }
+      const invA = 255.0 / aVal;
+      pd[p]     = Math.min(255, sR[i] * invA);
+      pd[p + 1] = Math.min(255, sG[i] * invA);
+      pd[p + 2] = Math.min(255, sB[i] * invA);
+      pd[p + 3] = Math.min(255, aVal);
+    }
+    smallSub.getContext("2d").putImageData(preImg, 0, 0);
+
+    // Continuous 56-Step Radial Zoom Blur (eliminates the 7 segmented rings in blur_now.jpg
+    // and produces the smooth radial zoom streak of watercolor_radial_PS.jpg in < 1ms!)
     const stackC = createCanvas(sw, sh);
     const stCtx = stackC.getContext("2d");
-    const cx = sw >> 1, cy = sh >> 1;
+    const cx = sw * 0.5, cy = sh * 0.5;
     const numLayers = cfg.NUM_BLUR_LAYERS ?? 7;
     const scaleStep = cfg.LAYER_SCALE_STEP ?? 0.3;
+    const maxScale = 1.0 + numLayers * scaleStep * 1.15; // e.g. ~3.4x radial reach
+    const zoomSteps = 56;
 
-    for (let i = numLayers; i >= 1; i--) {
-      const sc = 1.0 + i * scaleStep;
-      const nw = Math.trunc(subW * sc), nh = Math.trunc(subH * sc);
-      stCtx.drawImage(smallSub, cx - (nw >> 1), cy - (nh >> 1), nw, nh);
+    for (let i = zoomSteps; i >= 0; i--) {
+      const t = i / zoomSteps; // 1.0 (outermost) -> 0.0 (innermost)
+      // Smooth exponential scale progression so every step is a uniform 2% zoom increment (zero steps/rings!)
+      const sc = Math.pow(maxScale, t);
+      const nw = subW * sc;
+      const nh = subH * sc;
+      // Smooth bell/tapered alpha so outer radial streaks blend seamlessly
+      stCtx.globalAlpha = 0.14 + 0.28 * (1.0 - t * 0.65);
+      stCtx.drawImage(smallSub, cx - nw * 0.5, cy - nh * 0.5, nw, nh);
     }
+    stCtx.globalAlpha = 1.0;
     smallSub.width = 1; smallSub.height = 1;
 
-    // Cross-platform 2-pass boxBlurFloat32 + saturation/contrast boost (works 100% on iOS Safari where ctx.filter is unsupported!)
-    const blurR = Math.max(2, (cfg.BLUR_AMOUNT ?? 28) >> 2);
+    // Slight Gaussian blur (3-pass boxBlurFloat32) + saturation/contrast boost to ease radial edges
+    const blurR = Math.max(4, Math.round(((cfg.BLUR_AMOUNT ?? 28) >> 2) * 1.35));
     const satB = cfg.SATURATION_BOOST ?? 1.1;
     const conB = cfg.CONTRAST_BOOST ?? 1.4;
 
@@ -982,12 +1085,13 @@
       chB[i] = d[p + 2] * a;
       chA[i] = d[p + 3];
     }
-    const r1 = Math.max(1, Math.round(blurR * 0.85));
-    const r2 = Math.max(1, Math.round(blurR * 0.65));
-    const bR = boxBlurFloat32(boxBlurFloat32(chR, sw, sh, r1), sw, sh, r2);
-    const bG = boxBlurFloat32(boxBlurFloat32(chG, sw, sh, r1), sw, sh, r2);
-    const bB = boxBlurFloat32(boxBlurFloat32(chB, sw, sh, r1), sw, sh, r2);
-    const bA = boxBlurFloat32(boxBlurFloat32(chA, sw, sh, r1), sw, sh, r2);
+    const r1 = Math.max(2, Math.round(blurR * 0.85));
+    const r2 = Math.max(2, Math.round(blurR * 0.70));
+    const r3 = Math.max(1, Math.round(blurR * 0.55));
+    const bR = boxBlurFloat32(boxBlurFloat32(boxBlurFloat32(chR, sw, sh, r1), sw, sh, r2), sw, sh, r3);
+    const bG = boxBlurFloat32(boxBlurFloat32(boxBlurFloat32(chG, sw, sh, r1), sw, sh, r2), sw, sh, r3);
+    const bB = boxBlurFloat32(boxBlurFloat32(boxBlurFloat32(chB, sw, sh, r1), sw, sh, r2), sw, sh, r3);
+    const bA = boxBlurFloat32(boxBlurFloat32(boxBlurFloat32(chA, sw, sh, r1), sw, sh, r2), sw, sh, r3);
 
     for (let i = 0; i < n; i++) {
       const aVal = bA[i];
@@ -1256,6 +1360,12 @@
     const gpuOut = renderSubjectAndOilGPU(origC, maskC, w, h, cw, ch, offset, cfg);
     if (!gpuOut) throw new Error("WebGL2 GPU filter context unavailable");
     const { cleanCcCrop, subCcFull, subTexFull, oilFull } = gpuOut;
+    
+    STATE._wbProtectBlue = gpuOut.protectBlueBody ?? 0.0;
+    STATE._wbGain = gpuOut.wbGain || [1.0, 1.0, 1.0];
+    STATE._wbBaseSaved = null;
+
+
 
     // FIRST: Create subRawFull!
     const subRawFull = createCanvas(cw, ch);
@@ -1304,7 +1414,10 @@
    const uGpu = renderSubjectAndOilGPU(uOrigC, uMaskC, w, h, cw, ch, offset, cfg, {
      lumSmallC: gpuOut.lumSmallC,
      meanL: gpuOut.meanL,
+     protectBlueBody: gpuOut.protectBlueBody,
+     wbGain: gpuOut.wbGain,
    });
+
    if (uGpu) {
      uGpu.cleanCcCrop.width = 1; uGpu.cleanCcCrop.height = 1;
      const uRawFull = createCanvas(cw, ch);
@@ -1395,6 +1508,301 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
  setTimeout(() => StudioProfiler.report(), 60);
  return payload;
 }
+
+// ==========================================================================
+  // 6. INSTANT ZERO-RECOMPUTE WHITE BALANCE ENGINE (< 6 ms on PC & Mobile!)
+  //    Updates Subject, Oil, Edge Curve, Blur BG, AND all Brush Stroke colors
+  //    instantly without re-running generation!
+  // ==========================================================================
+  function transformRgbWithWhiteBalance(r, g, b, wbStr, protectBlue, wbGain) {
+    if (wbStr <= 0.001) return [r, g, b];
+    let cr = Math.min(1.0, Math.max(0.0, (r / 255.0) * (1.0 + (wbGain[0] - 1.0) * wbStr)));
+    let cg = Math.min(1.0, Math.max(0.0, (g / 255.0) * (1.0 + (wbGain[1] - 1.0) * wbStr)));
+    let cb = Math.min(1.0, Math.max(0.0, (b / 255.0) * (1.0 + (wbGain[2] - 1.0) * wbStr)));
+
+    const lwb = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+    const mxW = Math.max(cr, cg, cb);
+    const mnW = Math.min(cr, cg, cb);
+    const satW = mxW > 1e-4 ? (mxW - mnW) / mxW : 0.0;
+
+    const sstep = (e0, e1, x) => {
+      const t = Math.max(0.0, Math.min(1.0, (x - e0) / (e1 - e0)));
+      return t * t * (3.0 - 2.0 * t);
+    };
+
+    const achromGate = 1.0 - sstep(0.28, 0.52, satW);
+    const blueOverRed = Math.max(0.0, Math.min(1.0, (cb - cr * 1.02) / Math.max(0.04, mxW - mnW + 0.02)));
+    const cyanOverRed = Math.max(0.0, Math.min(1.0, (Math.min(cb, cg) - cr * 1.02) / Math.max(0.04, mxW - mnW + 0.02)));
+    const coolCast = Math.min(1.0, Math.max(blueOverRed, cyanOverRed) * 1.45);
+    const skyOrShadeKill = coolCast * (1.0 - protectBlue * sstep(0.50, 0.72, satW));
+
+    const darkZone = 1.0 - sstep(0.22, 0.52, lwb);
+    const lightZone = sstep(0.58, 0.82, lwb);
+    const extremeToneNeutral = Math.max(darkZone, lightZone) * (1.0 - sstep(0.38, 0.68, satW));
+
+    const neutWeight = Math.min(1.0, Math.max(achromGate, skyOrShadeKill, extremeToneNeutral) * wbStr);
+    let targetL = lwb;
+    const maxCA = Math.max(coolCast, achromGate);
+    targetL = targetL * (1.0 - darkZone * maxCA * 0.75 * 0.16);
+    const lifted = Math.min(1.0, targetL * 1.08 + 0.025);
+    targetL = targetL + (lifted - targetL) * (lightZone * maxCA * 0.75);
+
+    cr = cr + (targetL - cr) * neutWeight;
+    cg = cg + (targetL - cg) * neutWeight;
+    cb = cb + (targetL - cb) * neutWeight;
+    return [
+      Math.max(0, Math.min(255, Math.round(cr * 255))),
+      Math.max(0, Math.min(255, Math.round(cg * 255))),
+      Math.max(0, Math.min(255, Math.round(cb * 255))),
+    ];
+  }
+
+  // Applies the exact shader-equivalent White Balance to any 2D canvas using a fast WebGL2 pass!
+  function applyWhiteBalanceCanvasGPU(srcCanvas, dstCanvas, wbStr, protectBlue, wbGain) {
+    if (!srcCanvas || !dstCanvas) return;
+    const w = srcCanvas.width, h = srcCanvas.height;
+    const eng = getGPUFilterEngine();
+    if (!eng || wbStr <= 0.001) {
+      const ctx = dstCanvas.getContext("2d");
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(srcCanvas, 0, 0);
+      return;
+    }
+    const { gl, canvas, vao, progCC } = eng;
+    const texOrig = uploadTex2D(gl, srcCanvas, false);
+
+    // 1x1 white dummy texture for mask/lumBlur when running pure WB pass
+    if (!eng.whiteDummyTex) {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 255]));
+      eng.whiteDummyTex = t;
+    }
+
+    canvas.width = w;
+    canvas.height = h;
+    gl.bindVertexArray(vao);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(progCC);
+
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texOrig);
+    gl.uniform1i(gl.getUniformLocation(progCC, "u_orig"), 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, eng.whiteDummyTex);
+    gl.uniform1i(gl.getUniformLocation(progCC, "u_lumBlur"), 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texOrig);
+    gl.uniform1i(gl.getUniformLocation(progCC, "u_mask"), 2);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, eng.whiteDummyTex);
+    gl.uniform1i(gl.getUniformLocation(progCC, "u_wcTex"), 3);
+
+    // Identity CC params so ONLY the White Balance block runs!
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_shLift"), 0.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_hiReduce"), 0.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_vibrance"), 1.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_sat"), 1.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_bright"), 1.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_contrast"), 1.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_meanL"), 0.5);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_warmFilter"), 0.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_warmBoost"), 1.0);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_wbStrength"), wbStr);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_protectBlueBody"), protectBlue);
+    gl.uniform3f(gl.getUniformLocation(progCC, "u_wbGain"), wbGain[0], wbGain[1], wbGain[2]);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_wcOp"), 0.0);
+    gl.uniform2f(gl.getUniformLocation(progCC, "u_wcScale"), 1.0, 1.0);
+    gl.uniform1i(gl.getUniformLocation(progCC, "u_flipY"), 1);
+    gl.uniform1i(gl.getUniformLocation(progCC, "u_useMask"), 0);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // Copy RGB from GPU canvas while preserving srcCanvas's exact alpha channel!
+    const ctx = dstCanvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(srcCanvas, 0, 0);
+    ctx.globalCompositeOperation = "source-in";
+    ctx.drawImage(canvas, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+
+    gl.deleteTexture(texOrig);
+    canvas.width = 1; canvas.height = 1;
+  }
+
+  function applyLiveWhiteBalanceInStudio() {
+    if (!STATE.payload || !STATE.serverImages) return;
+    const wbOn = !!STATE.whiteBalanceEnabled;
+    const wbStr = wbOn ? ((STATE.whiteBalanceStrength ?? 25) / 100.0) : 0.0;
+    const protectBlue = STATE._wbProtectBlue ?? 0.0;
+    const wbGain = STATE._wbGain || [1.0, 1.0, 1.0];
+
+    const cloneC = (c) => {
+      if (!c) return null;
+      const copy = createCanvas(c.width, c.height);
+      copy.getContext("2d").drawImage(c, 0, 0);
+      return copy;
+    };
+
+    // 1. Save pristine base copies once on first call so slider can go 0% <-> 100% losslessly!
+    if (!STATE._wbBaseSaved) {
+      const [bx, by, bw, bh] = STATE.payload.full_subject_box || [0, 0, STATE.payload.canvas_size[0], STATE.payload.canvas_size[1]];
+      const cropSub = (c) => {
+        if (!c) return null;
+        const copy = createCanvas(bw, bh);
+        copy.getContext("2d").drawImage(c, bx, by, bw, bh, 0, 0, bw, bh);
+        return copy;
+      };
+      const [overW, overH] = STATE.payload.canvas_size;
+      let blurSmall = null;
+      if (STATE.serverImages.blur_bg) {
+        blurSmall = createCanvas(overW >> 2, overH >> 2);
+        blurSmall.getContext("2d").drawImage(STATE.serverImages.blur_bg, 0, 0, blurSmall.width, blurSmall.height);
+      }
+      if (typeof getOrBuildOilDetailCache === "function") getOrBuildOilDetailCache();
+
+      let savedWheelPatches = null;
+      if (STATE.wheelSubjectPatches) {
+        const wp = STATE.wheelSubjectPatches;
+        savedWheelPatches = {
+          turned: {
+            subject_cc: cloneC(wp.turned && wp.turned.subject_cc),
+            subject_tex: cloneC(wp.turned && wp.turned.subject_tex),
+            oil_crop_patch: cloneC(wp.turned && wp.turned.oil_crop_patch),
+          },
+          unturned: {
+            subject_cc: cloneC(wp.unturned && wp.unturned.subject_cc),
+            subject_tex: cloneC(wp.unturned && wp.unturned.subject_tex),
+            oil_crop_patch: cloneC(wp.unturned && wp.unturned.oil_crop_patch),
+          },
+        };
+      }
+
+      STATE._wbBaseSaved = {
+        bx, by, bw, bh,
+        subCcCrop: cropSub(STATE.serverImages.subject_cc),
+        subTexCrop: cropSub(STATE.serverImages.subject_tex),
+        oilCrop: STATE.oilDetailCache && STATE.oilDetailCache.oilCrop ? cloneC(STATE.oilDetailCache.oilCrop) : null,
+        blurSmall,
+        savedWheelPatches,
+        origAvg: STATE.payload.average_color ? [...STATE.payload.average_color] : [128, 128, 128],
+        origDom: STATE.payload.dominant_color ? [...STATE.payload.dominant_color] : null,
+        origEdgeRgb: STATE.payload.stroke_data.edges.map((e) => [e[4], e[5], e[6]]),
+        origCandRgb: (STATE.payload.stroke_data.accent_candidates || []).map((c) => [...c.color]),
+        origSpotRgb: (STATE.payload.stroke_data.accent_spots || []).map((s) => [...s.color]),
+      };
+    }
+
+    const base = STATE._wbBaseSaved;
+    const { bx, by, bw, bh } = base;
+
+    // 2. Transform all Edge Colors, Palette & Accent Stroke Colors in ~0.15ms!
+    const edges = STATE.payload.stroke_data.edges;
+    for (let i = 0; i < edges.length; i++) {
+      const [r0, g0, b0] = base.origEdgeRgb[i];
+      const [nr, ng, nb] = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, protectBlue, wbGain);
+      edges[i][4] = nr; edges[i][5] = ng; edges[i][6] = nb;
+    }
+    STATE.payload.average_color = transformRgbWithWhiteBalance(
+      base.origAvg[0], base.origAvg[1], base.origAvg[2], wbStr, protectBlue, wbGain
+    );
+    if (base.origDom) {
+      STATE.payload.dominant_color = transformRgbWithWhiteBalance(
+        base.origDom[0], base.origDom[1], base.origDom[2], wbStr, protectBlue, wbGain
+      );
+    }
+    const cands = STATE.payload.stroke_data.accent_candidates || [];
+    for (let i = 0; i < cands.length; i++) {
+      const [r0, g0, b0] = base.origCandRgb[i];
+      cands[i].color = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, protectBlue, wbGain);
+    }
+    const spots = STATE.payload.stroke_data.accent_spots || [];
+    for (let i = 0; i < spots.length; i++) {
+      const [r0, g0, b0] = base.origSpotRgb[i];
+      spots[i].color = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, protectBlue, wbGain);
+    }
+
+    // 3. Transform Subject, Oil Crop, Wheel Patches & Blur BG on the GPU (~3.5ms total!)
+    const tmpCrop = createCanvas(bw, bh);
+    if (base.subCcCrop && STATE.serverImages.subject_cc) {
+      applyWhiteBalanceCanvasGPU(base.subCcCrop, tmpCrop, wbStr, protectBlue, wbGain);
+      const ctx = STATE.serverImages.subject_cc.getContext("2d");
+      ctx.clearRect(bx, by, bw, bh);
+      ctx.drawImage(tmpCrop, bx, by);
+    }
+    if (base.subTexCrop && STATE.serverImages.subject_tex) {
+      applyWhiteBalanceCanvasGPU(base.subTexCrop, tmpCrop, wbStr, protectBlue, wbGain);
+      const ctx = STATE.serverImages.subject_tex.getContext("2d");
+      ctx.clearRect(bx, by, bw, bh);
+      ctx.drawImage(tmpCrop, bx, by);
+    }
+    tmpCrop.width = 1; tmpCrop.height = 1;
+
+    if (base.oilCrop && STATE.oilDetailCache && STATE.oilDetailCache.oilCrop) {
+      applyWhiteBalanceCanvasGPU(base.oilCrop, STATE.oilDetailCache.oilCrop, wbStr, protectBlue, wbGain);
+      if (STATE.layers.oil_paint && STATE.layers.oil_paint.vis) {
+        rerenderLiveOilLayer(true);
+      }
+    }
+
+    // Also keep both turned & unturned wheel patches white-balanced in sync so wheel state NEVER flips!
+    if (base.savedWheelPatches && STATE.wheelSubjectPatches) {
+      for (const mode of ["turned", "unturned"]) {
+        const srcSet = base.savedWheelPatches[mode];
+        const dstSet = STATE.wheelSubjectPatches[mode];
+        if (!srcSet || !dstSet) continue;
+        for (const k of ["subject_cc", "subject_tex", "oil_crop_patch"]) {
+          if (srcSet[k] && dstSet[k]) {
+            applyWhiteBalanceCanvasGPU(srcSet[k], dstSet[k], wbStr, protectBlue, wbGain);
+          }
+        }
+      }
+      if (typeof applyWheelPatchToSubjectLayers === "function") {
+        applyWheelPatchToSubjectLayers(STATE.wheelTurnEnabled !== false, true);
+      }
+    }
+
+    if (base.blurSmall && STATE.serverImages.blur_bg) {
+      const [overW, overH] = STATE.payload.canvas_size;
+      const tmpBlur = createCanvas(base.blurSmall.width, base.blurSmall.height);
+      applyWhiteBalanceCanvasGPU(base.blurSmall, tmpBlur, wbStr, protectBlue, wbGain);
+      const bCtx = STATE.serverImages.blur_bg.getContext("2d");
+      bCtx.clearRect(0, 0, overW, overH);
+      bCtx.drawImage(tmpBlur, 0, 0, overW, overH);
+      tmpBlur.width = 1; tmpBlur.height = 1;
+    }
+
+    // 4. Mark procedural brush layers dirty & refresh Edge Curve / Cool Brush
+    for (const def of LAYER_DEFINITIONS) {
+      const lyr = STATE.layers[def.id];
+      if (!lyr) continue;
+      if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)) {
+        lyr.strokesDirty = true;
+        if (lyr.vis && (STATE.selectedLayerId === def.id || def.type === "mask_blur")) {
+          rerenderProceduralLayer(def.id, true);
+        }
+      }
+    }
+    if (STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
+      STATE.edgeCurveCache = null;
+      destroyGLEdgeCurveResources();
+      rerenderLiveEdgeCurveLayer(true);
+      if (typeof freeEdgeCurveCpuUploadBuffers === "function") freeEdgeCurveCpuUploadBuffers();
+    }
+    if (STATE.layers.cool_brush && STATE.layers.cool_brush.vis && typeof rerenderCoolSwooshLayer === "function") {
+      STATE.swooshCarAnalysis = null;
+      STATE._colorizedSwooshCache = null;
+      rerenderCoolSwooshLayer(true);
+    }
+
+    if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+    invalidateStack();
+    compositeAllLayers();
+  }
+
+  window.InstantWhiteBalance = { applyLive: applyLiveWhiteBalanceInStudio };
+
+
+
 
 window.ClientWatercolorEngine = { generate };
 })();

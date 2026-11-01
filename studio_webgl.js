@@ -461,14 +461,20 @@ function getOrBuildEdgeCurveCache() {
   const lumFine   = normalizedBlurFloat32(lumTangentSmooth, insideFull, bw, bh, 1, den1);
   const lumMed    = gaussianBlurNormalized3Pass(lumFine, insideFull, bw, bh, 4, den4, 4, den4, 2, den2);
   const lumCoarse = gaussianBlurNormalized3Pass(lumFine, insideFull, bw, bh, 10, den10, 6, den6, 4, den4);
+  const lumLocal2 = normalizedBlurFloat32(lumFine, insideFull, bw, bh, 2, den2);
   const lumLocal6 = normalizedBlurFloat32(lumFine, insideFull, bw, bh, 6, den6);
+  
 
-  // Compute signed local detail band from the tangent-smoothed fine luminance, then smooth it again!
+  // Combine tight 2px contrast (for thin grille slats & fine spokes) + 6px contrast (for panel seams)
   const diffRaw = new Float32Array(nFull);
   for (let i = 0; i < nFull; i++) {
-    diffRaw[i] = insideFull[i] > 0 ? (lumFine[i] - lumLocal6[i]) : 0.0;
+    if (insideFull[i] > 0) {
+      const d2 = lumFine[i] - lumLocal2[i];
+      const d6 = lumFine[i] - lumLocal6[i];
+      diffRaw[i] = d2 * 0.55 + d6 * 0.65;
+    }
   }
-  const diffSmooth = gaussianBlurNormalized3Pass(diffRaw, insideFull, bw, bh, 2, den2, 1, den1, 1, den1);
+  const diffSmooth = normalizedBlurFloat32(diffRaw, insideFull, bw, bh, 1, den1);
 
   let silDistFull = boxBlurFloat32(outerSilFull, bw, bh, 4);
   silDistFull = boxBlurFloat32(silDistFull, bw, bh, 4);
@@ -636,15 +642,16 @@ function initGLEdgeCurveContext() {
 
     float evalSplineLumAt(vec2 uv) {
       vec4 a = textureBicubicBSpline(u_pyrA, clamp(uv, vec2(0.0), vec2(1.0)));
-      float tCoarseToMed = clamp(u_detail / 0.50, 0.0, 1.0);
-      float tMedToFine   = clamp((u_detail - 0.35) / 1.15, 0.0, 1.0);
+      float tCoarseToMed = clamp(u_detail / 0.35, 0.0, 1.0);
+      float tMedToFine   = clamp((u_detail - 0.20) / 0.55, 0.0, 1.0);
 
       float baseL = mix(a.b, a.g, tCoarseToMed);
-      baseL = mix(baseL, a.r, tMedToFine * 0.85);
+      baseL = mix(baseL, a.r, tMedToFine * 0.94);
 
-      float detailBoost = clamp((u_detail - 0.15) / 1.85, 0.0, 1.0) * 2.15;
+      // At 75% (u_detail=0.75), detailBoost is ~2.15 (previous max!); at 200% (u_detail=2.0), it reaches 3.9!
+      float detailBoost = clamp((u_detail - 0.10) / 1.90, 0.0, 1.0) * 3.90;
       float diff = a.a;
-      float eps = 0.012;
+      float eps = 0.006;
       float cleanMag = max(0.0, sqrt(diff * diff + eps * eps) - eps);
       float cleanDiff = (diff >= 0.0 ? 1.0 : -1.0) * cleanMag;
 
@@ -652,7 +659,7 @@ function initGLEdgeCurveContext() {
     }
 
     vec2 evalSmoothLumAndGrad(vec2 uv) {
-      vec2 sp = u_step * 2.2;
+      vec2 sp = u_step * 2.0;
       float lN = evalSplineLumAt(uv + vec2(0.0, -sp.y));
       float lS = evalSplineLumAt(uv + vec2(0.0,  sp.y));
       float lE = evalSplineLumAt(uv + vec2( sp.x, 0.0));
@@ -663,13 +670,14 @@ function initGLEdgeCurveContext() {
       vec2 tang = gradLen > 1e-4 ? vec2(-grad.y / gradLen, grad.x / gradLen) : vec2(1.0, 0.0);
       vec2 nrm  = vec2(tang.y, -tang.x);
 
-      float tangScale = mix(2.8, 1.6, clamp(u_detail / 2.0, 0.0, 1.0));
-      float nrmScale  = mix(2.0, 1.0, clamp(u_detail / 2.0, 0.0, 1.0));
+      // Smooth 5 taps ALONG the tangent (straightens lines) and 3 tight taps ACROSS the normal
+      float tangScale = mix(2.6, 1.15, clamp(u_detail / 2.0, 0.0, 1.0));
+      float nrmScale  = mix(1.8, 0.55, clamp(u_detail / 2.0, 0.0, 1.0));
       vec2 dT = tang * u_step * tangScale;
       vec2 dN = nrm  * u_step * nrmScale;
 
       float wT[5] = float[5](0.08, 0.24, 0.36, 0.24, 0.08);
-      float wN[3] = float[3](0.22, 0.56, 0.22);
+      float wN[3] = float[3](0.20, 0.60, 0.20);
 
       float sum = 0.0;
       for (int j = -1; j <= 1; j++) {
@@ -680,7 +688,7 @@ function initGLEdgeCurveContext() {
         }
       }
 
-      float perPixelGrad = gradLen / 4.4;
+      float perPixelGrad = gradLen / 4.0;
       return vec2(sum, perPixelGrad);
     }
 

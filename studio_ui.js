@@ -93,6 +93,15 @@ function bindUIEvents() {
   document.getElementById("applyMaskRegenBtn").addEventListener("click", () => {
     setActiveTool("pan");
     closeMobileSheets();
+    STATE.maskEditedByUser = true;
+    if (STATE.maskCanvas) {
+      const [w, h] = [STATE.maskCanvas.width, STATE.maskCanvas.height];
+      const mCopy = createCanvas(w, h);
+      mCopy.getContext("2d").drawImage(STATE.maskCanvas, 0, 0);
+      STATE.framedMaskCanvas = mCopy;
+      STATE.unturnedFramedMaskCanvas = mCopy;
+      if (STATE.turnedFramedMaskCanvas) STATE.turnedFramedMaskCanvas = mCopy;
+    }
     runModalGeneration(true);
   });
 
@@ -223,6 +232,7 @@ function renderLayerListUI() {
 
   for (const def of LAYER_DEFINITIONS) {
     if (def.id === "cool_brush" && !isCarPresetActive()) continue;
+    if (def.id === "eye_highlight" && isCarPresetActive()) continue;
     const lyr = STATE.layers[def.id];
     if (!lyr) continue;
 
@@ -360,6 +370,13 @@ function renderSlidersForLayer(lyr) {
     });
 
     addSubjectOverlayAndWindowControls(container, def, p);
+  }
+
+  if (def.type === "eye_highlight") {
+    addSlider(container, "Highlight Brush Size", p.size, 80, 1100, "px", (val) => {
+      p.size = val;
+      if (typeof rerenderEyeHighlightLayer === "function") rerenderEyeHighlightLayer(false);
+    });
   }
 
   if (def.type === "glow") {
@@ -525,6 +542,99 @@ function renderSlidersForLayer(lyr) {
 }
 
 function addSubjectOverlayAndWindowControls(container, def, p) {
+
+  // 1. Smart Neutral / Sky-Cast White Balance Toggle + Slider (Affects Subject + ALL Brush Layers!)
+  const wbRow = document.createElement("div");
+  wbRow.className = "control-row";
+  const wbLbl = document.createElement("label");
+  wbLbl.innerHTML = `<span>Smart White Balance (Neutralize Blue/Color Cast)</span>`;
+  wbRow.appendChild(wbLbl);
+
+  const wbBtn = document.createElement("button");
+  const wbSub = document.createElement("div");
+  wbSub.style.marginTop = "8px";
+
+  const syncWbBtn = () => {
+    const isOn = !!STATE.whiteBalanceEnabled;
+    p.whiteBalanceEnabled = isOn;
+    wbBtn.className = isOn ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+    wbBtn.textContent = isOn
+      ? "⚖️ Neutralize White/Grey/Black: ON"
+      : "⚖️ Neutralize White/Grey/Black: OFF";
+    wbSub.classList.toggle("hidden", !isOn);
+  };
+  syncWbBtn();
+
+  let _wbDebounce = 0;
+  const triggerLiveWhiteBalanceUpdate = () => {
+    if (window.InstantWhiteBalance && typeof window.InstantWhiteBalance.applyLive === "function") {
+      window.InstantWhiteBalance.applyLive();
+    }
+  };
+
+  wbBtn.addEventListener("click", () => {
+    History.paramBegin();
+    STATE.whiteBalanceEnabled = !STATE.whiteBalanceEnabled;
+    syncWbBtn();
+    History.paramCommit();
+    triggerLiveWhiteBalanceUpdate();
+  });
+  wbRow.appendChild(wbBtn);
+
+  addSlider(wbSub, "Neutralize Cast Strength", STATE.whiteBalanceStrength ?? 25, 10, 100, "%", (val) => {
+    STATE.whiteBalanceStrength = val;
+    p.whiteBalanceStrength = val;
+    triggerLiveWhiteBalanceUpdate();
+  });
+  wbRow.appendChild(wbSub);
+  container.appendChild(wbRow);
+
+  // 2. Eye-Edge White Highlight Brush Toggle + Opacity Slider (Animals & People)
+  if (!isCarPresetActive() && STATE.layers && STATE.layers.eye_highlight) {
+    const ehLyr = STATE.layers.eye_highlight;
+    const ehRow = document.createElement("div");
+    ehRow.className = "control-row";
+    const ehLbl = document.createElement("label");
+    ehLbl.innerHTML = `<span>Eye-Edge Pop Highlight (Outer Head Rim)</span>`;
+    ehRow.appendChild(ehLbl);
+
+    const ehBtn = document.createElement("button");
+    const ehSub = document.createElement("div");
+    ehSub.style.marginTop = "8px";
+
+    const syncEhBtn = () => {
+      ehBtn.className = ehLyr.vis ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+      ehBtn.textContent = ehLyr.vis
+        ? "✨ Eye-Edge White Highlight: ON"
+        : "✨ Eye-Edge White Highlight: OFF";
+      ehSub.classList.toggle("hidden", !ehLyr.vis);
+    };
+    syncEhBtn();
+
+    ehBtn.addEventListener("click", () => {
+      History.recordVis("eye_highlight", ehLyr.vis);
+      ehLyr.vis = !ehLyr.vis;
+      syncEhBtn();
+      if (ehLyr.vis) {
+        rerenderEyeHighlightLayer(true);
+      }
+      renderLayerListUI();
+      if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+      invalidateStack();
+      scheduleComposite();
+    });
+    ehRow.appendChild(ehBtn);
+
+    addSlider(ehSub, "Eye Highlight Opacity", Math.round((ehLyr.params.opacity ?? 0.84) * 100), 5, 100, "%", (val) => {
+      ehLyr.params.opacity = val / 100;
+      if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+      invalidateStack();
+      scheduleComposite();
+    });
+    ehRow.appendChild(ehSub);
+    container.appendChild(ehRow);
+  }
+  
   const showUpscaleToggle = !!(STATE.upscaleData && STATE.upscaleData.upscaledImg);
   if (showUpscaleToggle) {
     const upRow = document.createElement("div");
@@ -956,6 +1066,8 @@ function resetLayerToOriginal(layerId) {
     rerenderLiveEdgeCurveLayer(true);
   } else if (layerId === "cool_brush" && lyr.vis) {
     rerenderCoolSwooshLayer(true);
+  } else if (layerId === "eye_highlight" && lyr.vis) {
+    rerenderEyeHighlightLayer(true);
   }
 
   renderSlidersForLayer(lyr);

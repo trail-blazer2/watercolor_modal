@@ -90,6 +90,7 @@ const LAYER_DEFINITIONS = [
   { id: "colordrop", name: "💧 Bottom Color Drops", group: "Under Subject", type: "effect", prefix: "COLORDROP_BRUSH" },
   { id: "cool_brush", name: "🌊 Cool Brush", group: "Under Subject", type: "cool_swoosh", prefix: "COOL_BRUSH" },
   { id: "glow", name: "☀️ Subject Rim Glow", group: "Under Subject", type: "glow", prefix: "GLOW" },
+  { id: "eye_highlight", name: "✨ Eye-Edge White Highlight", group: "Under Subject", type: "eye_highlight", prefix: "EYE_HIGHLIGHT" },
   { id: "dark_dots", name: "⚫ Dark Splatter Dots", group: "Under Subject", type: "brush_dots", seedOffset: 400, prefix: "DARK_DOTS" },
   { id: "white_dots", name: "⚪ White Splatter Dots", group: "Under Subject", type: "brush_dots", seedOffset: 300, prefix: "WHITE_DOTS" },
   { id: "accent_strokes", name: "🔥 Accent Strokes (Smart)", group: "Under Subject", type: "accent", prefix: "ACCENT_STROKES" },
@@ -127,6 +128,8 @@ const STATE = {
   presetUserEdits: new Map(),  // Remembers per-preset layer slider/visibility tweaks
   bgFetchPromises: new Map(),
   uploadSessionId: 0,
+  whiteBalanceEnabled: false,
+  whiteBalanceStrength: 25,
   aspectRatioKey: "a4",
   aspectOrientation: null,
   uncroppedPlacement: null,
@@ -627,9 +630,11 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false,
     STATE.presetCache.clear();
     STATE.presetUserEdits.clear();
     STATE.bgFetchPromises.clear();
-    STATE.maskEditedByUser = !!useEditedMask;
+    if (useEditedMask) STATE.maskEditedByUser = true;
   }
 
+  // Always preserve user's edited cutout mask across preset switches & live regenerations!
+  const effectiveUseEditedMask = Boolean(useEditedMask || STATE.maskEditedByUser);
   const currentSessionId = STATE.uploadSessionId;
 
   // Always show loading popup (including fast cached preset switches & undo/redo preset switches)
@@ -642,7 +647,7 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false,
     let compactPayload = null;
 
     const useLocalGPU = !!(window.ClientWatercolorEngine && typeof window.ClientWatercolorEngine.generate === "function");
-    if (!useLocalGPU && (isPresetSwitch || isHistoryRestore) && !useEditedMask) {
+    if (!useLocalGPU && (isPresetSwitch || isHistoryRestore) && !effectiveUseEditedMask) {
       if (STATE.presetCache.has(presetKey)) {
         compactPayload = STATE.presetCache.get(presetKey);
       } else if (STATE.bgFetchPromises.has(presetKey)) {
@@ -651,7 +656,7 @@ async function runModalGeneration(useEditedMask = false, isPresetSwitch = false,
     }
 
     if (!compactPayload) {
-      compactPayload = await fetchPresetPayloadFromServer(presetKey, useEditedMask);
+      compactPayload = await fetchPresetPayloadFromServer(presetKey, effectiveUseEditedMask);
     }
 
     if (!useLocalGPU && currentSessionId === STATE.uploadSessionId && compactPayload) {
@@ -1690,6 +1695,8 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
       enabled = true;
     } else if (def.id === "cool_brush") {
       enabled = (compact.preset_key || "").startsWith("cars") && !!cfg.COOL_BRUSH_ENABLED;
+    } else if (def.id === "eye_highlight") {
+      enabled = !(compact.preset_key || "").startsWith("cars");
     } else {
       const enKey = `${def.prefix}_ENABLED`;
       enabled = cfg[enKey] !== undefined ? !!cfg[enKey] : true;
@@ -1757,7 +1764,18 @@ async function initializeStudioFromPayload(sourcePayload, isPresetSwitch = false
   if (STATE.layers.cool_brush && STATE.layers.cool_brush.vis) {
     rerenderCoolSwooshLayer(true);
   }
-  
+
+  if (STATE.layers.eye_highlight && STATE.layers.eye_highlight.vis) {
+    rerenderEyeHighlightLayer(true);
+  }
+
+  // Always reset the White Balance base snapshot for the newly initialized payload,
+  // and if White Balance is currently toggled ON, apply it immediately!
+  STATE._wbBaseSaved = null;
+  if (STATE.whiteBalanceEnabled && window.InstantWhiteBalance && typeof window.InstantWhiteBalance.applyLive === "function") {
+    window.InstantWhiteBalance.applyLive();
+  }
+
   invalidateStack();
   renderLayerListUI();
   selectLayer(STATE.selectedLayerId || "bg_brush");

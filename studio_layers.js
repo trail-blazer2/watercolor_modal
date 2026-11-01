@@ -249,6 +249,18 @@ function buildInitialLayerParams(def, cfg) {
       saturation: 100,
     });
   }
+  if (def.type === "eye_highlight") {
+    const isPeople = (STATE.payload && STATE.payload.preset_key === "people");
+    return {
+      opacity: isPeople ? 0.3 : 0.5,
+      baseOpacity: 1.0,
+      size: isPeople ? 280 : 380,
+      brushFile: "bgbrush.png",
+      brightness: 100,
+      contrast: 100,
+      saturation: 100,
+    };
+  }
   if (def.type === "cool_swoosh" && typeof buildInitialCoolSwooshParams === "function") {
     return buildInitialCoolSwooshParams(cfg);
   }
@@ -418,6 +430,8 @@ function ensureLayerCanvasRendered(lyr) {
     rerenderLiveOilLayer(true);
   } else if (def.id === "glow" && !lyr.baseCanvas) {
     rerenderLiveGlowLayer(true);
+  } else if (def.id === "eye_highlight" && !lyr.baseCanvas) {
+    rerenderEyeHighlightLayer(true);
   } else if (def.id === "cool_brush" && !lyr.baseCanvas) {
     if (typeof rerenderCoolSwooshLayer === "function") rerenderCoolSwooshLayer(true);
   }
@@ -1273,6 +1287,146 @@ function rerenderLiveGlowLayer(skipComposite = false) {
 
   if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   if (_stack.id !== "glow") invalidateStack();
+  if (!skipComposite) compositeAllLayers();
+}
+
+
+
+
+// ============================================================================
+// 8B-2. EYE-EDGE WHITE HIGHLIGHT BRUSH (Places bgbrush.png on Head Edge Closest to Eyes)
+//   - Finds the detected eye(s) (Animal or Person).
+//   - Locates the silhouette edge point on the side of the head closest to each eye.
+//   - Checks if the painted watercolor wash at that edge is not already too bright.
+//   - Centers bgbrush.png right on the edge line (so half the stroke radiates outward
+//     behind the head, making the animal/person pop!).
+// ============================================================================
+function rerenderEyeHighlightLayer(skipComposite = false) {
+  const lyr = STATE.layers && STATE.layers.eye_highlight;
+  if (!lyr || !STATE.payload) return;
+
+  const [overW, overH] = STATE.payload.canvas_size;
+  if (!lyr.baseCanvas || lyr.baseCanvas.width !== overW || lyr.baseCanvas.height !== overH) {
+    lyr.baseCanvas = createCanvas(overW, overH);
+  }
+  const ctx = lyr.baseCanvas.getContext("2d");
+  ctx.clearRect(0, 0, overW, overH);
+
+  if (isCarPresetActive()) return;
+
+  const brushImg = STATE.brushImages["bgbrush.png"] || Object.values(STATE.brushImages)[0];
+  if (!brushImg) return;
+
+  const [offX, offY] = STATE.payload.offset;
+  const [padX, padY] = STATE.payload.pad || [0, 0];
+  const edges = (STATE.payload.stroke_data && STATE.payload.stroke_data.edges) || [];
+  if (!edges.length) return;
+
+  // Gather eye positions in Overscan Space (from STATE.detectedEyes or STATE.eyeBeautifierPatches)
+  let eyePts = [];
+  if (Array.isArray(STATE.detectedEyes) && STATE.detectedEyes.length > 0) {
+    eyePts = STATE.detectedEyes.map((e) => ({
+      x: e.x + padX,
+      y: e.y + padY,
+    }));
+  } else if (Array.isArray(STATE.eyeBeautifierPatches) && STATE.eyeBeautifierPatches.length > 0) {
+    eyePts = STATE.eyeBeautifierPatches.map((ep) => ({
+      x: ep.baseX + ep.w * 0.5 + padX,
+      y: ep.baseY + ep.h * 0.5 + padY,
+    }));
+  }
+  if (!eyePts.length) return;
+
+  eyePts.sort((a, b) => a.x - b.x);
+  const targetEyes = eyePts.length >= 2
+    ? [
+        { ...eyePts[0], sideHint: "left" },
+        { ...eyePts[eyePts.length - 1], sideHint: "right" },
+      ]
+    : [{ ...eyePts[0], sideHint: "nearest" }];
+
+  const p = lyr.params;
+  const cfg = STATE.payload.preset_settings || {};
+  let winningCandidate = null;
+
+  // Evaluate each eye's closest outer head edge and pick ONLY THE SINGLE CLOSEST ONE!
+  for (const eye of targetEyes) {
+    const subEyeX = eye.x - offX;
+    const subEyeY = eye.y - offY;
+
+    let bestEdge = null;
+    let bestScore = Infinity;
+
+    for (let i = 0; i < edges.length; i++) {
+      const e = edges[i];
+      const ex = e[0], ey = e[1];
+      const dy = ey - subEyeY;
+      if (Math.abs(dy) > 220) continue;
+
+      const dx = ex - subEyeX;
+      if (eye.sideHint === "left" && dx > 25) continue;
+      if (eye.sideHint === "right" && dx < -25) continue;
+
+      const d2 = dx * dx + dy * dy * 2.4;
+      if (d2 < bestScore) {
+        bestScore = d2;
+        bestEdge = e;
+      }
+    }
+
+    if (!bestEdge) continue;
+    const drawX = bestEdge[0] + offX;
+    const drawY = bestEdge[1] + offY;
+
+    // Brightness check: ensure the painted watercolor area at this edge is not already too bright
+    const er = bestEdge[4], eg = bestEdge[5], eb = bestEdge[6];
+    const edgeLum = 0.299 * er + 0.587 * eg + 0.114 * eb;
+
+    let paintedWashLum = edgeLum * (cfg.BG_BRUSH_BRIGHTNESS ?? 0.6);
+    if (STATE.layers.bg_brush && STATE.layers.bg_brush.cachedStrokes) {
+      let washCov = 0;
+      for (const s of STATE.layers.bg_brush.cachedStrokes) {
+        const dist = Math.hypot(s.x - drawX, s.y - drawY);
+        if (dist < s.size * 0.42) {
+          const sLum = 0.299 * s.rgb[0] + 0.587 * s.rgb[1] + 0.114 * s.rgb[2];
+          paintedWashLum = Math.min(paintedWashLum, sLum);
+          washCov += 1;
+        }
+      }
+      if (!cfg.DARK_BACKGROUND_ENABLED && washCov === 0 && edgeLum > 195) {
+        continue;
+      }
+    }
+
+    if (paintedWashLum > 205 && edgeLum > 210) continue;
+
+    if (!winningCandidate || bestScore < winningCandidate.score) {
+      const nx = bestEdge[2], ny = bestEdge[3];
+      const rotAngle = (Math.atan2(-ny, nx) * 180) / Math.PI + 270;
+      winningCandidate = {
+        score: bestScore,
+        stroke: {
+          x: drawX,
+          y: drawY,
+          size: p.size,
+          rot: rotAngle,
+          rgb: [255, 255, 255],
+          op: 1.0,
+        },
+      };
+    }
+  }
+
+  // Place strictly ONE singular highlight stroke on the winning head edge!
+  if (winningCandidate) {
+    const glC = drawStrokesWebGL(overW, overH, "bgbrush.png", brushImg, [winningCandidate.stroke]);
+    if (glC) {
+      ctx.drawImage(glC, 0, 0);
+    }
+  }
+
+  if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+  if (_stack.id !== "eye_highlight") invalidateStack();
   if (!skipComposite) compositeAllLayers();
 }
 

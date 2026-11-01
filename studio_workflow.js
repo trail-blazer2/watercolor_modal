@@ -482,7 +482,14 @@ const Workflow = (() => {
     const targetSessionId = STATE.eyeSessionId;
     PERF_LOG.markStart("BG_WheelTurn_GPU_RPC");
     try {
-      const blob = await prepareOptimizedUploadBlob(img, "cars_black");
+      let sourceForWheel = img;
+      if (STATE.isLowResPhoto && STATE.upscalePromise) {
+        const upData = await STATE.upscalePromise;
+        if (upData && upData.upscaledImg) {
+          sourceForWheel = upData.upscaledImg;
+        }
+      }
+      const blob = await prepareOptimizedUploadBlob(sourceForWheel, "cars_black");
       const fd = new FormData();
       fd.append("image_file", blob, "upload.jpg");
       const res = await fetch(`${STATE.apiUrl}/steer_wheel`, { method: "POST", body: fd });
@@ -498,6 +505,32 @@ const Workflow = (() => {
         ]);
         STATE.wheelTurnData = { ...data, patchRgbImg, patchMaskImg };
         PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `${data.turn} ${data.angle}° (server ${data.elapsed_sec}s)`);
+
+        // If the user already entered Step 3 (Studio) while a cold GPU was booting,
+        // hot-build the turned wheel canvases and update the live Studio painting automatically!
+        if (currentStep === "studio" && STATE.payload && STATE.uncroppedPlacement && STATE.eyeSessionId === targetSessionId) {
+          const outW = STATE.unturnedFramedPhotoCanvas ? STATE.unturnedFramedPhotoCanvas.width : 1782;
+          const outH = STATE.unturnedFramedPhotoCanvas ? STATE.unturnedFramedPhotoCanvas.height : 1260;
+          const px = STATE.uncroppedPlacement.px;
+          const framedMaskC = STATE.unturnedFramedMaskCanvas;
+          if (STATE.lowResUnturnedPhotoCanvas && framedMaskC) {
+            const lowTurned = buildTurnedPhotoAndMaskFromBase(
+              STATE.lowResUnturnedPhotoCanvas, framedMaskC, STATE.wheelTurnData, px, outW, outH
+            );
+            STATE.lowResTurnedPhotoCanvas = lowTurned.turnedPhotoC;
+            STATE.turnedFramedMaskCanvas = lowTurned.turnedMaskC;
+          }
+          if (STATE.hqUnturnedPhotoCanvas && framedMaskC) {
+            const hqTurned = buildTurnedPhotoAndMaskFromBase(
+              STATE.hqUnturnedPhotoCanvas, framedMaskC, STATE.wheelTurnData, px, outW, outH
+            );
+            STATE.hqTurnedPhotoCanvas = hqTurned.turnedPhotoC;
+            STATE.turnedFramedMaskCanvas = hqTurned.turnedMaskC;
+          }
+          syncActiveResolutionAndWheelCanvases();
+          if (STATE.presetCache) STATE.presetCache.clear();
+          runModalGeneration(Boolean(STATE.maskEditedByUser), true, true);
+        }
         return STATE.wheelTurnData;
       } else {
         PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `skipped (${data ? data.reason : "unknown"})`);
@@ -1078,7 +1111,8 @@ const Workflow = (() => {
       await STATE.upscalePromise;
     }
 
-    // 2. If this is a car, ensure /steer_wheel has finished
+    // 2. If this is a car, wait up to 4.0s for /steer_wheel (if warm, finishes in ~2s;
+    //    if cold-booting on Modal, enter Studio immediately and hot-swap when ready!)
     if (isCar || profileKey === "car" || STATE.isCarPhoto) {
       if (!STATE.wheelTurnPromise && !STATE.wheelTurnData && CROP.sourceImg) {
         STATE.wheelTurnPromise = fetchWheelTurnInBackground(CROP.sourceImg);
@@ -1087,7 +1121,10 @@ const Workflow = (() => {
         startProgressBar(false);
         const loadingText = document.getElementById("loadingText");
         if (loadingText) loadingText.textContent = "Steering front wheel in 3D...";
-        await STATE.wheelTurnPromise;
+        await Promise.race([
+          STATE.wheelTurnPromise,
+          new Promise((r) => setTimeout(r, 4000)),
+        ]);
       }
     }
 
