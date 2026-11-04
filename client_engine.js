@@ -174,6 +174,7 @@
       uniform float u_wbStrength;
       uniform float u_protectBlueBody;
       uniform vec3 u_wbGain;
+      uniform float u_hdrShadows;
       uniform float u_wcOp;
       uniform vec2 u_wcScale;
       uniform int u_flipY;
@@ -213,6 +214,41 @@
           c.r = clamp(c.r + w * bAmt * (20.0 / 255.0), 0.0, 1.0);
           c.b = clamp(c.b - w * bAmt * (10.0 / 255.0), 0.0, 1.0);
         }
+
+        if (u_hdrShadows > 0.001) {
+          // Exact Photoshop "Image -> Adjustments -> Shadows/Highlights" (Shadows Only) Curve:
+          // Uses mix(L, maxRGB, 0.55) so bright red/colored car paint (where R is high so maxRGB ~ 0.75)
+          // is NEVER mistaken for a dark shadow, while true dark regions (black grille, tires, dark fur)
+          // get a crisp, zero-pedestal multiplicative lift that expands local detail (like Audi rings & mesh)!
+          float pixL = dot(c, vec3(0.299, 0.587, 0.114));
+          float maxC = max(c.r, max(c.g, c.b));
+          float tRef = mix(pixL, maxC, 0.55);
+
+          vec3 bRgb = texture(u_lumBlur, uv).rgb;
+          float bLum = dot(bRgb, vec3(0.299, 0.587, 0.114));
+          float bMax = max(bRgb.r, max(bRgb.g, bRgb.b));
+          float bTone = mix(bLum, bMax, 0.55);
+
+          // Edge-preserving local shadow tone (prevents red bodywork from bleeding into black grille edges)
+          float tLoc = mix(tRef, min(tRef, bTone), 0.58);
+
+          // Smooth shadow tonal width (0.0 .. 0.82) with exponent 2.5
+          float shMask = clamp(1.0 - tLoc / 0.82, 0.0, 1.0);
+          shMask = shMask * shMask * sqrt(shMask);
+
+          // Pure multiplicative rational shadow gain (zero additive pedestal so deep blacks stay rich, never milky!)
+          float amt = u_hdrShadows * 1.15;
+          float gain = 1.0 + (amt * shMask) / (tRef + 0.16);
+          float newL = clamp(pixL * gain, 0.0, 1.0);
+          float dL = newL - pixL;
+
+          // Y + Chroma scaling (matches CIE Lab / Photoshop Color Correction: keeps red paint rich crimson
+          // and damps noisy blue/purple sensor chroma in deep achromatic shadows)
+          float deepDark = 1.0 - smoothstep(0.02, 0.18, maxC);
+          float coldNoise = clamp((c.b - c.r * 0.95) * 3.0, 0.0, 1.0);
+          float chromaScale = (1.0 + (gain - 1.0) * 0.38 + dL * 1.45) * (1.0 - deepDark * coldNoise * 0.55);
+          c = clamp(vec3(newL) + (c - vec3(pixL)) * chromaScale, 0.0, 1.0);
+        }
         if (u_wbStrength > 0.001) {
           // 1. Illuminant Chromatic Adaptation (restores sun-lit yellow/orange casts AND cool shade casts to true neutral!)
           c = clamp(c * mix(vec3(1.0), u_wbGain, u_wbStrength), 0.0, 1.0);
@@ -226,22 +262,19 @@
           float achromGate = 1.0 - smoothstep(0.28, 0.52, satW);
 
           // 3. Strong Cool/Sky Cast Neutralizer (kills blue/cyan sky reflections on Red Audi glass, White Seat, & Black Dog fur!):
-          //    Triggers whenever Blue (or Cyan-Blue) exceeds Red, even at high saturation (up to 0.85)!
           float blueOverRed = clamp((c.b - c.r * 1.02) / max(0.04, mxW - mnW + 0.02), 0.0, 1.0);
           float cyanOverRed = clamp((min(c.b, c.g) - c.r * 1.02) / max(0.04, mxW - mnW + 0.02), 0.0, 1.0);
           float coolCast = clamp(max(blueOverRed, cyanOverRed) * 1.45, 0.0, 1.0);
 
-          // Only protect vivid blue if the subject itself is a bright blue car (u_protectBlueBody == 1.0)
           float skyOrShadeKill = coolCast * (1.0 - u_protectBlueBody * smoothstep(0.50, 0.72, satW));
 
-          // 4. Sun-lit / Warm Cast Neutralizer on Whites & Darks (restores sun-lit white/grey/black fur without dulling rich midtone fur):
+          // 4. Sun-lit / Warm Cast Neutralizer on Whites & Darks:
           float darkZone = 1.0 - smoothstep(0.22, 0.52, lwb);
           float lightZone = smoothstep(0.58, 0.82, lwb);
           float extremeToneNeutral = max(darkZone, lightZone) * (1.0 - smoothstep(0.38, 0.68, satW));
 
           float neutWeight = clamp(max(max(achromGate, skyOrShadeKill), extremeToneNeutral) * u_wbStrength, 0.0, 1.0);
 
-          // Make whites crisp white, greys clean grey, and bluish/tinted blacks deep charcoal-black:
           float targetL = lwb;
           targetL = mix(targetL, targetL * 0.84, darkZone * max(coolCast, achromGate) * 0.75);
           targetL = mix(targetL, min(1.0, targetL * 1.08 + 0.025), lightZone * max(coolCast, achromGate) * 0.75);
@@ -258,6 +291,7 @@
     `;
 
     // Oil Pass 1: Tone Curve + Levels + Gamma (also outputs luminance in .a)
+    // NEVER inverts or darkens bright specular reflections/windshields into dark grey!
     const fsOilTone = `#version 300 es
       precision highp float;
       in vec2 v_uv;
@@ -283,8 +317,7 @@
       }
     `;
 
-    // Oil Pass 2: Structure Tensor + 8-Step Bidirectional LIC Advection
-    // Mask-aware: if a streamline steps outside the subject mask, it clamps to the last valid interior pixel!
+    // Oil Pass 2: Exact Original Structure Tensor + 8-Step Bidirectional LIC Advection
     const fsOilLIC = `#version 300 es
       precision highp float;
       in vec2 v_uv;
@@ -337,7 +370,7 @@
       }
     `;
 
-    // Oil Pass 3: True 2D Gaussian Blur (sigma=2.7) of the LIC-Advected Image (Mask-normalized so edges never halo!)
+    // Oil Pass 3: Exact Original 2D Gaussian Blur (sigma=2.7) of the LIC-Advected Image
     const fsOilBlur = `#version 300 es
       precision highp float;
       in vec2 v_uv;
@@ -360,7 +393,7 @@
       }
     `;
 
-    // Oil Pass 4: Exact High-Pass Bristle Overlay + Unsharp Mask + Final Contrast + Mask Alpha
+    // Oil Pass 4: Exact Original High-Pass Bristle Overlay + Unsharp Mask + Final Contrast + Mask Alpha
     const fsOilComp = `#version 300 es
       precision highp float;
       in vec2 v_uv;
@@ -539,13 +572,9 @@
 
       lumSmallC = createCanvas(sw4, sh4);
       const lsCtx = lumSmallC.getContext("2d");
-      const lsImg = lsCtx.createImageData(sw4, sh4);
-      for (let i = 0; i < n4; i++) {
-        const v = Math.max(0, Math.min(255, Math.round(lumBlur4[i])));
-        const p = i * 4;
-        lsImg.data[p] = v; lsImg.data[p + 1] = v; lsImg.data[p + 2] = v; lsImg.data[p + 3] = 255;
-      }
-      lsCtx.putImageData(lsImg, 0, 0);
+      lsCtx.filter = "blur(5px)";
+      lsCtx.drawImage(subSmallC, 0, 0);
+      lsCtx.filter = "none";
       subSmallC.width = 1; subSmallC.height = 1;
     }
 
@@ -590,6 +619,7 @@
       // Keep u_wbStrength = 0.0 during base generation so the base layers stay un-balanced;
       // InstantWhiteBalance.applyLive() then applies 0%..100% White Balance live in < 6ms!
       gl.uniform1f(gl.getUniformLocation(progCC, "u_wbStrength"), 0.0);
+      gl.uniform1f(gl.getUniformLocation(progCC, "u_hdrShadows"), 0.0);
       gl.uniform1f(gl.getUniformLocation(progCC, "u_protectBlueBody"), protectBlueBody);
       gl.uniform3f(gl.getUniformLocation(progCC, "u_wbGain"), wbGain[0], wbGain[1], wbGain[2]);
 
@@ -625,6 +655,7 @@
     }
 
     let oilFull = null;
+    let oilCleanHiFull = null;
     if (cfg.OIL_PAINT_ENABLED !== false) {
       const oilScale = cfg.OIL_DETAIL_SCALE ?? 0.85;
       const ow = Math.max(16, Math.round(w * oilScale));
@@ -638,70 +669,79 @@
       const rtPing = createEmptyTexFbo(gl, ow, oh);
       const rtBlur = createEmptyTexFbo(gl, ow, oh);
 
-      // Oil Pass 1: Tone + Levels into rtToned (ow x oh)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, rtToned.fbo);
-      gl.viewport(0, 0, ow, oh);
-      gl.useProgram(progOilTone);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texCc);
-      gl.uniform1i(gl.getUniformLocation(progOilTone, "u_cc"), 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texLumBlur);
-      gl.uniform1i(gl.getUniformLocation(progOilTone, "u_lumBlur"), 1);
-
       const shAmt = ((cfg.OIL_SHADOW_AMOUNT ?? 30) / 100.0) * 100.0;
-      const hiAmt = ((cfg.OIL_HIGHLIGHT_AMOUNT ?? 90) / 100.0) * 80.0;
+      const fullHiAmt = ((cfg.OIL_HIGHLIGHT_AMOUNT ?? 90) / 100.0) * 80.0;
       const black = cfg.OIL_LEVELS_BLACK ?? 30;
       const white = cfg.OIL_LEVELS_WHITE ?? 220;
-      gl.uniform1f(gl.getUniformLocation(progOilTone, "u_shAmt"), shAmt);
-      gl.uniform1f(gl.getUniformLocation(progOilTone, "u_hiAmt"), hiAmt);
-      gl.uniform1f(gl.getUniformLocation(progOilTone, "u_black"), black);
-      gl.uniform1f(gl.getUniformLocation(progOilTone, "u_invRange"), 1.0 / Math.max(1.0, white - black));
-      gl.uniform1f(gl.getUniformLocation(progOilTone, "u_invGamma"), 1.0 / (cfg.OIL_LEVELS_GAMMA ?? 0.95));
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      // Oil Pass 2: Structure Tensor + 8-Step LIC into rtLic (ow x oh)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, rtLic.fbo);
-      gl.useProgram(progOilLIC);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtToned.tex);
-      gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_toned"), 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texMask);
-      gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_mask"), 1);
-      gl.uniform2f(gl.getUniformLocation(progOilLIC, "u_step"), 1.0 / ow, 1.0 / oh);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      const run4PassOilWithHiAmt = (hiAmtVal) => {
+        // Oil Pass 1: Tone + Levels into rtToned (ow x oh) — 100% identical to client_engine_OLD.js
+        gl.bindFramebuffer(gl.FRAMEBUFFER, rtToned.fbo);
+        gl.viewport(0, 0, ow, oh);
+        gl.useProgram(progOilTone);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texCc);
+        gl.uniform1i(gl.getUniformLocation(progOilTone, "u_cc"), 0);
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texLumBlur);
+        gl.uniform1i(gl.getUniformLocation(progOilTone, "u_lumBlur"), 1);
 
-      // Oil Pass 3: Separable 2D Gaussian Blur of rtLic -> rtPing -> rtBlur
-      gl.useProgram(progOilBlur);
-      gl.uniform1i(gl.getUniformLocation(progOilBlur, "u_src"), 0);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, rtPing.fbo);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtLic.tex);
-      gl.uniform2f(gl.getUniformLocation(progOilBlur, "u_dirStep"), 1.0 / ow, 0.0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.uniform1f(gl.getUniformLocation(progOilTone, "u_shAmt"), shAmt);
+        gl.uniform1f(gl.getUniformLocation(progOilTone, "u_hiAmt"), hiAmtVal);
+        gl.uniform1f(gl.getUniformLocation(progOilTone, "u_black"), black);
+        gl.uniform1f(gl.getUniformLocation(progOilTone, "u_invRange"), 1.0 / Math.max(1.0, white - black));
+        gl.uniform1f(gl.getUniformLocation(progOilTone, "u_invGamma"), 1.0 / (cfg.OIL_LEVELS_GAMMA ?? 0.95));
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      gl.bindFramebuffer(gl.FRAMEBUFFER, rtBlur.fbo);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtPing.tex);
-      gl.uniform2f(gl.getUniformLocation(progOilBlur, "u_dirStep"), 0.0, 1.0 / oh);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        // Oil Pass 2: Structure Tensor + 8-Step LIC into rtLic (ow x oh)
+        gl.bindFramebuffer(gl.FRAMEBUFFER, rtLic.fbo);
+        gl.useProgram(progOilLIC);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtToned.tex);
+        gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_toned"), 0);
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texMask);
+        gl.uniform1i(gl.getUniformLocation(progOilLIC, "u_mask"), 1);
+        gl.uniform2f(gl.getUniformLocation(progOilLIC, "u_step"), 1.0 / ow, 1.0 / oh);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      // Oil Pass 4: High-Pass Bristle Overlay + Unsharp Mask + Mask Alpha at full w x h
-      canvas.width = w;
-      canvas.height = h;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, w, h);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.useProgram(progOilComp);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtLic.tex);
-      gl.uniform1i(gl.getUniformLocation(progOilComp, "u_lic"), 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, rtBlur.tex);
-      gl.uniform1i(gl.getUniformLocation(progOilComp, "u_licBlur"), 1);
-      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texMask);
-      gl.uniform1i(gl.getUniformLocation(progOilComp, "u_mask"), 2);
-      gl.uniform1f(gl.getUniformLocation(progOilComp, "u_hpStrength"), cfg.OIL_HIGH_PASS_STRENGTH ?? 0.5);
-      gl.uniform1f(gl.getUniformLocation(progOilComp, "u_unsharp"), cfg.OIL_UNSHARP_AMOUNT ?? 1.1);
-      gl.uniform1f(gl.getUniformLocation(progOilComp, "u_finalCon"), cfg.OIL_FINAL_CONTRAST ?? 1.0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        // Oil Pass 3: Separable 2D Gaussian Blur of rtLic -> rtPing -> rtBlur
+        gl.useProgram(progOilBlur);
+        gl.uniform1i(gl.getUniformLocation(progOilBlur, "u_src"), 0);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, rtPing.fbo);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtLic.tex);
+        gl.uniform2f(gl.getUniformLocation(progOilBlur, "u_dirStep"), 1.0 / ow, 0.0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      oilFull = createCanvas(cw, ch);
-      oilFull.getContext("2d").drawImage(canvas, offX, offY);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, rtBlur.fbo);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtPing.tex);
+        gl.uniform2f(gl.getUniformLocation(progOilBlur, "u_dirStep"), 0.0, 1.0 / oh);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // Oil Pass 4: High-Pass Bristle Overlay + Unsharp Mask + Mask Alpha at full w x h
+        canvas.width = w;
+        canvas.height = h;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, w, h);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(progOilComp);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtLic.tex);
+        gl.uniform1i(gl.getUniformLocation(progOilComp, "u_lic"), 0);
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, rtBlur.tex);
+        gl.uniform1i(gl.getUniformLocation(progOilComp, "u_licBlur"), 1);
+        gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texMask);
+        gl.uniform1i(gl.getUniformLocation(progOilComp, "u_mask"), 2);
+        gl.uniform1f(gl.getUniformLocation(progOilComp, "u_hpStrength"), cfg.OIL_HIGH_PASS_STRENGTH ?? 0.5);
+        gl.uniform1f(gl.getUniformLocation(progOilComp, "u_unsharp"), cfg.OIL_UNSHARP_AMOUNT ?? 1.1);
+        gl.uniform1f(gl.getUniformLocation(progOilComp, "u_finalCon"), cfg.OIL_FINAL_CONTRAST ?? 1.0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        const outC = createCanvas(cw, ch);
+        outC.getContext("2d").drawImage(canvas, offX, offY);
+        return outC;
+      };
+
+      // 1. Exact client_engine_OLD.js Oil Paint (100% Highlight Darkening)
+      oilFull = run4PassOilWithHiAmt(fullHiAmt);
+      // 2. Clean-Highlight Oil Paint (0% Highlight Darkening, brights stay bright!)
+      oilCleanHiFull = run4PassOilWithHiAmt(0.0);
 
       for (const rt of [rtToned, rtLic, rtPing, rtBlur]) {
         gl.deleteFramebuffer(rt.fbo);
@@ -717,7 +757,7 @@
     gl.deleteTexture(texMask);
     if (texWc !== texOrig) gl.deleteTexture(texWc);
     canvas.width = 1; canvas.height = 1;
-    return { cleanCcCrop, subCcFull, subTexFull, oilFull, lumSmallC, meanL, protectBlueBody, wbGain };
+    return { cleanCcCrop, subCcFull, subTexFull, oilFull, oilCleanHiFull, lumSmallC, meanL, protectBlueBody, wbGain };
   }
 
   // ==========================================================================
@@ -1246,8 +1286,15 @@
       if (x <= leftT) rot += endTurn * (1.0 - (x - minX) / Math.max(1e-5, leftT - minX));
       else if (x >= rightT) rot -= endTurn * ((x - rightT) / Math.max(1e-5, maxX - rightT));
       const sz = Math.max(20, Math.trunc(baseSize * rng.uniform(1 - sizeJit, 1 + sizeJit)));
-      strokes.push({ x: x + offset[0], y: y + offset[1], size: sz, rot, rgb, op: 1.0 });
+      strokes.push({ x: x + offset[0], y: y + offset[1], size: sz, rot, rgb: [...rgb], op: 1.0 });
     }
+    STATE._shadowStrokeCache = {
+      baseRgb: [...rgb],
+      opacity: cfg.SHADOW_BRUSH_OPACITY ?? 0.5,
+      baseW: cw,
+      baseH: ch,
+      strokes: strokes.map((s) => ({ ...s, rgb: [...s.rgb] })),
+    };
     const glC = drawStrokesWebGL(cw, ch, "bgbrush.png", brushImg, strokes);
     const ctx = outC.getContext("2d");
     ctx.globalAlpha = cfg.SHADOW_BRUSH_OPACITY ?? 0.5;
@@ -1290,24 +1337,31 @@
   // 5. MASTER CLIENT-SIDE PAYLOAD GENERATOR
   // ==========================================================================
   async function generate(presetKey, useEditedMask = false) {
-    if (typeof _glgpu !== "undefined" && _glgpu) {
-      try { _glgpu.gl.deleteProgram(_glgpu.progCC); } catch (_) {}
-      _glgpu = null;
-    }
     const t0 = performance.now();
     const timings = { "0_engine_mode": "⚡ LOCAL_BROWSER_WEBGL2" };
     const { key, cfg } = await getPresetFromServerSingleSource(presetKey);
 
-    const cw = cfg.OUTPUT_WIDTH || (key.startsWith("cars") ? 1782 : 1260);
-    const ch = cfg.OUTPUT_HEIGHT || (key.startsWith("cars") ? 1260 : 1782);
-
-    let tStep = performance.now();
-    const origSource = STATE.framedPhotoCanvas || STATE.originalImg;
     const isCar = key.startsWith("cars");
-    const maxW = isCar ? 1782 : 1260;
-    const maxH = isCar ? 1260 : 1782;
+    const hasDualWheelVariants = !!(
+      isCar &&
+      STATE.wheelTurnData &&
+      STATE.wheelTurnData.turned &&
+      STATE.unturnedFramedPhotoCanvas &&
+      STATE.turnedFramedPhotoCanvas
+    );
+    const origSource = hasDualWheelVariants
+      ? STATE.turnedFramedPhotoCanvas
+      : (STATE.framedPhotoCanvas || STATE.originalImg);
     let w = origSource.naturalWidth || origSource.width;
     let h = origSource.naturalHeight || origSource.height;
+
+    const isLandscapeCanvas = isCar || w > h || STATE.aspectOrientation === "landscape";
+    const cw = isLandscapeCanvas ? 1782 : (cfg.OUTPUT_WIDTH || 1260);
+    const ch = isLandscapeCanvas ? 1260 : (cfg.OUTPUT_HEIGHT || 1782);
+
+    let tStep = performance.now();
+    const maxW = cw;
+    const maxH = ch;
     if (w > maxW || h > maxH) {
       const sc = Math.min(maxW / w, maxH / h);
       w = Math.round(w * sc);
@@ -1315,14 +1369,16 @@
     }
 
     const origC = createCanvas(w, h);
-    origC.getContext("2d").drawImage(origSource, 0, 0, w, h);
+    origC.getContext("2d", { willReadFrequently: true }).drawImage(origSource, 0, 0, w, h);
 
     const maskC = createCanvas(w, h);
-    const mCtx = maskC.getContext("2d");
+    const mCtx = maskC.getContext("2d", { willReadFrequently: true });
     if (useEditedMask && STATE.maskCanvas) {
       mCtx.filter = "blur(1.5px)";
       mCtx.drawImage(STATE.maskCanvas, 0, 0, w, h);
       mCtx.filter = "none";
+    } else if (hasDualWheelVariants && STATE.turnedFramedMaskCanvas) {
+      mCtx.drawImage(STATE.turnedFramedMaskCanvas, 0, 0, w, h);
     } else if (STATE.framedMaskCanvas) {
       mCtx.drawImage(STATE.framedMaskCanvas, 0, 0, w, h);
     } else if (STATE.rawMaskBase64) {
@@ -1355,21 +1411,18 @@
     const offset = [offX, offY];
 
     // 2. WebGL2 GPU Color Correction + WebGL2 GPU 4-Pass LIC Oil Paint
-    // 2. WebGL2 GPU Color Correction + WebGL2 GPU 4-Pass LIC Oil Paint
     tStep = performance.now();
     const gpuOut = renderSubjectAndOilGPU(origC, maskC, w, h, cw, ch, offset, cfg);
     if (!gpuOut) throw new Error("WebGL2 GPU filter context unavailable");
-    const { cleanCcCrop, subCcFull, subTexFull, oilFull } = gpuOut;
-    
+    const { cleanCcCrop, subCcFull, subTexFull, oilFull, oilCleanHiFull } = gpuOut;
+
     STATE._wbProtectBlue = gpuOut.protectBlueBody ?? 0.0;
     STATE._wbGain = gpuOut.wbGain || [1.0, 1.0, 1.0];
     STATE._wbBaseSaved = null;
 
-
-
     // FIRST: Create subRawFull!
     const subRawFull = createCanvas(cw, ch);
-    const origCtx = origC.getContext("2d");
+    const origCtx = origC.getContext("2d", { willReadFrequently: true });
     const origImgData = origCtx.getImageData(0, 0, w, h);
     const oD = origImgData.data;
     for (let i = 0, p = 3; i < maskClean.length; i++, p += 4) oD[p] = maskClean[i];
@@ -1377,179 +1430,200 @@
     subRawFull.getContext("2d").drawImage(origC, offX, offY);
     origC.width = 1; origC.height = 1;
 
-    // SECOND: Build unturned layer canvases if this is a car with a turned wheel
- let unturnedLayerBlobs = null;
- if (
-   isCar &&
-   STATE.wheelTurnData &&
-   STATE.wheelTurnData.turned &&
-   STATE.unturnedFramedPhotoCanvas &&
-   STATE.turnedFramedPhotoCanvas
- ) {
-   const uOrigC = createCanvas(w, h);
-   uOrigC.getContext("2d").drawImage(STATE.unturnedFramedPhotoCanvas, 0, 0, w, h);
+    // SECOND: Build compact unturned wheel patches ONLY on the wheel crop region (~12ms, 0.3 MB RAM!)
+    // so there is NEVER a rectangular patch seam or UV mismatch! (~18ms on WebGL2 GPU)
+    let unturnedLayerBlobs = null;
+    let edgeMaskForBrushes = maskClean;
+    if (hasDualWheelVariants) {
+      const uOrigC = createCanvas(w, h);
+      uOrigC.getContext("2d", { willReadFrequently: true }).drawImage(STATE.unturnedFramedPhotoCanvas, 0, 0, w, h);
 
-   const uMaskC = createCanvas(w, h);
-   const umCtx = uMaskC.getContext("2d");
-   if (useEditedMask && STATE.maskCanvas) {
-     umCtx.filter = "blur(1.5px)";
-     umCtx.drawImage(STATE.maskCanvas, 0, 0, w, h);
-     umCtx.filter = "none";
-   } else if (STATE.unturnedFramedMaskCanvas) {
-     umCtx.drawImage(STATE.unturnedFramedMaskCanvas, 0, 0, w, h);
-   } else {
-     umCtx.drawImage(maskC, 0, 0);
-   }
-   const uRawMaskData = umCtx.getImageData(0, 0, w, h).data;
-   const uRawU8 = new Uint8Array(w * h);
-   for (let i = 0, p = 0; i < uRawU8.length; i++, p += 4) uRawU8[i] = uRawMaskData[p];
-   const uMaskClean = erodeMaskFastUint8(uRawU8, w, h, trim);
-   const uCleanImg = umCtx.createImageData(w, h);
-   for (let i = 0, p = 0; i < uMaskClean.length; i++, p += 4) {
-     const v = uMaskClean[i];
-     uCleanImg.data[p] = v; uCleanImg.data[p + 1] = v; uCleanImg.data[p + 2] = v; uCleanImg.data[p + 3] = 255;
-   }
-   umCtx.putImageData(uCleanImg, 0, 0);
+      const uMaskC = createCanvas(w, h);
+      const umCtx = uMaskC.getContext("2d", { willReadFrequently: true });
+      if (useEditedMask && STATE.maskCanvas) {
+        umCtx.filter = "blur(1.5px)";
+        umCtx.drawImage(STATE.maskCanvas, 0, 0, w, h);
+        umCtx.filter = "none";
+      } else if (STATE.unturnedFramedMaskCanvas) {
+        umCtx.drawImage(STATE.unturnedFramedMaskCanvas, 0, 0, w, h);
+      } else {
+        umCtx.drawImage(maskC, 0, 0, w, h);
+      }
 
-   const uGpu = renderSubjectAndOilGPU(uOrigC, uMaskC, w, h, cw, ch, offset, cfg, {
-     lumSmallC: gpuOut.lumSmallC,
-     meanL: gpuOut.meanL,
-     protectBlueBody: gpuOut.protectBlueBody,
-     wbGain: gpuOut.wbGain,
-   });
+      const uRawMaskData = umCtx.getImageData(0, 0, w, h).data;
+      const uRawU8 = new Uint8Array(w * h);
+      for (let i = 0, p = 0; i < uRawU8.length; i++, p += 4) uRawU8[i] = uRawMaskData[p];
+      const uMaskClean = erodeMaskFastUint8(uRawU8, w, h, trim);
+      edgeMaskForBrushes = uMaskClean;
+      const uCleanImg = umCtx.createImageData(w, h);
+      for (let i = 0, p = 0; i < uMaskClean.length; i++, p += 4) {
+        const v = uMaskClean[i];
+        uCleanImg.data[p] = v; uCleanImg.data[p + 1] = v; uCleanImg.data[p + 2] = v; uCleanImg.data[p + 3] = 255;
+      }
+      umCtx.putImageData(uCleanImg, 0, 0);
 
-   if (uGpu) {
-     uGpu.cleanCcCrop.width = 1; uGpu.cleanCcCrop.height = 1;
-     const uRawFull = createCanvas(cw, ch);
-     const uoCtx = uOrigC.getContext("2d");
-     const uoImg = uoCtx.getImageData(0, 0, w, h);
-     for (let i = 0, p = 3; i < uMaskClean.length; i++, p += 4) uoImg.data[p] = uMaskClean[i];
-     uoCtx.putImageData(uoImg, 0, 0);
-     uRawFull.getContext("2d").drawImage(uOrigC, offX, offY);
+      const uGpu = renderSubjectAndOilGPU(uOrigC, uMaskC, w, h, cw, ch, offset, cfg, {
+        lumSmallC: gpuOut.lumSmallC,
+        meanL: gpuOut.meanL,
+        protectBlueBody: gpuOut.protectBlueBody,
+        wbGain: gpuOut.wbGain,
+      });
 
-     unturnedLayerBlobs = {
-       subject_raw: uRawFull,
-       subject_cc: uGpu.subCcFull,
-       subject_tex: uGpu.subTexFull,
-       oil_paint_full: uGpu.oilFull,
-     };
-   }
-   uOrigC.width = 1; uOrigC.height = 1;
-   uMaskC.width = 1; uMaskC.height = 1;
- }
- if (gpuOut.lumSmallC) {
-   gpuOut.lumSmallC.width = 1;
-   gpuOut.lumSmallC.height = 1;
- }
+      if (uGpu) {
+        uGpu.cleanCcCrop.width = 1; uGpu.cleanCcCrop.height = 1;
+        const uRawFull = createCanvas(cw, ch);
+        const uoCtx = uOrigC.getContext("2d", { willReadFrequently: true });
+        const uoImg = uoCtx.getImageData(0, 0, w, h);
+        for (let i = 0, p = 3; i < uMaskClean.length; i++, p += 4) uoImg.data[p] = uMaskClean[i];
+        uoCtx.putImageData(uoImg, 0, 0);
+        uRawFull.getContext("2d").drawImage(uOrigC, offX, offY);
 
- timings["2_gpu_cc_and_oil_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
+        unturnedLayerBlobs = {
+          subject_raw: uRawFull,
+          subject_cc: uGpu.subCcFull,
+          subject_tex: uGpu.subTexFull,
+          oil_paint_full: uGpu.oilFull,
+          oil_clean_hi_full: uGpu.oilCleanHiFull,
+        };
+      }
+      uOrigC.width = 1; uOrigC.height = 1;
+      uMaskC.width = 1; uMaskC.height = 1;
+    }
+    if (gpuOut.lumSmallC) {
+      gpuOut.lumSmallC.width = 1;
+      gpuOut.lumSmallC.height = 1;
+    }
 
- // 3. Half-Scale Normal Pyramid, Full-Res Edges, Accents & Auxiliary Layers
- tStep = performance.now();
- const {
-   averageColor,
-   dominantColor,
-   edges,
-   edgePixelsX,
-   edgePixelsY,
-   normXHalf,
-   normYHalf,
-   hw,
-   hh,
-   candidates,
-   spots,
- } = computeEdgesPaletteAndAccentsFast(cleanCcCrop, maskClean, w, h, offset, cfg);
+    timings["2_gpu_cc_and_oil_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
 
- const paperC = buildPaperLayerClient(cw, ch, cfg);
-const blurBgC = buildBlurBgLayerClient(cleanCcCrop, cw, ch, cfg);
-const shadowC = buildShadowLayerClient(
-    edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg,
-    cleanCcCrop, maskClean, w, h
-);
-cleanCcCrop.width = 1; cleanCcCrop.height = 1;
+    // 3. Half-Scale Normal Pyramid, Full-Res Edges, Accents & Auxiliary Layers
+    //    Use `edgeMaskForBrushes` (unturned mask silhouette) so the brush outline stays consistent across Turned/Unturned toggling!
+    tStep = performance.now();
+    const {
+      averageColor,
+      dominantColor,
+      edges,
+      edgePixelsX,
+      edgePixelsY,
+      normXHalf,
+      normYHalf,
+      hw,
+      hh,
+      candidates,
+      spots,
+    } = computeEdgesPaletteAndAccentsFast(cleanCcCrop, edgeMaskForBrushes, w, h, offset, cfg);
 
-const colordropC = buildColordropLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg);
-timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
+    const paperC = buildPaperLayerClient(cw, ch, cfg);
+    const blurBgC = buildBlurBgLayerClient(cleanCcCrop, cw, ch, cfg);
+    const shadowC = buildShadowLayerClient(
+      edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg,
+      cleanCcCrop, maskClean, w, h
+    );
+    cleanCcCrop.width = 1; cleanCcCrop.height = 1;
 
- const elapsedSec = Number(((performance.now() - t0) / 1000).toFixed(2));
- timings["total_client_sec"] = elapsedSec;
- STATE.lastEngineSource = "Local GPU";
+    const colordropC = buildColordropLayerClient(edgePixelsX, edgePixelsY, normXHalf, normYHalf, hw, hh, cw, ch, offset, cfg);
+    timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1000).toFixed(3));
 
- const payload = {
-   _isCompact: true,
-   preset_key: key,
-   canvas_size: [cw, ch],
-   offset: [offX, offY],
-   subject_size: [w, h],
-   preset_settings: cfg,
-   average_color: cfg.BG_BRUSH_MIX_AVERAGE ? averageColor : [128, 128, 128],
-   dominant_color: dominantColor,
-   elapsed_sec: elapsedSec,
-   timings,
-   maskBlob: maskC,
-   unturnedLayerBlobs,
-   layerBlobs: {
-     bg_paper: paperC,
-     subject_raw: subRawFull,
-     subject_cc: subCcFull,
-     subject_tex: subTexFull,
-     blur_bg: blurBgC,
-     oil_paint_full: oilFull,
-     shadow: shadowC,
-     colordrop: colordropC,
-   },
-   stroke_data: {
-     edges,
-     accent_candidates: candidates,
-     accent_spots: spots,
-   },
- };
- rebuildEdgeSpatialIndex(payload.stroke_data);
- setTimeout(() => StudioProfiler.report(), 60);
- return payload;
-}
+    const elapsedSec = Number(((performance.now() - t0) / 1000).toFixed(2));
+    timings["total_client_sec"] = elapsedSec;
+    STATE.lastEngineSource = "Local GPU";
 
-// ==========================================================================
-  // 6. INSTANT ZERO-RECOMPUTE WHITE BALANCE ENGINE (< 6 ms on PC & Mobile!)
-  //    Updates Subject, Oil, Edge Curve, Blur BG, AND all Brush Stroke colors
-  //    instantly without re-running generation!
-  // ==========================================================================
-  function transformRgbWithWhiteBalance(r, g, b, wbStr, protectBlue, wbGain) {
-    if (wbStr <= 0.001) return [r, g, b];
-    let cr = Math.min(1.0, Math.max(0.0, (r / 255.0) * (1.0 + (wbGain[0] - 1.0) * wbStr)));
-    let cg = Math.min(1.0, Math.max(0.0, (g / 255.0) * (1.0 + (wbGain[1] - 1.0) * wbStr)));
-    let cb = Math.min(1.0, Math.max(0.0, (b / 255.0) * (1.0 + (wbGain[2] - 1.0) * wbStr)));
-
-    const lwb = 0.299 * cr + 0.587 * cg + 0.114 * cb;
-    const mxW = Math.max(cr, cg, cb);
-    const mnW = Math.min(cr, cg, cb);
-    const satW = mxW > 1e-4 ? (mxW - mnW) / mxW : 0.0;
-
-    const sstep = (e0, e1, x) => {
-      const t = Math.max(0.0, Math.min(1.0, (x - e0) / (e1 - e0)));
-      return t * t * (3.0 - 2.0 * t);
+    const payload = {
+      _isCompact: true,
+      preset_key: key,
+      canvas_size: [cw, ch],
+      offset: [offX, offY],
+      subject_size: [w, h],
+      preset_settings: cfg,
+      average_color: cfg.BG_BRUSH_MIX_AVERAGE ? averageColor : [128, 128, 128],
+      dominant_color: dominantColor,
+      elapsed_sec: elapsedSec,
+      timings,
+      maskBlob: maskC,
+      unturnedLayerBlobs,
+      layerBlobs: {
+        bg_paper: paperC,
+        subject_raw: subRawFull,
+        subject_cc: subCcFull,
+        subject_tex: subTexFull,
+        blur_bg: blurBgC,
+        oil_paint_full: oilFull,
+        oil_clean_hi_full: oilCleanHiFull,
+        shadow: shadowC,
+        colordrop: colordropC,
+      },
+      stroke_data: {
+        edges,
+        accent_candidates: candidates,
+        accent_spots: spots,
+      },
     };
+    rebuildEdgeSpatialIndex(payload.stroke_data);
+    setTimeout(() => StudioProfiler.report(), 60);
+    return payload;
+  }
 
-    const achromGate = 1.0 - sstep(0.28, 0.52, satW);
-    const blueOverRed = Math.max(0.0, Math.min(1.0, (cb - cr * 1.02) / Math.max(0.04, mxW - mnW + 0.02)));
-    const cyanOverRed = Math.max(0.0, Math.min(1.0, (Math.min(cb, cg) - cr * 1.02) / Math.max(0.04, mxW - mnW + 0.02)));
-    const coolCast = Math.min(1.0, Math.max(blueOverRed, cyanOverRed) * 1.45);
-    const skyOrShadeKill = coolCast * (1.0 - protectBlue * sstep(0.50, 0.72, satW));
+  // ==========================================================================
+  // 6. UNIFIED 60 FPS WHITE BALANCE, SHADOW RECOVERY & WHEEL VARIANT ENGINE
+  //    Guarantees Subject, Oil Paint, Edge Curve, Glow & Wheel Turn are 100%
+  //    synchronized with ZERO box seams and ZERO ghost overlays!
+  // ==========================================================================
+  function transformRgbWithWhiteBalance(r, g, b, wbStr, hdrStr, protectBlue, wbGain) {
+    if (wbStr <= 0.001 && hdrStr <= 0.001) return [r, g, b];
+    let cr = r / 255.0, cg = g / 255.0, cb = b / 255.0;
 
-    const darkZone = 1.0 - sstep(0.22, 0.52, lwb);
-    const lightZone = sstep(0.58, 0.82, lwb);
-    const extremeToneNeutral = Math.max(darkZone, lightZone) * (1.0 - sstep(0.38, 0.68, satW));
+    if (hdrStr > 0.001) {
+      const pixL = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+      const maxC = Math.max(cr, cg, cb);
+      const tRef = pixL * 0.45 + maxC * 0.55;
+      const shMask = Math.pow(Math.max(0.0, Math.min(1.0, 1.0 - tRef / 0.82)), 2.5);
+      const amt = hdrStr * 1.15;
+      const gain = 1.0 + (amt * shMask) / (tRef + 0.16);
+      const newL = Math.min(1.0, pixL * gain);
+      const dL = newL - pixL;
+      const chromaScale = 1.0 + (gain - 1.0) * 0.38 + dL * 1.45;
+      cr = Math.min(1.0, Math.max(0.0, newL + (cr - pixL) * chromaScale));
+      cg = Math.min(1.0, Math.max(0.0, newL + (cg - pixL) * chromaScale));
+      cb = Math.min(1.0, Math.max(0.0, newL + (cb - pixL) * chromaScale));
+    }
 
-    const neutWeight = Math.min(1.0, Math.max(achromGate, skyOrShadeKill, extremeToneNeutral) * wbStr);
-    let targetL = lwb;
-    const maxCA = Math.max(coolCast, achromGate);
-    targetL = targetL * (1.0 - darkZone * maxCA * 0.75 * 0.16);
-    const lifted = Math.min(1.0, targetL * 1.08 + 0.025);
-    targetL = targetL + (lifted - targetL) * (lightZone * maxCA * 0.75);
+    if (wbStr > 0.001) {
+      cr = Math.min(1.0, Math.max(0.0, cr * (1.0 + (wbGain[0] - 1.0) * wbStr)));
+      cg = Math.min(1.0, Math.max(0.0, cg * (1.0 + (wbGain[1] - 1.0) * wbStr)));
+      cb = Math.min(1.0, Math.max(0.0, cb * (1.0 + (wbGain[2] - 1.0) * wbStr)));
 
-    cr = cr + (targetL - cr) * neutWeight;
-    cg = cg + (targetL - cg) * neutWeight;
-    cb = cb + (targetL - cb) * neutWeight;
+      const lwb = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+      const mxW = Math.max(cr, cg, cb);
+      const mnW = Math.min(cr, cg, cb);
+      const satW = mxW > 1e-4 ? (mxW - mnW) / mxW : 0.0;
+
+      const sstep = (e0, e1, x) => {
+        const t = Math.max(0.0, Math.min(1.0, (x - e0) / (e1 - e0)));
+        return t * t * (3.0 - 2.0 * t);
+      };
+
+      const achromGate = 1.0 - sstep(0.28, 0.52, satW);
+      const blueOverRed = Math.max(0.0, Math.min(1.0, (cb - cr * 1.02) / Math.max(0.04, mxW - mnW + 0.02)));
+      const cyanOverRed = Math.max(0.0, Math.min(1.0, (Math.min(cb, cg) - cr * 1.02) / Math.max(0.04, mxW - mnW + 0.02)));
+      const coolCast = Math.min(1.0, Math.max(blueOverRed, cyanOverRed) * 1.45);
+      const skyOrShadeKill = coolCast * (1.0 - protectBlue * sstep(0.50, 0.72, satW));
+
+      const darkZone = 1.0 - sstep(0.22, 0.52, lwb);
+      const lightZone = sstep(0.58, 0.82, lwb);
+      const extremeToneNeutral = Math.max(darkZone, lightZone) * (1.0 - sstep(0.38, 0.68, satW));
+
+      const neutWeight = Math.min(1.0, Math.max(achromGate, skyOrShadeKill, extremeToneNeutral) * wbStr);
+      let targetL = lwb;
+      const maxCA = Math.max(coolCast, achromGate);
+      targetL = targetL * (1.0 - darkZone * maxCA * 0.75 * 0.16);
+      const lifted = Math.min(1.0, targetL * 1.08 + 0.025);
+      targetL = targetL + (lifted - targetL) * (lightZone * maxCA * 0.75);
+
+      cr = cr + (targetL - cr) * neutWeight;
+      cg = cg + (targetL - cg) * neutWeight;
+      cb = cb + (targetL - cb) * neutWeight;
+    }
+
     return [
       Math.max(0, Math.min(255, Math.round(cr * 255))),
       Math.max(0, Math.min(255, Math.round(cg * 255))),
@@ -1557,12 +1631,11 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
     ];
   }
 
-  // Applies the exact shader-equivalent White Balance to any 2D canvas using a fast WebGL2 pass!
-  function applyWhiteBalanceCanvasGPU(srcCanvas, dstCanvas, wbStr, protectBlue, wbGain) {
+  function applyToneAndWBOnGPU(srcCanvas, dstCanvas, lumBlurCanvas, wbStr, hdrStr, protectBlue, wbGain) {
     if (!srcCanvas || !dstCanvas) return;
     const w = srcCanvas.width, h = srcCanvas.height;
     const eng = getGPUFilterEngine();
-    if (!eng || wbStr <= 0.001) {
+    if (!eng || (wbStr <= 0.001 && hdrStr <= 0.001)) {
       const ctx = dstCanvas.getContext("2d");
       ctx.clearRect(0, 0, w, h);
       ctx.drawImage(srcCanvas, 0, 0);
@@ -1570,14 +1643,7 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
     }
     const { gl, canvas, vao, progCC } = eng;
     const texOrig = uploadTex2D(gl, srcCanvas, false);
-
-    // 1x1 white dummy texture for mask/lumBlur when running pure WB pass
-    if (!eng.whiteDummyTex) {
-      const t = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 255]));
-      eng.whiteDummyTex = t;
-    }
+    const texLum = lumBlurCanvas ? uploadTex2D(gl, lumBlurCanvas, false) : texOrig;
 
     canvas.width = w;
     canvas.height = h;
@@ -1590,14 +1656,13 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
 
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texOrig);
     gl.uniform1i(gl.getUniformLocation(progCC, "u_orig"), 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, eng.whiteDummyTex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texLum);
     gl.uniform1i(gl.getUniformLocation(progCC, "u_lumBlur"), 1);
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texOrig);
     gl.uniform1i(gl.getUniformLocation(progCC, "u_mask"), 2);
-    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, eng.whiteDummyTex);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texOrig);
     gl.uniform1i(gl.getUniformLocation(progCC, "u_wcTex"), 3);
 
-    // Identity CC params so ONLY the White Balance block runs!
     gl.uniform1f(gl.getUniformLocation(progCC, "u_shLift"), 0.0);
     gl.uniform1f(gl.getUniformLocation(progCC, "u_hiReduce"), 0.0);
     gl.uniform1f(gl.getUniformLocation(progCC, "u_vibrance"), 1.0);
@@ -1610,6 +1675,7 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
     gl.uniform1f(gl.getUniformLocation(progCC, "u_wbStrength"), wbStr);
     gl.uniform1f(gl.getUniformLocation(progCC, "u_protectBlueBody"), protectBlue);
     gl.uniform3f(gl.getUniformLocation(progCC, "u_wbGain"), wbGain[0], wbGain[1], wbGain[2]);
+    gl.uniform1f(gl.getUniformLocation(progCC, "u_hdrShadows"), hdrStr);
     gl.uniform1f(gl.getUniformLocation(progCC, "u_wcOp"), 0.0);
     gl.uniform2f(gl.getUniformLocation(progCC, "u_wcScale"), 1.0, 1.0);
     gl.uniform1i(gl.getUniformLocation(progCC, "u_flipY"), 1);
@@ -1617,7 +1683,6 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-    // Copy RGB from GPU canvas while preserving srcCanvas's exact alpha channel!
     const ctx = dstCanvas.getContext("2d");
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(srcCanvas, 0, 0);
@@ -1626,16 +1691,36 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
     ctx.globalCompositeOperation = "source-over";
 
     gl.deleteTexture(texOrig);
+    if (texLum !== texOrig) gl.deleteTexture(texLum);
     canvas.width = 1; canvas.height = 1;
   }
 
-  function applyLiveWhiteBalanceInStudio() {
-    if (!STATE.payload || !STATE.serverImages) return;
-    const wbOn = !!STATE.whiteBalanceEnabled;
-    const wbStr = wbOn ? ((STATE.whiteBalanceStrength ?? 25) / 100.0) : 0.0;
-    const protectBlue = STATE._wbProtectBlue ?? 0.0;
-    const wbGain = STATE._wbGain || [1.0, 1.0, 1.0];
+  function applyToneAndWBToSubRect(fullCanvas, bx, by, bw, bh, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain) {
+    if (!fullCanvas || (wbStr <= 0.001 && hdrStr <= 0.001)) return;
+    const subC = createCanvas(bw, bh);
+    subC.getContext("2d").drawImage(fullCanvas, bx, by, bw, bh, 0, 0, bw, bh);
+    const dstC = createCanvas(bw, bh);
+    applyToneAndWBOnGPU(subC, dstC, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain);
+    const ctx = fullCanvas.getContext("2d");
+    ctx.clearRect(bx, by, bw, bh);
+    ctx.drawImage(dstC, bx, by);
+    subC.width = 1; subC.height = 1;
+    dstC.width = 1; dstC.height = 1;
+  }
 
+  function ensureBaseStateSaved() {
+    if (STATE._wbBaseSaved) return STATE._wbBaseSaved;
+    if (!STATE.payload || !STATE.serverImages) return null;
+
+    const [bx, by, bw, bh] = STATE.payload.full_subject_box || [
+      0, 0, STATE.payload.canvas_size[0], STATE.payload.canvas_size[1],
+    ];
+    const cropSub = (c) => {
+      if (!c) return null;
+      const copy = createCanvas(bw, bh);
+      copy.getContext("2d").drawImage(c, bx, by, bw, bh, 0, 0, bw, bh);
+      return copy;
+    };
     const cloneC = (c) => {
       if (!c) return null;
       const copy = createCanvas(c.width, c.height);
@@ -1643,166 +1728,277 @@ timings["3_edges_accents_effects_sec"] = Number(((performance.now() - tStep) / 1
       return copy;
     };
 
-    // 1. Save pristine base copies once on first call so slider can go 0% <-> 100% losslessly!
-    if (!STATE._wbBaseSaved) {
-      const [bx, by, bw, bh] = STATE.payload.full_subject_box || [0, 0, STATE.payload.canvas_size[0], STATE.payload.canvas_size[1]];
-      const cropSub = (c) => {
-        if (!c) return null;
-        const copy = createCanvas(bw, bh);
-        copy.getContext("2d").drawImage(c, bx, by, bw, bh, 0, 0, bw, bh);
-        return copy;
-      };
-      const [overW, overH] = STATE.payload.canvas_size;
-      let blurSmall = null;
-      if (STATE.serverImages.blur_bg) {
-        blurSmall = createCanvas(overW >> 2, overH >> 2);
-        blurSmall.getContext("2d").drawImage(STATE.serverImages.blur_bg, 0, 0, blurSmall.width, blurSmall.height);
-      }
-      if (typeof getOrBuildOilDetailCache === "function") getOrBuildOilDetailCache();
+    if (typeof getOrBuildOilDetailCache === "function") getOrBuildOilDetailCache();
 
-      let savedWheelPatches = null;
-      if (STATE.wheelSubjectPatches) {
-        const wp = STATE.wheelSubjectPatches;
-        savedWheelPatches = {
-          turned: {
-            subject_cc: cloneC(wp.turned && wp.turned.subject_cc),
-            subject_tex: cloneC(wp.turned && wp.turned.subject_tex),
-            oil_crop_patch: cloneC(wp.turned && wp.turned.oil_crop_patch),
-          },
-          unturned: {
-            subject_cc: cloneC(wp.unturned && wp.unturned.subject_cc),
-            subject_tex: cloneC(wp.unturned && wp.unturned.subject_tex),
-            oil_crop_patch: cloneC(wp.unturned && wp.unturned.oil_crop_patch),
-          },
-        };
+    // If wheelSubjectPatches wasn't built or we only have one variant, create a single-variant structure
+    if (!STATE.wheelVariants) {
+      const subCcCrop = cropSub(STATE.serverImages.subject_cc);
+      let lumBlurCrop = null;
+      if (subCcCrop) {
+        lumBlurCrop = createCanvas(Math.max(16, bw >> 3), Math.max(16, bh >> 3));
+        const lCtx = lumBlurCrop.getContext("2d");
+        lCtx.filter = "blur(4px)";
+        lCtx.drawImage(subCcCrop, 0, 0, lumBlurCrop.width, lumBlurCrop.height);
+        lCtx.filter = "none";
       }
-
-      STATE._wbBaseSaved = {
-        bx, by, bw, bh,
-        subCcCrop: cropSub(STATE.serverImages.subject_cc),
+      const singleVar = {
+        subRawCrop: cropSub(STATE.serverImages.subject_raw),
+        subCcCrop,
         subTexCrop: cropSub(STATE.serverImages.subject_tex),
         oilCrop: STATE.oilDetailCache && STATE.oilDetailCache.oilCrop ? cloneC(STATE.oilDetailCache.oilCrop) : null,
-        blurSmall,
-        savedWheelPatches,
-        origAvg: STATE.payload.average_color ? [...STATE.payload.average_color] : [128, 128, 128],
-        origDom: STATE.payload.dominant_color ? [...STATE.payload.dominant_color] : null,
-        origEdgeRgb: STATE.payload.stroke_data.edges.map((e) => [e[4], e[5], e[6]]),
-        origCandRgb: (STATE.payload.stroke_data.accent_candidates || []).map((c) => [...c.color]),
-        origSpotRgb: (STATE.payload.stroke_data.accent_spots || []).map((s) => [...s.color]),
+        oilCleanHiCrop: STATE.oilDetailCache && STATE.oilDetailCache.oilCleanHiCrop ? cloneC(STATE.oilDetailCache.oilCleanHiCrop) : null,
+        lumBlurCrop,
+        edgeCurveCache: STATE.edgeCurveCache || null,
+        glowCache: STATE.glowCache || null,
+      };
+      STATE.wheelVariants = {
+        bx, by, bw, bh,
+        turned: singleVar,
+        unturned: singleVar,
       };
     }
 
-    const base = STATE._wbBaseSaved;
-    const { bx, by, bw, bh } = base;
-
-    // 2. Transform all Edge Colors, Palette & Accent Stroke Colors in ~0.15ms!
-    const edges = STATE.payload.stroke_data.edges;
-    for (let i = 0; i < edges.length; i++) {
-      const [r0, g0, b0] = base.origEdgeRgb[i];
-      const [nr, ng, nb] = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, protectBlue, wbGain);
-      edges[i][4] = nr; edges[i][5] = ng; edges[i][6] = nb;
-    }
-    STATE.payload.average_color = transformRgbWithWhiteBalance(
-      base.origAvg[0], base.origAvg[1], base.origAvg[2], wbStr, protectBlue, wbGain
-    );
-    if (base.origDom) {
-      STATE.payload.dominant_color = transformRgbWithWhiteBalance(
-        base.origDom[0], base.origDom[1], base.origDom[2], wbStr, protectBlue, wbGain
-      );
-    }
-    const cands = STATE.payload.stroke_data.accent_candidates || [];
-    for (let i = 0; i < cands.length; i++) {
-      const [r0, g0, b0] = base.origCandRgb[i];
-      cands[i].color = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, protectBlue, wbGain);
-    }
-    const spots = STATE.payload.stroke_data.accent_spots || [];
-    for (let i = 0; i < spots.length; i++) {
-      const [r0, g0, b0] = base.origSpotRgb[i];
-      spots[i].color = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, protectBlue, wbGain);
+    const [overW, overH] = STATE.payload.canvas_size;
+    let blurSmall = null;
+    if (STATE.serverImages.blur_bg) {
+      blurSmall = createCanvas(overW >> 2, overH >> 2);
+      blurSmall.getContext("2d").drawImage(STATE.serverImages.blur_bg, 0, 0, blurSmall.width, blurSmall.height);
     }
 
-    // 3. Transform Subject, Oil Crop, Wheel Patches & Blur BG on the GPU (~3.5ms total!)
-    const tmpCrop = createCanvas(bw, bh);
-    if (base.subCcCrop && STATE.serverImages.subject_cc) {
-      applyWhiteBalanceCanvasGPU(base.subCcCrop, tmpCrop, wbStr, protectBlue, wbGain);
+    STATE._wbBaseSaved = {
+      bx, by, bw, bh,
+      blurSmall,
+      origAvg: STATE.payload.average_color ? [...STATE.payload.average_color] : [128, 128, 128],
+      origDom: STATE.payload.dominant_color ? [...STATE.payload.dominant_color] : null,
+      origEdgeRgb: STATE.payload.stroke_data.edges.map((e) => [e[4], e[5], e[6]]),
+      origCandRgb: (STATE.payload.stroke_data.accent_candidates || []).map((c) => [...c.color]),
+      origSpotRgb: (STATE.payload.stroke_data.accent_spots || []).map((s) => [...s.color]),
+    };
+    return STATE._wbBaseSaved;
+  }
+
+  function applyLiveWhiteBalanceInStudio(skipComposite = false, isWheelSwitchOnly = false) {
+    if (!STATE.payload || !STATE.serverImages) return;
+    const base = ensureBaseStateSaved();
+    if (!base || !STATE.wheelVariants) return;
+
+    const wbOn = !!STATE.whiteBalanceEnabled;
+    const wbStr = wbOn ? ((STATE.whiteBalanceStrength ?? 80) / 100.0) : 0.0;
+    const hdrOn = !!STATE.hdrShadowsEnabled;
+    const hdrStr = hdrOn ? ((STATE.hdrShadowsStrength ?? 55) / 100.0) : 0.0;
+    const protectBlue = STATE._wbProtectBlue ?? 0.0;
+    const wbGain = STATE._wbGain || [1.0, 1.0, 1.0];
+
+    const { bx, by, bw, bh } = STATE.wheelVariants;
+    const useTurned = STATE.wheelTurnEnabled !== false;
+    const vSet = (useTurned ? STATE.wheelVariants.turned : STATE.wheelVariants.unturned) || STATE.wheelVariants.turned;
+    const lumBlurCrop = vSet.lumBlurCrop;
+
+    // 1. Update Subject Raw (un-toned) from the active wheel variant
+    if (vSet.subRawCrop && STATE.serverImages) {
+      vSet.subRawCrop._ox = bx;
+      vSet.subRawCrop._oy = by;
+      STATE.serverImages.subject_raw = vSet.subRawCrop;
+    }
+
+    // 2. Transform Subject CC & Subject Tex from the active wheel variant's pristine base through GPU WB/HDR
+    const hasToneOrWB = wbStr > 0.001 || hdrStr > 0.001;
+    const tmpCrop = hasToneOrWB ? createCanvas(bw, bh) : null;
+
+    if (vSet.subCcCrop && STATE.serverImages.subject_cc) {
       const ctx = STATE.serverImages.subject_cc.getContext("2d");
       ctx.clearRect(bx, by, bw, bh);
-      ctx.drawImage(tmpCrop, bx, by);
+      if (hasToneOrWB) {
+        applyToneAndWBOnGPU(vSet.subCcCrop, tmpCrop, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain);
+        ctx.drawImage(tmpCrop, bx, by);
+      } else {
+        ctx.drawImage(vSet.subCcCrop, bx, by);
+      }
     }
-    if (base.subTexCrop && STATE.serverImages.subject_tex) {
-      applyWhiteBalanceCanvasGPU(base.subTexCrop, tmpCrop, wbStr, protectBlue, wbGain);
+    if (vSet.subTexCrop && STATE.serverImages.subject_tex) {
       const ctx = STATE.serverImages.subject_tex.getContext("2d");
       ctx.clearRect(bx, by, bw, bh);
-      ctx.drawImage(tmpCrop, bx, by);
+      if (hasToneOrWB) {
+        applyToneAndWBOnGPU(vSet.subTexCrop, tmpCrop, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain);
+        ctx.drawImage(tmpCrop, bx, by);
+      } else {
+        ctx.drawImage(vSet.subTexCrop, bx, by);
+      }
     }
-    tmpCrop.width = 1; tmpCrop.height = 1;
+    if (tmpCrop) {
+      tmpCrop.width = 1;
+      tmpCrop.height = 1;
+    }
 
-    if (base.oilCrop && STATE.oilDetailCache && STATE.oilDetailCache.oilCrop) {
-      applyWhiteBalanceCanvasGPU(base.oilCrop, STATE.oilDetailCache.oilCrop, wbStr, protectBlue, wbGain);
+    // 3. Transform Oil Paint from the active wheel variant's pristine oilCrop through GPU WB/HDR
+    if (STATE.oilDetailCache) {
+      if (vSet.oilCrop && STATE.oilDetailCache.oilCrop) {
+        if (hasToneOrWB) {
+          applyToneAndWBOnGPU(vSet.oilCrop, STATE.oilDetailCache.oilCrop, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain);
+        } else {
+          const oCtx = STATE.oilDetailCache.oilCrop.getContext("2d");
+          oCtx.clearRect(0, 0, bw, bh);
+          oCtx.drawImage(vSet.oilCrop, 0, 0);
+        }
+      }
+      if (vSet.oilCleanHiCrop && STATE.oilDetailCache.oilCleanHiCrop) {
+        if (hasToneOrWB) {
+          applyToneAndWBOnGPU(vSet.oilCleanHiCrop, STATE.oilDetailCache.oilCleanHiCrop, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain);
+        } else {
+          const ocCtx = STATE.oilDetailCache.oilCleanHiCrop.getContext("2d");
+          ocCtx.clearRect(0, 0, bw, bh);
+          ocCtx.drawImage(vSet.oilCleanHiCrop, 0, 0);
+        }
+      }
+      if (STATE.oilDetailCache.popCanvas && STATE.oilDetailCache.oilCrop) {
+        const pCtx = STATE.oilDetailCache.popCanvas.getContext("2d");
+        pCtx.clearRect(0, 0, bw, bh);
+        pCtx.filter = "contrast(165%) saturate(80%)";
+        pCtx.drawImage(STATE.oilDetailCache.oilCrop, 0, 0);
+        pCtx.filter = "none";
+      }
       if (STATE.layers.oil_paint && STATE.layers.oil_paint.vis) {
         rerenderLiveOilLayer(true);
       }
     }
 
-    // Also keep both turned & unturned wheel patches white-balanced in sync so wheel state NEVER flips!
-    if (base.savedWheelPatches && STATE.wheelSubjectPatches) {
-      for (const mode of ["turned", "unturned"]) {
-        const srcSet = base.savedWheelPatches[mode];
-        const dstSet = STATE.wheelSubjectPatches[mode];
-        if (!srcSet || !dstSet) continue;
-        for (const k of ["subject_cc", "subject_tex", "oil_crop_patch"]) {
-          if (srcSet[k] && dstSet[k]) {
-            applyWhiteBalanceCanvasGPU(srcSet[k], dstSet[k], wbStr, protectBlue, wbGain);
+    if (vSet.oilCleanHiCrop && STATE.oilDetailCache && STATE.oilDetailCache.oilCleanHiCrop) {
+      if (hasToneOrWB) {
+        applyToneAndWBOnGPU(vSet.oilCleanHiCrop, STATE.oilDetailCache.oilCleanHiCrop, lumBlurCrop, wbStr, hdrStr, protectBlue, wbGain);
+      } else {
+        const ocCtx = STATE.oilDetailCache.oilCleanHiCrop.getContext("2d");
+        ocCtx.clearRect(0, 0, bw, bh);
+        ocCtx.drawImage(vSet.oilCleanHiCrop, 0, 0);
+      }
+    }
+
+    // 4. Sync Edge Curve Cache to the active wheel variant (builds once per variant from pristine base, then applies WB/HDR on GPU!)
+    if (!vSet.edgeCurveCache) {
+      // Build EdgeCurveCache from pristine untoned subject_cc so WB/HDR is never double-applied!
+      const savedCurCc = createCanvas(bw, bh);
+      savedCurCc.getContext("2d").drawImage(STATE.serverImages.subject_cc, bx, by, bw, bh, 0, 0, bw, bh);
+      if (vSet.subCcCrop) {
+        const ctx = STATE.serverImages.subject_cc.getContext("2d");
+        ctx.clearRect(bx, by, bw, bh);
+        ctx.drawImage(vSet.subCcCrop, bx, by);
+      }
+      STATE.edgeCurveCache = null;
+      vSet.edgeCurveCache = getOrBuildEdgeCurveCache();
+      const ctx = STATE.serverImages.subject_cc.getContext("2d");
+      ctx.clearRect(bx, by, bw, bh);
+      ctx.drawImage(savedCurCc, bx, by);
+      savedCurCc.width = 1; savedCurCc.height = 1;
+    }
+    STATE.edgeCurveCache = vSet.edgeCurveCache;
+    if (STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
+      rerenderLiveEdgeCurveLayer(true);
+    }
+
+    // 5. Sync Rim Glow to the active wheel variant
+    if (isWheelSwitchOnly) {
+      if (!vSet.glowCache) {
+        STATE.glowCache = null;
+        vSet.glowCache = getOrBuildGlowCache();
+      } else {
+        STATE.glowCache = vSet.glowCache;
+      }
+      if (STATE.layers.glow && STATE.layers.glow.vis) {
+        rerenderLiveGlowLayer(true);
+      }
+    }
+
+    // 5B. Adapt Bottom Car Shadow Brush Color to match HDR Shadow Recovery & White Balance at 60 FPS!
+    //     Recolor existing shadow pixels in-place via 'source-in' so stroke positions & overscan never shift!
+    if (
+      !isWheelSwitchOnly &&
+      STATE._shadowStrokeCache &&
+      STATE.layers.shadow &&
+      STATE.layers.shadow.vis &&
+      STATE.layers.shadow.origImage
+    ) {
+      const sc = STATE._shadowStrokeCache;
+      const shCanvas = STATE.layers.shadow.origImage;
+      // Lift the shadow color proportionally to the bottom tire rubber's HDR Shadow Lift
+      const liftedShadowRgb = transformRgbWithWhiteBalance(
+        sc.baseRgb[0], sc.baseRgb[1], sc.baseRgb[2],
+        wbStr, hdrStr * 0.72, protectBlue, wbGain
+      );
+      const shCtx = shCanvas.getContext("2d");
+      shCtx.save();
+      shCtx.globalCompositeOperation = "source-in";
+      shCtx.fillStyle = `rgb(${liftedShadowRgb[0]}, ${liftedShadowRgb[1]}, ${liftedShadowRgb[2]})`;
+      shCtx.fillRect(0, 0, shCanvas.width, shCanvas.height);
+      shCtx.restore();
+    }
+
+    // 6. If White Balance or Shadow Recovery changed, also update brush colors & blur_bg
+    if (!isWheelSwitchOnly) {
+      const edges = STATE.payload.stroke_data.edges;
+      for (let i = 0; i < edges.length; i++) {
+        const [r0, g0, b0] = base.origEdgeRgb[i];
+        const [nr, ng, nb] = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, hdrStr, protectBlue, wbGain);
+        edges[i][4] = nr; edges[i][5] = ng; edges[i][6] = nb;
+      }
+      STATE.payload.average_color = transformRgbWithWhiteBalance(
+        base.origAvg[0], base.origAvg[1], base.origAvg[2], wbStr, hdrStr, protectBlue, wbGain
+      );
+      if (base.origDom) {
+        STATE.payload.dominant_color = transformRgbWithWhiteBalance(
+          base.origDom[0], base.origDom[1], base.origDom[2], wbStr, hdrStr, protectBlue, wbGain
+        );
+      }
+      const cands = STATE.payload.stroke_data.accent_candidates || [];
+      for (let i = 0; i < cands.length; i++) {
+        const [r0, g0, b0] = base.origCandRgb[i];
+        cands[i].color = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, hdrStr, protectBlue, wbGain);
+      }
+      const spots = STATE.payload.stroke_data.accent_spots || [];
+      for (let i = 0; i < spots.length; i++) {
+        const [r0, g0, b0] = base.origSpotRgb[i];
+        spots[i].color = transformRgbWithWhiteBalance(r0, g0, b0, wbStr, hdrStr, protectBlue, wbGain);
+      }
+
+      if (base.blurSmall && STATE.serverImages.blur_bg) {
+        const bW = STATE.serverImages.blur_bg.width;
+        const bH = STATE.serverImages.blur_bg.height;
+        const tmpBlur = createCanvas(base.blurSmall.width, base.blurSmall.height);
+        applyToneAndWBOnGPU(base.blurSmall, tmpBlur, base.blurSmall, wbStr, hdrStr * 0.5, protectBlue, wbGain);
+        const bCtx = STATE.serverImages.blur_bg.getContext("2d");
+        bCtx.clearRect(0, 0, bW, bH);
+        bCtx.drawImage(tmpBlur, 0, 0, bW, bH);
+        tmpBlur.width = 1; tmpBlur.height = 1;
+      }
+
+      for (const def of LAYER_DEFINITIONS) {
+        const lyr = STATE.layers[def.id];
+        if (!lyr) continue;
+        if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)) {
+          lyr.strokesDirty = true;
+          if (lyr.vis && (STATE.selectedLayerId === def.id || def.type === "mask_blur")) {
+            rerenderProceduralLayer(def.id, true);
           }
         }
       }
-      if (typeof applyWheelPatchToSubjectLayers === "function") {
-        applyWheelPatchToSubjectLayers(STATE.wheelTurnEnabled !== false, true);
+      if (STATE.layers.cool_brush && STATE.layers.cool_brush.vis && typeof rerenderCoolSwooshLayer === "function") {
+        STATE.swooshCarAnalysis = null;
+        STATE._colorizedSwooshCache = null;
+        rerenderCoolSwooshLayer(true);
       }
-    }
-
-    if (base.blurSmall && STATE.serverImages.blur_bg) {
-      const [overW, overH] = STATE.payload.canvas_size;
-      const tmpBlur = createCanvas(base.blurSmall.width, base.blurSmall.height);
-      applyWhiteBalanceCanvasGPU(base.blurSmall, tmpBlur, wbStr, protectBlue, wbGain);
-      const bCtx = STATE.serverImages.blur_bg.getContext("2d");
-      bCtx.clearRect(0, 0, overW, overH);
-      bCtx.drawImage(tmpBlur, 0, 0, overW, overH);
-      tmpBlur.width = 1; tmpBlur.height = 1;
-    }
-
-    // 4. Mark procedural brush layers dirty & refresh Edge Curve / Cool Brush
-    for (const def of LAYER_DEFINITIONS) {
-      const lyr = STATE.layers[def.id];
-      if (!lyr) continue;
-      if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type)) {
-        lyr.strokesDirty = true;
-        if (lyr.vis && (STATE.selectedLayerId === def.id || def.type === "mask_blur")) {
-          rerenderProceduralLayer(def.id, true);
-        }
-      }
-    }
-    if (STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
-      STATE.edgeCurveCache = null;
-      destroyGLEdgeCurveResources();
-      rerenderLiveEdgeCurveLayer(true);
-      if (typeof freeEdgeCurveCpuUploadBuffers === "function") freeEdgeCurveCpuUploadBuffers();
-    }
-    if (STATE.layers.cool_brush && STATE.layers.cool_brush.vis && typeof rerenderCoolSwooshLayer === "function") {
-      STATE.swooshCarAnalysis = null;
-      STATE._colorizedSwooshCache = null;
-      rerenderCoolSwooshLayer(true);
     }
 
     if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
     invalidateStack();
-    compositeAllLayers();
+    if (!skipComposite) compositeAllLayers();
   }
 
-  window.InstantWhiteBalance = { applyLive: applyLiveWhiteBalanceInStudio };
+  window.ClientWatercolorEngine = {
+    generate,
+  };
 
-
-
-
-window.ClientWatercolorEngine = { generate };
+  window.InstantWhiteBalance = {
+    applyLive: applyLiveWhiteBalanceInStudio,
+    applyToSubRect: applyToneAndWBToSubRect,
+    ensureBaseStateSaved,
+    ensureBaseState: ensureBaseStateSaved,
+  };
 })();

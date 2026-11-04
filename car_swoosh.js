@@ -226,7 +226,9 @@
     const sw = Math.min(360, Math.max(64, bw >> 2));
     const sh = Math.max(32, Math.round(bh * (sw / Math.max(1, bw))));
     const c = createCanvas(sw, sh);
-    c.getContext("2d").drawImage(subImg, bx, by, bw, bh, 0, 0, sw, sh);
+    const srcOx = subImg._ox || 0;
+    const srcOy = subImg._oy || 0;
+    c.getContext("2d").drawImage(subImg, bx - srcOx, by - srcOy, bw, bh, 0, 0, sw, sh);
     const d = c.getContext("2d").getImageData(0, 0, sw, sh).data;
     c.width = 1; c.height = 1;
 
@@ -372,12 +374,11 @@
     const brushImg = STATE.brushImages["largebrush.png"] || STATE.brushImages["bgbrush.png"];
     if (!brushImg) return;
 
-    const [overW, overH] = STATE.payload.canvas_size;
-    if (!lyr.baseCanvas || lyr.baseCanvas.width !== overW || lyr.baseCanvas.height !== overH) {
-      lyr.baseCanvas = createCanvas(overW, overH);
+    if (lyr.baseCanvas) {
+      lyr.baseCanvas.width = 1;
+      lyr.baseCanvas.height = 1;
+      lyr.baseCanvas = null;
     }
-    const ctx = lyr.baseCanvas.getContext("2d");
-    ctx.clearRect(0, 0, overW, overH);
 
     const an = analyzeCarSilhouetteAndColorForSwoosh();
     if (!an) return;
@@ -467,10 +468,10 @@
     const tx = cx - (m00 * (bw * 0.5) + m01 * (bh * 0.5));
     const ty = cy - (m10 * (bw * 0.5) + m11 * (bh * 0.5));
 
-    ctx.save();
-    ctx.setTransform(m00, m10, m01, m11, tx, ty);
-    ctx.drawImage(coloredCanvas, 0, 0);
-    ctx.restore();
+    lyr.swooshDrawSpec = {
+      canvas: coloredCanvas,
+      m00, m10, m01, m11, tx, ty,
+    };
 
     if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
     if (_stack.id !== "cool_brush") invalidateStack();

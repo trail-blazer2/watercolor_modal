@@ -62,9 +62,6 @@
     </div>
 
     <div class="export-controls">
-      <button id="exportPngBtn" class="btn btn-outline" disabled>
-        💾 PNG
-      </button>
       <button id="exportJpgBtn" class="btn btn-primary" disabled>
         🖼️ Export Print JPG
       </button>
@@ -190,14 +187,44 @@
 
     <!-- CENTER VIEWPORT: Interactive Canvas -->
     <main class="canvas-viewport" id="viewport">
+      <!-- STEP 1: FULL-SCREEN LANDING PAGE -->
       <div id="emptyState" class="empty-state">
-        <div class="empty-card">
-          <h2>🎨 Create Your Custom Painting</h2>
-          <p>Upload a photo in the top bar to generate a multi-layer watercolor artwork in seconds.</p>
-          <p class="sub-note">Fine-tune every brush layer, oil paint texture, color balance, and eye reflection in real time.</p>
-          <label class="btn btn-primary" for="fileInput" style="margin-top: 18px;">
-            📁 Choose Photo to Start
+        <div class="landing-hero">
+          <!-- Style Cartridge Selector Bar (Populated / Managed by StudioSpine) -->
+          <div class="landing-style-pills" id="landingStylePills">
+            <button type="button" class="style-cartridge-pill active" data-style-id="watercolor">
+              🎨 Watercolor & Oil Studio
+            </button>
+            <button type="button" class="style-cartridge-pill" data-style-id="poster_art" disabled title="Coming soon">
+              🖼️ Vintage Poster Art (Soon)
+            </button>
+            <button type="button" class="style-cartridge-pill" data-style-id="architecture" disabled title="Coming soon">
+              🏛️ Architecture & Line Wash (Soon)
+            </button>
+          </div>
+
+          <!-- Large Centered Upload Dropzone Card -->
+          <label class="upload-dropzone-card" id="landingDropzone" for="fileInput">
+            <div class="dropzone-icon">📁</div>
+            <h2 id="landingTitle">Upload Your Photo to Begin</h2>
+            <p id="landingSubtitle">
+              Drop a photo of a pet, portrait, or vehicle here, or click to browse.
+              Smart framing, background removal, and 60 FPS artist layers run automatically.
+            </p>
+            <span class="btn btn-primary dropzone-cta">
+              ✨ Choose Photo from Device
+            </span>
           </label>
+
+          <!-- Multi-Photo Collage Starter on Landing Page -->
+          <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:4px;">
+            <button type="button" id="landingMulti2Btn" class="btn btn-sm btn-outline">
+              🐾👥 Combine 2 Separate Photos
+            </button>
+            <button type="button" id="landingMulti3Btn" class="btn btn-sm btn-outline">
+              🐾🐾🐾 Combine 3 Separate Photos
+            </button>
+          </div>
         </div>
       </div>
 
@@ -213,6 +240,38 @@
           <p class="help-text" style="margin-bottom:12px;">
             Drag directly on the canvas to move, or fine-tune with the sliders below before generating your painting.
           </p>
+
+          <!-- MANUAL 1 / 2 / 3 SUBJECTS SWITCHER & SEPARATE PHOTO UPLOADER -->
+          <div class="mask-controls" style="margin-bottom:14px;">
+            <div class="mask-badge" id="multiSubjectBadge">🐾👥 Multi-Subject Side-by-Side Studio</div>
+            <div class="btn-group" style="margin-bottom:8px;">
+              <button type="button" id="cropMode1SubBtn" class="btn btn-xs btn-primary full-width">1 Subject</button>
+              <button type="button" id="cropMode2SubBtn" class="btn btn-xs btn-outline full-width">2 Side-by-Side</button>
+              <button type="button" id="cropMode3SubBtn" class="btn btn-xs btn-outline full-width">3 Side-by-Side</button>
+            </div>
+            <input type="file" id="slotFileInput" accept="image/*" hidden />
+
+            <!-- Shown when 2 or 3 Side-by-Side is active OR when 2+ subjects were auto-detected in 1 photo -->
+            <div id="multiSubjectPanel" class="hidden">
+              <div id="multiAutoLayoutToggle" class="btn-group hidden" style="margin-bottom:8px;">
+                <button type="button" id="multiModeTogetherBtn" class="btn btn-xs btn-primary full-width">
+                  🖼️ Original Layout
+                </button>
+                <button type="button" id="multiModeSideBySideBtn" class="btn btn-xs btn-outline full-width">
+                  ↔️ Side-by-Side
+                </button>
+              </div>
+              <div id="multiSubjectSelectorRow">
+                <label style="font-size:11.5px; color:var(--muted); display:block; margin-bottom:5px;">
+                  Select Subject to Move, Zoom, or Replace Photo:
+                </label>
+                <div id="multiSubjectTabs" class="btn-group" style="margin-top:0; margin-bottom:8px;"></div>
+                <button type="button" id="uploadSlotPhotoBtn" class="btn btn-xs btn-outline full-width">
+                  📁 Upload Separate Photo for Selected Subject
+                </button>
+              </div>
+            </div>
+          </div>
 
           <div class="control-row">
             <label><span>Canvas Aspect Ratio</span></label>
@@ -359,6 +418,57 @@
       📑<span>Layers</span>
     </button>
   </nav>
+
+  <!-- EXPORT QUALITY & PRINT MENU MODAL -->
+  <div id="exportModal" class="loading-overlay hidden" style="z-index: 60;">
+    <div class="loading-card" style="max-width: 420px; padding: 24px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h3 style="font-family:'Cormorant Garamond',serif; font-size:22px; margin:0;">🖼️ Export Painting (JPEG)</h3>
+        <button type="button" id="closeExportModalBtn" class="sheet-close-btn" style="display:inline-flex; align-items:center; justify-content:center;">×</button>
+      </div>
+      <p class="help-text" style="margin-bottom:14px;">
+        Choose your export resolution. Full Print renders your subject and brush textures at high resolution for physical canvas/paper printing.
+      </p>
+
+      <div id="exportQualityOptions" style="display:flex; flex-direction:column; gap:10px; margin-bottom:18px;">
+        <label id="expOptFullCard" style="display:flex; align-items:flex-start; gap:10px; padding:12px 14px; border:2px solid var(--gold); border-radius:12px; background:var(--gold-soft); cursor:pointer;">
+          <input type="radio" name="exportQualityRadio" value="full_200ppi" checked style="margin-top:3px;" />
+          <div style="flex:1;">
+            <div style="display:flex; justify-content:space-between; font-weight:600; color:var(--text);">
+              <span>🖨️ Full Print Quality (~200 PPI)</span>
+              <span id="expFullSizeEst" style="color:var(--gold-dark); font-variant-numeric:tabular-nums;">~2.6 MB</span>
+            </div>
+            <div id="expFullDimLabel" style="font-size:11.5px; color:var(--muted); margin-top:3px;">
+              2520 × 3564 px · High-Res Subject & Brushes (Best for Print)
+            </div>
+          </div>
+        </label>
+
+        <label id="expOptPreviewCard" style="display:flex; align-items:flex-start; gap:10px; padding:12px 14px; border:1px solid var(--line-strong); border-radius:12px; background:var(--panel); cursor:pointer;">
+          <input type="radio" name="exportQualityRadio" value="preview_120ppi" style="margin-top:3px;" />
+          <div style="flex:1;">
+            <div style="display:flex; justify-content:space-between; font-weight:600; color:var(--text);">
+              <span>⚡ Preview / Web Quality (~120 PPI)</span>
+              <span id="expPreviewSizeEst" style="color:var(--muted); font-variant-numeric:tabular-nums;">~650 KB</span>
+            </div>
+            <div id="expPreviewDimLabel" style="font-size:11.5px; color:var(--muted); margin-top:3px;">
+              1260 × 1782 px · Standard Resolution (Fast Share)
+            </div>
+          </div>
+        </label>
+      </div>
+
+      <div style="display:flex; gap:8px;">
+        <button type="button" id="cancelExportBtn" class="btn btn-outline full-width">Cancel</button>
+        <button type="button" id="confirmDownloadJpgBtn" class="btn btn-primary full-width">
+          ⬇️ Download JPG
+        </button>
+      </div>
+    </div>
+  </div>
+
+
+
   <script src="studio_config.js"></script>
   <script src="framing.js"></script>
   <script src="subject_vision.js"></script>
@@ -370,5 +480,7 @@
   <script src="studio_layers.js"></script>
   <script src="studio_ui.js"></script>
   <script src="studio_workflow.js"></script>
+  <script src="multi_subject.js"></script>
+  <script src="studio_spine.js"></script>
 </body>
 </html>
