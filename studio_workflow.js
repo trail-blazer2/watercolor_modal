@@ -1,6 +1,6 @@
 /**
  * 🧭 Watercolor Studio — Modular Multi-Step Workflow & Smart Crop Controller
- * Steps: "upload" -> "crop" (Smart Move, Zoom & Mask Edit) -> "studio" (60 FPS Layer Editor)
+ * Steps: "upload" -> "crop" (Smart Move, Zoom, Multi-Subject Lineup & Mask Edit) -> "studio" (60 FPS Layer Editor)
  */
 
 const Workflow = (() => {
@@ -35,7 +35,12 @@ const Workflow = (() => {
     dragStart: { x: 0, y: 0, dxPct: 0, dyPct: 0 },
     pinchStartDist: null,
     pinchStartZoom: 97,
+    multiSubjectMode: "together", // "together" | "side_by_side"
+    multiSubjects: [],            // Array of { index, label, cutoutC, maskC, srcCropC, cw, ch, minX, minY, headW, headCxRel, eyeYRel, zoomPct, dxPct, dyPct }
+    activeSubjectIdx: -1,         // -1 = All, 0..2 = individual subject
   };
+
+  window._activeCropRef = CROP;
 
   // Detailed Concrete Workflow Timing Logger
   const PERF_LOG = {
@@ -108,7 +113,6 @@ const Workflow = (() => {
           opt.disabled = !show;
         });
       } else {
-        // Unrecognized: show all options
         grp.style.display = "";
         grp.disabled = false;
         grp.querySelectorAll("option").forEach((opt) => {
@@ -184,6 +188,7 @@ const Workflow = (() => {
 
     if (stepId === "crop" && CROP.analysis) {
       syncOrientationButtonsUI();
+      updateMultiSubjectUI();
       requestAnimationFrame(() => renderCropPreview());
     } else if (stepId === "studio" && STATE.payload) {
       fitCanvasToViewport();
@@ -248,15 +253,7 @@ const Workflow = (() => {
     PERF_LOG.startUpload(file.name, rawW, rawH);
 
     const rawMaxDim = Math.max(rawW, rawH);
-    STATE.isLowResPhoto = rawMaxDim < 1600;
-    if (STATE.isLowResPhoto) {
-      // Delayed by 150ms so /cutout hits the network first and finishes in < 0.5s
-      STATE.upscalePromise = new Promise((resolve) => {
-        setTimeout(() => {
-          resolve(fetchUpscaledPhotoInBackground(rawImg));
-        }, 150);
-      });
-    }
+    STATE.isLowResPhoto = rawMaxDim < 1100;
 
     const maxDim = IS_MOBILE ? 1024 : 1400;
     const scale = Math.min(1, maxDim / rawMaxDim);
@@ -264,7 +261,7 @@ const Workflow = (() => {
     const sh = Math.max(1, Math.round(rawH * scale));
 
     const srcC = createCanvas(sw, sh);
-    const srcCtx = srcC.getContext("2d");
+    const srcCtx = srcC.getContext("2d", { willReadFrequently: true });
     srcCtx.drawImage(rawImg, 0, 0, sw, sh);
     const photoData = srcCtx.getImageData(0, 0, sw, sh);
 
@@ -285,35 +282,6 @@ const Workflow = (() => {
     if (loadingSub) loadingSub.textContent = "Running AI face/eye & vehicle recognition in parallel";
 
     try {
-      const triggerBackgroundTaskFromVision = (vRes) => {
-        if (!vRes || mySessionId !== STATE.eyeSessionId) return;
-        let animalBoxes = [];
-        if (vRes.animals && vRes.animals.length > 0) {
-          animalBoxes = vRes.animals.map((a) => [a.box.x0, a.box.y0, a.box.x1, a.box.y1]);
-        } else if (vRes.primaryKind === "animal") {
-          animalBoxes = [[0.0, 0.0, 1.0, 1.0]];
-        }
-
-        const hasVehicles = vRes.vehicles && vRes.vehicles.length > 0;
-        const hasAnimals = vRes.animals && vRes.animals.length > 0;
-        const hasPeople = (vRes.faces && vRes.faces.length > 0) || (vRes.people && vRes.people.length > 0);
-
-        const isCar = hasVehicles || vRes.primaryKind === "car";
-        const isAnimal = !isCar && (hasAnimals || (!hasPeople && vRes.primaryKind === "animal"));
-
-        STATE.isCarPhoto = isCar;
-        STATE.isAnimalPhoto = isAnimal;
-
-        if (isCar && !STATE.wheelTurnPromise) {
-          STATE.wheelTurnPromise = fetchWheelTurnInBackground(rawImg);
-        } else if (isAnimal && !STATE.eyeFetchPromise) {
-          STATE.eyeFetchPromise = fetchEyePatchesInBackground(
-            rawImg,
-            animalBoxes.length > 0 ? animalBoxes : [[0.0, 0.0, 1.0, 1.0]]
-          );
-        }
-      };
-
       PERF_LOG.markStart("1_SubjectVision_AI");
       const visionPromise = (window.SubjectVision
         ? window.SubjectVision.detect(srcC, { timeoutMs: 4500 })
@@ -323,7 +291,6 @@ const Workflow = (() => {
           "1_SubjectVision_AI",
           vRes ? `kind=${vRes.primaryKind} (${vRes.ms}ms internal)` : "null"
         );
-        triggerBackgroundTaskFromVision(vRes);
         return vRes;
       });
 
@@ -344,7 +311,7 @@ const Workflow = (() => {
         ]);
         CROP.visionResult = visionRes;
         const mc = createCanvas(sw, sh);
-        const mCtx = mc.getContext("2d");
+        const mCtx = mc.getContext("2d", { willReadFrequently: true });
         mCtx.drawImage(maskImg, 0, 0, sw, sh);
         const mData = mCtx.getImageData(0, 0, sw, sh);
         maskArr = window.WatercolorFraming.maskFromImageData(mData, "luma");
@@ -354,17 +321,31 @@ const Workflow = (() => {
       finalizeCropMask(maskArr, sw, sh);
       PERF_LOG.markEnd("3_Framing_Solver", `profile=${getActiveProfileKey()}`);
 
-      // Fallback check after finalizeCropMask
+      const vRes = CROP.visionResult;
       const detectedProf = getActiveProfileKey();
       const presetVal = (document.getElementById("presetSelect") && document.getElementById("presetSelect").value) || "";
-      if (!STATE.isCarPhoto && (detectedProf === "car" || presetVal.startsWith("cars"))) {
-        STATE.isCarPhoto = true;
-        if (!STATE.wheelTurnPromise) {
-          STATE.wheelTurnPromise = fetchWheelTurnInBackground(rawImg);
+      const hasVehicles = !!(vRes && vRes.vehicles && vRes.vehicles.length > 0);
+      const hasAnimals = !!(vRes && vRes.animals && vRes.animals.length > 0);
+      const hasPeople = !!(vRes && ((vRes.faces && vRes.faces.length > 0) || (vRes.people && vRes.people.length > 0)));
+
+      const isCar = hasVehicles || (vRes && vRes.primaryKind === "car") || detectedProf === "car" || presetVal.startsWith("cars");
+      const isAnimal = !isCar && (hasAnimals || (!hasPeople && vRes && vRes.primaryKind === "animal") || detectedProf === "animal" || presetVal.startsWith("animals"));
+
+      STATE.isCarPhoto = isCar;
+      STATE.isAnimalPhoto = isAnimal;
+
+      if (mySessionId === STATE.eyeSessionId) {
+        if (STATE.isLowResPhoto && !STATE.upscalePromise) {
+          STATE.upscalePromise = fetchUpscaledPhotoInBackground(rawImg);
         }
-      } else if (!STATE.isCarPhoto && (detectedProf === "animal" || presetVal.startsWith("animals")) && !STATE.eyeFetchPromise) {
-        STATE.isAnimalPhoto = true;
-        STATE.eyeFetchPromise = fetchEyePatchesInBackground(rawImg, [[0.0, 0.0, 1.0, 1.0]]);
+        if (isCar && !STATE.wheelTurnPromise) {
+          STATE.wheelTurnPromise = fetchWheelTurnInBackground(rawImg);
+        } else if (isAnimal && !STATE.eyeFetchPromise) {
+          const animalBoxes = hasAnimals
+            ? vRes.animals.map((a) => [a.box.x0, a.box.y0, a.box.x1, a.box.y1])
+            : [[0.0, 0.0, 1.0, 1.0]];
+          STATE.eyeFetchPromise = fetchEyePatchesInBackground(rawImg, animalBoxes);
+        }
       }
 
       PERF_LOG.printSummary("Step 1 → Step 2 (Upload to Move & Zoom)");
@@ -418,6 +399,11 @@ const Workflow = (() => {
 
   function mapRawEyePatchesToCanvas() {
     if (!STATE.uncroppedPlacement || !Array.isArray(STATE.rawEyePatches)) return;
+    // If side-by-side lineup mode rearranged the subjects, skip raw whole-photo eye coordinate mapping
+    if (CROP.multiSubjectMode === "side_by_side" && CROP.multiSubjects.length >= 2) {
+      STATE.eyeBeautifierPatches = [];
+      return;
+    }
     const { px } = STATE.uncroppedPlacement;
     STATE.eyeBeautifierPatches = STATE.rawEyePatches.map((ep) => ({
       baseX: Math.round(px.x + ep.x0Frac * px.w),
@@ -482,14 +468,8 @@ const Workflow = (() => {
     const targetSessionId = STATE.eyeSessionId;
     PERF_LOG.markStart("BG_WheelTurn_GPU_RPC");
     try {
-      let sourceForWheel = img;
-      if (STATE.isLowResPhoto && STATE.upscalePromise) {
-        const upData = await STATE.upscalePromise;
-        if (upData && upData.upscaledImg) {
-          sourceForWheel = upData.upscaledImg;
-        }
-      }
-      const blob = await prepareOptimizedUploadBlob(sourceForWheel, "cars_black");
+      // Send `img` immediately in parallel with cutout & Cloudinary upscale (server upscales <1100px in 15ms and returns fractional coords)
+      const blob = await prepareOptimizedUploadBlob(img, "cars_black");
       const fd = new FormData();
       fd.append("image_file", blob, "upload.jpg");
       const res = await fetch(`${STATE.apiUrl}/steer_wheel`, { method: "POST", body: fd });
@@ -504,28 +484,62 @@ const Workflow = (() => {
           loadImage(data.patch_mask_webp),
         ]);
         STATE.wheelTurnData = { ...data, patchRgbImg, patchMaskImg };
-        PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `${data.turn} ${data.angle}° (server ${data.elapsed_sec}s)`);
+        const fr = data.front_ratio ?? 0.35;
+        const rr = data.rear_ratio ?? 0.0;
+        const ta = data.tread_asym ?? 1.0;
+        const dd = data.deg_diff ?? 0.0;
+        const ratio = rr > 0 ? (fr / rr) : 0;
+        const isAlreadyTurned =
+          data.is_already_turned !== undefined
+            ? Boolean(data.is_already_turned)
+            : (
+                (rr > 0.08 && ratio >= 1.95 && dd >= 1.2) ||
+                (ratio >= 1.65 && ta >= 1.9 && dd >= 4.5) ||
+                (ratio >= 1.65 && ta >= 1.95 && dd >= 1.0)
+              );
+        const steerMode = data.steer_mode || (isAlreadyTurned ? "ALREADY_TURNED" : "STRAIGHT");
+        const boxMetrics =
+          data.front_angle_deg !== undefined
+            ? `F=${data.front_angle_deg}° vs Exp=${data.expected_straight_deg}° (Net=${data.net_steer_deg}°, kappa=${data.kappa})`
+            : `front_r=${fr}, rear_r=${rr}, tread_asym=${ta}, deg_diff=${dd}°`;
+        if (isAlreadyTurned) {
+          STATE.wheelTurnEnabled = false;
+          console.log(
+            `%c🛞 [3D Box & Cylinder Check] ${steerMode} (${boxMetrics}) -> Defaulting Turned Wheel to OFF!`,
+            "color:#f59e0b;font-weight:bold;"
+          );
+        } else {
+          STATE.wheelTurnEnabled = true;
+          console.log(
+            `%c🛞 [3D Box & Cylinder Check] ${steerMode} (${boxMetrics}) -> Turned Wheel ON!`,
+            "color:#10b981;font-weight:bold;"
+          );
+        }
+        PERF_LOG.markEnd("BG_WheelTurn_GPU_RPC", `${steerMode} | ${data.turn} ${data.angle}° (server ${data.elapsed_sec}s)`);
 
-        // If the user already entered Step 3 (Studio) while a cold GPU was booting,
-        // hot-build the turned wheel canvases and update the live Studio painting automatically!
         if (currentStep === "studio" && STATE.payload && STATE.uncroppedPlacement && STATE.eyeSessionId === targetSessionId) {
           const outW = STATE.unturnedFramedPhotoCanvas ? STATE.unturnedFramedPhotoCanvas.width : 1782;
           const outH = STATE.unturnedFramedPhotoCanvas ? STATE.unturnedFramedPhotoCanvas.height : 1260;
           const px = STATE.uncroppedPlacement.px;
           const framedMaskC = STATE.unturnedFramedMaskCanvas;
-          if (STATE.lowResUnturnedPhotoCanvas && framedMaskC) {
-            const lowTurned = buildTurnedPhotoAndMaskFromBase(
-              STATE.lowResUnturnedPhotoCanvas, framedMaskC, STATE.wheelTurnData, px, outW, outH
-            );
-            STATE.lowResTurnedPhotoCanvas = lowTurned.turnedPhotoC;
-            STATE.turnedFramedMaskCanvas = lowTurned.turnedMaskC;
-          }
           if (STATE.hqUnturnedPhotoCanvas && framedMaskC) {
             const hqTurned = buildTurnedPhotoAndMaskFromBase(
               STATE.hqUnturnedPhotoCanvas, framedMaskC, STATE.wheelTurnData, px, outW, outH
             );
             STATE.hqTurnedPhotoCanvas = hqTurned.turnedPhotoC;
             STATE.turnedFramedMaskCanvas = hqTurned.turnedMaskC;
+            if (IS_MOBILE) {
+              STATE.lowResTurnedPhotoCanvas = STATE.hqTurnedPhotoCanvas;
+            }
+          }
+          if ((!IS_MOBILE || !STATE.hqUnturnedPhotoCanvas) && STATE.lowResUnturnedPhotoCanvas && framedMaskC) {
+            const lowTurned = buildTurnedPhotoAndMaskFromBase(
+              STATE.lowResUnturnedPhotoCanvas, framedMaskC, STATE.wheelTurnData, px, outW, outH
+            );
+            STATE.lowResTurnedPhotoCanvas = lowTurned.turnedPhotoC;
+            if (!STATE.turnedFramedMaskCanvas) {
+              STATE.turnedFramedMaskCanvas = lowTurned.turnedMaskC;
+            }
           }
           syncActiveResolutionAndWheelCanvases();
           if (STATE.presetCache) STATE.presetCache.clear();
@@ -547,12 +561,7 @@ const Workflow = (() => {
     const targetSessionId = STATE.eyeSessionId;
     PERF_LOG.markStart("BG_Cloudinary_2x_Upscale");
     try {
-      const w = img.naturalWidth || img.width;
-      const h = img.naturalHeight || img.height;
-      const c = createCanvas(w, h);
-      c.getContext("2d").drawImage(img, 0, 0, w, h);
-      const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.93));
-
+      const blob = await prepareOptimizedUploadBlob(img, "cars_black");
       const fd = new FormData();
       fd.append("image_file", blob, "upload.jpg");
       const res = await fetch(`${STATE.apiUrl}/upscale_subject`, { method: "POST", body: fd });
@@ -576,7 +585,6 @@ const Workflow = (() => {
     return null;
   }
 
-  // Helper that composites the turned wheel patch onto ANY baseFramedPhotoCanvas with feathered pixel-diff
   function buildTurnedPhotoAndMaskFromBase(baseFramedPhotoC, baseFramedMaskC, wt, px, outW, outH) {
     const dstX = Math.round(px.x + wt.x0Frac * px.w);
     const dstY = Math.round(px.y + wt.y0Frac * px.h);
@@ -584,24 +592,24 @@ const Workflow = (() => {
     const dstH = Math.max(1, Math.round(wt.hFrac * px.h));
 
     const turnedPhotoC = createCanvas(outW, outH);
-    const tpCtx = turnedPhotoC.getContext("2d");
+    const tpCtx = turnedPhotoC.getContext("2d", { willReadFrequently: true });
     tpCtx.drawImage(baseFramedPhotoC, 0, 0);
 
     const origPatch = tpCtx.getImageData(dstX, dstY, dstW, dstH);
     const oD = origPatch.data;
 
     const patchC = createCanvas(dstW, dstH);
-    const pCtx = patchC.getContext("2d");
+    const pCtx = patchC.getContext("2d", { willReadFrequently: true });
     pCtx.drawImage(wt.patchRgbImg, 0, 0, dstW, dstH);
     const pD = pCtx.getImageData(0, 0, dstW, dstH).data;
 
     const maskPatchC = createCanvas(dstW, dstH);
-    const mpCtx = maskPatchC.getContext("2d");
+    const mpCtx = maskPatchC.getContext("2d", { willReadFrequently: true });
     mpCtx.drawImage(wt.patchMaskImg, 0, 0, dstW, dstH);
     const mpD = mpCtx.getImageData(0, 0, dstW, dstH).data;
 
     const turnedMaskC = createCanvas(outW, outH);
-    const tmCtx = turnedMaskC.getContext("2d");
+    const tmCtx = turnedMaskC.getContext("2d", { willReadFrequently: true });
     tmCtx.drawImage(baseFramedMaskC, 0, 0);
     const origMaskImg = tmCtx.getImageData(dstX, dstY, dstW, dstH);
     const omD = origMaskImg.data;
@@ -640,8 +648,6 @@ const Workflow = (() => {
     return { turnedPhotoC, turnedMaskC };
   }
 
-  // Synchronizes STATE.unturnedFramedPhotoCanvas, STATE.turnedFramedPhotoCanvas, and STATE.framedPhotoCanvas
-  // whenever AI Upscale is toggled ON/OFF in Studio, preventing any mask/wheel desync (fixes arti.jpg!)
   function syncActiveResolutionAndWheelCanvases() {
     const useHq = !!(STATE.upscaleEnabled !== false && STATE.hqUnturnedPhotoCanvas);
     const unturnedPhoto = useHq ? STATE.hqUnturnedPhotoCanvas : STATE.lowResUnturnedPhotoCanvas;
@@ -659,46 +665,101 @@ const Workflow = (() => {
     const useTurnedNow = hasTurned && STATE.wheelTurnEnabled !== false;
     STATE.framedPhotoCanvas = useTurnedNow ? turnedPhoto : unturnedPhoto;
     STATE.framedMaskCanvas = useTurnedNow ? STATE.turnedFramedMaskCanvas : STATE.unturnedFramedMaskCanvas;
+    STATE.originalImg = STATE.framedPhotoCanvas;
   }
 
-  function rebuildCutoutAndTintFromMaskCanvas() {
+  function rebuildCutoutAndTintFromMaskCanvas(skipMaskReadback = false) {
     if (!CROP.sourceCanvas || !CROP.maskCanvas) return;
     const sw = CROP.sourceCanvas.width;
     const sh = CROP.sourceCanvas.height;
-    const mData = CROP.maskCanvas.getContext("2d").getImageData(0, 0, sw, sh).data;
 
     if (!CROP.maskArr || CROP.maskArr.length !== sw * sh) {
       CROP.maskArr = new Uint8Array(sw * sh);
+      skipMaskReadback = false;
     }
+    if (!skipMaskReadback) {
+      const mData = CROP.maskCanvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, sw, sh).data;
+      for (let i = 0; i < CROP.maskArr.length; i++) {
+        CROP.maskArr[i] = mData[i * 4];
+      }
+    }
+
     if (!CROP.cutoutCanvas || CROP.cutoutCanvas.width !== sw || CROP.cutoutCanvas.height !== sh) {
       CROP.cutoutCanvas = createCanvas(sw, sh);
     }
-    if (!CROP.maskTintCanvas || CROP.maskTintCanvas.width !== sw || CROP.maskTintCanvas.height !== sh) {
-      CROP.maskTintCanvas = createCanvas(sw, sh);
-    }
 
-    const cCtx = CROP.cutoutCanvas.getContext("2d");
+    const cCtx = CROP.cutoutCanvas.getContext("2d", { willReadFrequently: true });
     cCtx.clearRect(0, 0, sw, sh);
     cCtx.drawImage(CROP.sourceCanvas, 0, 0);
     const cImg = cCtx.getImageData(0, 0, sw, sh);
     const cData = cImg.data;
+    const maskArr = CROP.maskArr;
 
-    const tCtx = CROP.maskTintCanvas.getContext("2d");
-    const tImg = tCtx.createImageData(sw, sh);
-    const tData = tImg.data;
-
-    for (let i = 0; i < CROP.maskArr.length; i++) {
-      const p = i * 4;
-      const v = mData[p];
-      CROP.maskArr[i] = v;
-      cData[p + 3] = Math.min(cData[p + 3], v);
-      tData[p] = 0;
-      tData[p + 1] = 0;
-      tData[p + 2] = 0;
-      tData[p + 3] = 255 - v;
+    if (CROP.maskEditMode) {
+      if (!CROP.maskTintCanvas || CROP.maskTintCanvas.width !== sw || CROP.maskTintCanvas.height !== sh) {
+        CROP.maskTintCanvas = createCanvas(sw, sh);
+      }
+      const tCtx = CROP.maskTintCanvas.getContext("2d");
+      const tImg = tCtx.createImageData(sw, sh);
+      const tData = tImg.data;
+      for (let i = 0; i < maskArr.length; i++) {
+        const p = i * 4;
+        const v = maskArr[i];
+        cData[p + 3] = Math.min(cData[p + 3], v);
+        tData[p + 3] = 255 - v;
+      }
+      tCtx.putImageData(tImg, 0, 0);
+    } else {
+      for (let i = 0; i < maskArr.length; i++) {
+        const p = i * 4;
+        cData[p + 3] = Math.min(cData[p + 3], maskArr[i]);
+      }
     }
     cCtx.putImageData(cImg, 0, 0);
-    tCtx.putImageData(tImg, 0, 0);
+  }
+
+  
+  // ==========================================================================
+  // 🐾👥 MULTI-SUBJECT SIDE-BY-SIDE LINEUP ENGINE (Animals & People Only!)
+  // ==========================================================================
+  const _msHelpers = () => ({
+    fetchSubjectMaskFromBackend,
+    getActiveProfileKey,
+    syncOrientationButtonsUI,
+    resetCropToSmartDefault,
+    syncCropSlidersUI,
+    renderCropPreview,
+  });
+
+  function extractDetectedMultiSubjects() {
+    if (window.MultiSubjectEngine) window.MultiSubjectEngine.extractDetectedMultiSubjects(CROP, getActiveProfileKey);
+  }
+  function computeSideBySidePlacements(canvasW, canvasH) {
+    return window.MultiSubjectEngine ? window.MultiSubjectEngine.computeSideBySidePlacements(CROP, canvasW, canvasH) : [];
+  }
+  function loadSingleSubjectSlotFromFile(file, slotIdx) {
+    if (window.MultiSubjectEngine) return window.MultiSubjectEngine.loadSingleSubjectSlotFromFile(file, slotIdx, CROP, _msHelpers());
+  }
+  function setMultiSubjectTargetCount(targetCount) {
+    if (window.MultiSubjectEngine) window.MultiSubjectEngine.setMultiSubjectTargetCount(targetCount, CROP, _msHelpers());
+  }
+  function updateMultiSubjectUI() {
+    if (window.MultiSubjectEngine) window.MultiSubjectEngine.updateMultiSubjectUI(CROP, getActiveProfileKey, _msHelpers());
+  }
+
+
+
+  
+
+  function getActiveSliderTargetInCrop() {
+    if (
+      CROP.multiSubjectMode === "side_by_side" &&
+      CROP.activeSubjectIdx >= 0 &&
+      CROP.multiSubjects[CROP.activeSubjectIdx]
+    ) {
+      return CROP.multiSubjects[CROP.activeSubjectIdx];
+    }
+    return CROP;
   }
 
   function finalizeCropMask(maskArr, sw, sh) {
@@ -715,10 +776,10 @@ const Workflow = (() => {
     mCtx.putImageData(mImg, 0, 0);
     CROP.maskCanvas = mc;
 
-    rebuildCutoutAndTintFromMaskCanvas();
+    rebuildCutoutAndTintFromMaskCanvas(true);
     rebuildAnalysisWithVision(true);
+    extractDetectedMultiSubjects();
 
-    // Determine whether the subject is a known Car, known Animal/Person, or Unrecognized
     const vRes = CROP.visionResult;
     const hasConfidentVehicle = !!(vRes && vRes.vehicles && vRes.vehicles.length > 0);
     const hasConfidentPerson = !!(vRes && ((vRes.faces && vRes.faces.length > 0) || (vRes.people && vRes.people.length > 0)));
@@ -755,8 +816,15 @@ const Workflow = (() => {
     syncOrientationButtonsUI();
     toggleStep2MaskMode(false);
 
-    resetCropToSmartDefault();
+    resetCropToSmartDefault(true);
     goTo("crop");
+
+    if (STATE._pendingMultiCountFromLanding >= 2) {
+      const targetCnt = STATE._pendingMultiCountFromLanding;
+      STATE._pendingMultiCountFromLanding = 0;
+      setMultiSubjectTargetCount(targetCnt);
+    }
+
   }
 
   function rebuildAnalysisWithVision(isNewUpload = false) {
@@ -764,6 +832,9 @@ const Workflow = (() => {
     const F = window.WatercolorFraming;
     const sw = CROP.sourceCanvas.width;
     const sh = CROP.sourceCanvas.height;
+    if (!CROP.sourcePhotoData) {
+      CROP.sourcePhotoData = CROP.sourceCanvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, sw, sh);
+    }
     const presetKey = isNewUpload ? "auto" : document.getElementById("presetSelect").value;
     const forcedCar = !isNewUpload && presetKey.startsWith("cars");
 
@@ -797,15 +868,20 @@ const Workflow = (() => {
     const ratioSel = document.getElementById("cropCanvasRatio");
     const val = ratioSel ? ratioSel.value : STATE.aspectRatioKey || "a4";
     STATE.aspectRatioKey = val;
+    const effectiveOrient = CROP.multiSubjectMode === "side_by_side" ? "landscape" : STATE.aspectOrientation;
     if (typeof window.parseAspectRatioToCm === "function") {
-      return window.parseAspectRatioToCm(val, profileKey, STATE.aspectOrientation);
+      return window.parseAspectRatioToCm(val, profileKey, effectiveOrient);
     }
-    return profileKey === "car" ? { width: 141.42, height: 100 } : { width: 100, height: 141.42 };
+    return profileKey === "car" || effectiveOrient === "landscape"
+      ? { width: 141.42, height: 100 }
+      : { width: 100, height: 141.42 };
   }
 
   function syncOrientationButtonsUI() {
     const profKey = getActiveProfileKey();
-    const orient = STATE.aspectOrientation || (profKey === "car" ? "landscape" : "portrait");
+    const orient = CROP.multiSubjectMode === "side_by_side"
+      ? "landscape"
+      : (STATE.aspectOrientation || (profKey === "car" ? "landscape" : "portrait"));
     const pBtn = document.getElementById("cropOrientPortraitBtn");
     const lBtn = document.getElementById("cropOrientLandscapeBtn");
     if (pBtn) pBtn.className = orient === "portrait" ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
@@ -818,6 +894,9 @@ const Workflow = (() => {
   }
 
   function setOrientation(orient) {
+    if (CROP.multiSubjectMode === "side_by_side" && orient === "portrait") {
+      return; // Side-by-side lineup requires Landscape
+    }
     STATE.aspectOrientation = orient;
     syncOrientationButtonsUI();
     if (currentStep === "crop") {
@@ -840,36 +919,50 @@ const Workflow = (() => {
     }
   }
 
-  function resetCropToSmartDefault() {
-    rebuildCutoutAndTintFromMaskCanvas();
-    rebuildAnalysisWithVision(false);
+  function resetCropToSmartDefault(skipRebuild = false) {
+    if (!skipRebuild) {
+      rebuildCutoutAndTintFromMaskCanvas();
+      rebuildAnalysisWithVision(false);
+    }
     const presetKey = document.getElementById("presetSelect").value;
     const profileKey = getActiveProfileKey();
     const defaultZoom = window.STUDIO_CONFIG
       ? window.STUDIO_CONFIG.getDefaultZoomPercent(presetKey, profileKey)
       : profileKey === "car" ? 100 : 97;
 
-    CROP.zoomPct = defaultZoom;
-    CROP.dxPct = 0;
-    CROP.dyPct = 0;
+    if (CROP.multiSubjectMode === "side_by_side") {
+      CROP.zoomPct = 100;
+      CROP.dxPct = 0;
+      CROP.dyPct = 0;
+      for (const s of CROP.multiSubjects) {
+        s.zoomPct = 100;
+        s.dxPct = 0;
+        s.dyPct = 0;
+      }
+    } else {
+      CROP.zoomPct = defaultZoom;
+      CROP.dxPct = 0;
+      CROP.dyPct = 0;
+    }
     syncCropSlidersUI();
     renderCropPreview();
   }
 
   function syncCropSlidersUI() {
+    const tgt = getActiveSliderTargetInCrop();
     const zSlider = document.getElementById("cropZoomSlider");
     const xSlider = document.getElementById("cropDxSlider");
     const ySlider = document.getElementById("cropDySlider");
-    if (zSlider) zSlider.value = Math.round(CROP.zoomPct);
-    if (xSlider) xSlider.value = Math.round(CROP.dxPct);
-    if (ySlider) ySlider.value = Math.round(CROP.dyPct);
+    if (zSlider) zSlider.value = Math.round(tgt.zoomPct);
+    if (xSlider) xSlider.value = Math.round(tgt.dxPct);
+    if (ySlider) ySlider.value = Math.round(tgt.dyPct);
 
     const zVal = document.getElementById("cropZoomVal");
     const xVal = document.getElementById("cropDxVal");
     const yVal = document.getElementById("cropDyVal");
-    if (zVal) zVal.textContent = `${Math.round(CROP.zoomPct)}%`;
-    if (xVal) xVal.textContent = `${Math.round(CROP.dxPct)}%`;
-    if (yVal) yVal.textContent = `${Math.round(CROP.dyPct)}%`;
+    if (zVal) zVal.textContent = `${Math.round(tgt.zoomPct)}%`;
+    if (xVal) xVal.textContent = `${Math.round(tgt.dxPct)}%`;
+    if (yVal) yVal.textContent = `${Math.round(tgt.dyPct)}%`;
   }
 
   function clampMaskViewPan(cvW, cvH) {
@@ -914,6 +1007,44 @@ const Workflow = (() => {
     const isDarkBg = presetKey.endsWith("_black");
     g.fillStyle = CROP.maskEditMode ? "#121212" : isDarkBg ? "#141414" : "#f5efe4";
     g.fillRect(0, 0, cv.width, cv.height);
+
+    // Side-by-Side Lineup Preview Mode
+    if (CROP.multiSubjectMode === "side_by_side" && CROP.multiSubjects.length >= 2 && !CROP.maskEditMode) {
+      const placements = computeSideBySidePlacements(cv.width, cv.height);
+      for (let i = 0; i < placements.length; i++) {
+        const pl = placements[i];
+        g.drawImage(pl.sub.cutoutC, pl.x, pl.y, pl.w, pl.h);
+        if (CROP.showGuides && CROP.activeSubjectIdx === i) {
+          g.save();
+          g.strokeStyle = "rgba(37,99,235,0.85)";
+          g.lineWidth = 2;
+          g.setLineDash([6, 4]);
+          g.strokeRect(pl.x, pl.y, pl.w, pl.h);
+          g.restore();
+        }
+      }
+      if (CROP.showGuides) {
+        g.save();
+        g.strokeStyle = "#16a34a";
+        g.lineWidth = 1.4;
+        g.setLineDash([4, 4]);
+        g.beginPath();
+        g.moveTo(0, cv.height * 0.43);
+        g.lineTo(cv.width, cv.height * 0.43);
+        g.stroke();
+        g.restore();
+      }
+      g.strokeStyle = "#b8935a";
+      g.lineWidth = 2;
+      g.strokeRect(1, 1, cv.width - 2, cv.height - 2);
+
+      const badge = document.getElementById("cropInfoBadge");
+      if (badge) {
+        const who = CROP.activeSubjectIdx >= 0 ? `Moving Subject #${CROP.activeSubjectIdx + 1} (Click any subject to switch)` : "Moving All Subjects";
+        badge.textContent = `↔️ Side-by-Side Lineup (${CROP.multiSubjects.length}) · ${who}`;
+      }
+      return;
+    }
 
     const fr = F.computeFraming(CROP.analysis, cm, {
       profile: profileKey,
@@ -1085,11 +1216,12 @@ const Workflow = (() => {
 
   function onCropMaskHistorySwap() {
     rebuildCutoutAndTintFromMaskCanvas();
+    extractDetectedMultiSubjects();
     renderCropPreview();
   }
 
   async function confirmCropAndGenerate() {
-    if (!CROP.sourceCanvas || !CROP.maskCanvas || !CROP.lastFraming) return;
+    if (!CROP.sourceCanvas || !CROP.maskCanvas) return;
     PERF_LOG.markStart("Step2_to_Step3_Total");
 
     if (CROP.maskEditMode) {
@@ -1111,8 +1243,7 @@ const Workflow = (() => {
       await STATE.upscalePromise;
     }
 
-    // 2. If this is a car, wait up to 4.0s for /steer_wheel (if warm, finishes in ~2s;
-    //    if cold-booting on Modal, enter Studio immediately and hot-swap when ready!)
+    // 2. If this is a car, wait up to 4.5s for /steer_wheel
     if (isCar || profileKey === "car" || STATE.isCarPhoto) {
       if (!STATE.wheelTurnPromise && !STATE.wheelTurnData && CROP.sourceImg) {
         STATE.wheelTurnPromise = fetchWheelTurnInBackground(CROP.sourceImg);
@@ -1123,12 +1254,12 @@ const Workflow = (() => {
         if (loadingText) loadingText.textContent = "Steering front wheel in 3D...";
         await Promise.race([
           STATE.wheelTurnPromise,
-          new Promise((r) => setTimeout(r, 4000)),
+          new Promise((r) => setTimeout(r, 4500)),
         ]);
       }
     }
 
-    // 3. If this is an animal, ensure /beautify_eyes has finished so eyes NEVER miss on first load!
+    // 3. If this is an animal, ensure /beautify_eyes has finished
     if (isAnimal) {
       if (!STATE.eyeFetchPromise && (!STATE.rawEyePatches || STATE.rawEyePatches.length === 0) && CROP.sourceImg) {
         STATE.eyeFetchPromise = fetchEyePatchesInBackground(CROP.sourceImg, [[0.0, 0.0, 1.0, 1.0]]);
@@ -1141,106 +1272,171 @@ const Workflow = (() => {
       }
     }
 
-    const refCm = isCar ? { width: 141.421356, height: 100 } : { width: 100, height: 141.421356 };
-    const outW = isCar ? 1782 : 1260;
-    const outH = isCar ? 1260 : 1782;
+    const isSideBySide = CROP.multiSubjectMode === "side_by_side" && CROP.multiSubjects.length >= 2 && !isCar;
+    if (isSideBySide) {
+      STATE.aspectOrientation = "landscape";
+    }
+    const useLandscapeRef = isCar || isSideBySide || STATE.aspectOrientation === "landscape";
+    const refCm = useLandscapeRef ? { width: 141.421356, height: 100 } : { width: 100, height: 141.421356 };
+    const outW = useLandscapeRef ? 1782 : 1260;
+    const outH = useLandscapeRef ? 1260 : 1782;
 
-    const refFraming = window.WatercolorFraming.computeFraming(CROP.analysis, refCm, {
-      profile: profileKey,
-      adjust: {
-        zoom: CROP.zoomPct / 100,
-        dx: CROP.dxPct / 100,
-        dy: CROP.dyPct / 100,
-      },
-    });
-    const px = window.WatercolorFraming.toPixels(refFraming, outW, outH);
+    if (isSideBySide) {
+      // Compose Side-by-Side Lineup directly into outW x outH Framed Photo & Mask Canvases!
+      const placements = computeSideBySidePlacements(outW, outH);
+      const framedPhotoC = createCanvas(outW, outH);
+      const fpCtx = framedPhotoC.getContext("2d");
+      fpCtx.fillStyle = "#faf8f4";
+      fpCtx.fillRect(0, 0, outW, outH);
+      fpCtx.save();
+      fpCtx.filter = "blur(28px)";
+      fpCtx.drawImage(CROP.sourceImg, 0, 0, outW, outH);
+      fpCtx.restore();
 
-    STATE.uncroppedPlacement = {
-      sourceImg: CROP.sourceImg,
-      sourceCanvas: CROP.sourceCanvas,
-      maskCanvas: CROP.maskCanvas,
-      cutoutCanvas: CROP.cutoutCanvas,
-      refSize: [outW, outH],
-      px: { x: px.x, y: px.y, w: px.w, h: px.h },
-    };
+      const framedMaskC = createCanvas(outW, outH);
+      const fmCtx = framedMaskC.getContext("2d");
+      fmCtx.fillStyle = "#000000";
+      fmCtx.fillRect(0, 0, outW, outH);
 
-    mapRawEyePatchesToCanvas();
+      const compCutoutC = createCanvas(outW, outH);
+      const ccCtx = compCutoutC.getContext("2d");
 
-    // 4. Build Unturned Framed Photo Canvases (for both HQ Upscaled and Low-Res Original) & Mask Canvas
-    const buildFramedPhotoFromSource = (srcImage) => {
-      const c = createCanvas(outW, outH);
-      const ctx = c.getContext("2d");
-      ctx.fillStyle = isCar ? "#ffffff" : "#faf8f4";
-      ctx.fillRect(0, 0, outW, outH);
-      ctx.save();
-      ctx.filter = "blur(24px)";
-      ctx.drawImage(srcImage, 0, 0, outW, outH);
-      ctx.restore();
-      ctx.drawImage(srcImage, px.x, px.y, px.w, px.h);
-      return c;
-    };
-
-    const hasUpscaled = !!(STATE.upscaleData && STATE.upscaleData.upscaledImg);
-    STATE.lowResUnturnedPhotoCanvas = buildFramedPhotoFromSource(CROP.sourceImg);
-    STATE.hqUnturnedPhotoCanvas = hasUpscaled
-      ? buildFramedPhotoFromSource(STATE.upscaleData.upscaledImg)
-      : null;
-
-    const framedMaskC = createCanvas(outW, outH);
-    const fmCtx = framedMaskC.getContext("2d");
-    fmCtx.fillStyle = "#000000";
-    fmCtx.fillRect(0, 0, outW, outH);
-    fmCtx.drawImage(CROP.maskCanvas, px.x, px.y, px.w, px.h);
-    STATE.unturnedFramedMaskCanvas = framedMaskC;
-
-    // 5. Build Turned Framed Photo Canvases (for both HQ Upscaled and Low-Res Original) & Turned Mask Canvas
-    if (STATE.wheelTurnData && STATE.wheelTurnData.turned) {
-      const wt = STATE.wheelTurnData;
-      const lowResTurned = buildTurnedPhotoAndMaskFromBase(
-        STATE.lowResUnturnedPhotoCanvas,
-        framedMaskC,
-        wt,
-        px,
-        outW,
-        outH
-      );
-      STATE.lowResTurnedPhotoCanvas = lowResTurned.turnedPhotoC;
-      STATE.turnedFramedMaskCanvas = lowResTurned.turnedMaskC;
-
-      if (STATE.hqUnturnedPhotoCanvas) {
-        const hqTurned = buildTurnedPhotoAndMaskFromBase(
-          STATE.hqUnturnedPhotoCanvas,
-          framedMaskC,
-          wt,
-          px,
-          outW,
-          outH
-        );
-        STATE.hqTurnedPhotoCanvas = hqTurned.turnedPhotoC;
-        STATE.turnedFramedMaskCanvas = hqTurned.turnedMaskC;
-      } else {
-        STATE.hqTurnedPhotoCanvas = null;
+      for (const pl of placements) {
+        // Draw each subject's unmasked source crop first, then its clean cutout on top so edge sampling has rich interior RGB
+        fpCtx.drawImage(pl.sub.srcCropC, pl.x, pl.y, pl.w, pl.h);
+        fpCtx.drawImage(pl.sub.cutoutC, pl.x, pl.y, pl.w, pl.h);
+        fmCtx.drawImage(pl.sub.maskC, pl.x, pl.y, pl.w, pl.h);
+        ccCtx.drawImage(pl.sub.cutoutC, pl.x, pl.y, pl.w, pl.h);
       }
-    } else {
+
+      STATE.uncroppedPlacement = {
+        sourceImg: framedPhotoC,
+        sourceCanvas: framedPhotoC,
+        maskCanvas: framedMaskC,
+        cutoutCanvas: compCutoutC,
+        refSize: [outW, outH],
+        px: { x: 0, y: 0, w: outW, h: outH },
+      };
+
+      STATE.lowResUnturnedPhotoCanvas = framedPhotoC;
+      STATE.hqUnturnedPhotoCanvas = null;
+      STATE.unturnedFramedMaskCanvas = framedMaskC;
       STATE.lowResTurnedPhotoCanvas = null;
       STATE.hqTurnedPhotoCanvas = null;
       STATE.turnedFramedMaskCanvas = null;
+      STATE.eyeBeautifierPatches = [];
+      STATE.detectedEyes = [];
+    } else {
+      const refFraming = window.WatercolorFraming.computeFraming(CROP.analysis, refCm, {
+        profile: profileKey,
+        adjust: {
+          zoom: CROP.zoomPct / 100,
+          dx: CROP.dxPct / 100,
+          dy: CROP.dyPct / 100,
+        },
+      });
+      const px = window.WatercolorFraming.toPixels(refFraming, outW, outH);
+
+      STATE.uncroppedPlacement = {
+        sourceImg: CROP.sourceImg,
+        sourceCanvas: CROP.sourceCanvas,
+        maskCanvas: CROP.maskCanvas,
+        cutoutCanvas: CROP.cutoutCanvas,
+        refSize: [outW, outH],
+        px: { x: px.x, y: px.y, w: px.w, h: px.h },
+      };
+
+      mapRawEyePatchesToCanvas();
+
+      const buildFramedPhotoFromSource = (srcImage) => {
+        const c = createCanvas(outW, outH);
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = isCar ? "#ffffff" : "#faf8f4";
+        ctx.fillRect(0, 0, outW, outH);
+        ctx.save();
+        ctx.filter = "blur(24px)";
+        ctx.drawImage(srcImage, 0, 0, outW, outH);
+        ctx.restore();
+        ctx.drawImage(srcImage, px.x, px.y, px.w, px.h);
+        return c;
+      };
+
+      const hasUpscaled = !!(STATE.upscaleData && STATE.upscaleData.upscaledImg);
+      if (IS_MOBILE && hasUpscaled) {
+        STATE.hqUnturnedPhotoCanvas = buildFramedPhotoFromSource(STATE.upscaleData.upscaledImg);
+        STATE.lowResUnturnedPhotoCanvas = STATE.hqUnturnedPhotoCanvas;
+      } else {
+        STATE.lowResUnturnedPhotoCanvas = buildFramedPhotoFromSource(CROP.sourceImg);
+        STATE.hqUnturnedPhotoCanvas = hasUpscaled
+          ? buildFramedPhotoFromSource(STATE.upscaleData.upscaledImg)
+          : null;
+      }
+
+      const framedMaskC = createCanvas(outW, outH);
+      const fmCtx = framedMaskC.getContext("2d");
+      fmCtx.fillStyle = "#000000";
+      fmCtx.fillRect(0, 0, outW, outH);
+      fmCtx.drawImage(CROP.maskCanvas, px.x, px.y, px.w, px.h);
+      STATE.unturnedFramedMaskCanvas = framedMaskC;
+
+      if (STATE.wheelTurnData && STATE.wheelTurnData.turned) {
+        const wt = STATE.wheelTurnData;
+        if (STATE.hqUnturnedPhotoCanvas) {
+          const hqTurned = buildTurnedPhotoAndMaskFromBase(
+            STATE.hqUnturnedPhotoCanvas,
+            framedMaskC,
+            wt,
+            px,
+            outW,
+            outH
+          );
+          STATE.hqTurnedPhotoCanvas = hqTurned.turnedPhotoC;
+          STATE.turnedFramedMaskCanvas = hqTurned.turnedMaskC;
+          if (IS_MOBILE) {
+            STATE.lowResTurnedPhotoCanvas = STATE.hqTurnedPhotoCanvas;
+          }
+        }
+        if (!IS_MOBILE || !STATE.hqUnturnedPhotoCanvas) {
+          const lowResTurned = buildTurnedPhotoAndMaskFromBase(
+            STATE.lowResUnturnedPhotoCanvas,
+            framedMaskC,
+            wt,
+            px,
+            outW,
+            outH
+          );
+          STATE.lowResTurnedPhotoCanvas = lowResTurned.turnedPhotoC;
+          if (!STATE.turnedFramedMaskCanvas) {
+            STATE.turnedFramedMaskCanvas = lowResTurned.turnedMaskC;
+          }
+        }
+      } else {
+        STATE.lowResTurnedPhotoCanvas = null;
+        STATE.hqTurnedPhotoCanvas = null;
+        STATE.turnedFramedMaskCanvas = null;
+      }
+
+      STATE.detectedEyes = px.eyes || [];
+      STATE.detectedEyesRefSize = [outW, outH];
+      STATE.headRectNorm = refFraming.headRect || null;
     }
 
     syncActiveResolutionAndWheelCanvases();
 
-    STATE.originalImg = await loadImage(STATE.framedPhotoCanvas.toDataURL("image/jpeg", 0.95));
-    STATE.rawMaskBase64 = STATE.framedMaskCanvas.toDataURL("image/png");
-    STATE.framedMaskBase64 = STATE.rawMaskBase64;
-    STATE.detectedEyes = px.eyes || [];
-    STATE.detectedEyesRefSize = [outW, outH];
-    STATE.headRectNorm = refFraming.headRect || null;
+    STATE.originalImg = STATE.framedPhotoCanvas;
+    STATE.rawMaskBase64 = null;
+    STATE.framedMaskBase64 = null;
     if (profileKey === "animal" || (presetKey && presetKey.startsWith("animals"))) {
       STATE.isAnimalPhoto = true;
     }
     STATE.maskCanvas = null;
 
-    CROP.maskTintCanvas = null;
+    if (CROP.maskTintCanvas) {
+      CROP.maskTintCanvas.width = 1;
+      CROP.maskTintCanvas.height = 1;
+      CROP.maskTintCanvas = null;
+    }
+    CROP.sourcePhotoData = null;
     if (window.SubjectVision && window.SubjectVision.releaseMemory) {
       await window.SubjectVision.releaseMemory();
     }
@@ -1263,13 +1459,21 @@ const Workflow = (() => {
       btn.textContent = CROP.maskEditMode ? "✅ Done Editing Mask" : "✂️ Edit Cutout Mask";
     }
     if (sub) sub.classList.toggle("hidden", !CROP.maskEditMode);
-    if (!CROP.maskEditMode) {
+    if (CROP.maskEditMode) {
+      if (CROP.maskCanvas) rebuildCutoutAndTintFromMaskCanvas(true);
+    } else {
       CROP.maskViewZoom = 1.0;
       CROP.maskViewPanX = 0;
       CROP.maskViewPanY = 0;
+      if (CROP.maskTintCanvas) {
+        CROP.maskTintCanvas.width = 1;
+        CROP.maskTintCanvas.height = 1;
+        CROP.maskTintCanvas = null;
+      }
       brushCursor.classList.add("hidden");
       if (CROP.maskCanvas) {
         rebuildCutoutAndTintFromMaskCanvas();
+        extractDetectedMultiSubjects();
       }
     }
     if (CROP.analysis) renderCropPreview();
@@ -1289,6 +1493,79 @@ const Workflow = (() => {
     const lBtn = document.getElementById("cropOrientLandscapeBtn");
     if (pBtn) pBtn.addEventListener("click", () => setOrientation("portrait"));
     if (lBtn) lBtn.addEventListener("click", () => setOrientation("landscape"));
+
+    const togetherBtn = document.getElementById("multiModeTogetherBtn");
+    const sideBySideBtn = document.getElementById("multiModeSideBySideBtn");
+    if (togetherBtn) {
+      togetherBtn.addEventListener("click", () => {
+        CROP.multiSubjectMode = "together";
+        CROP.activeSubjectIdx = -1;
+        STATE.aspectOrientation = getActiveProfileKey() === "car" ? "landscape" : "portrait";
+        syncOrientationButtonsUI();
+        updateMultiSubjectUI();
+        resetCropToSmartDefault();
+      });
+    }
+    if (sideBySideBtn) {
+      sideBySideBtn.addEventListener("click", () => {
+        CROP.multiSubjectMode = "side_by_side";
+        CROP.activeSubjectIdx = 0;
+        STATE.aspectOrientation = "landscape";
+        CROP.zoomPct = 100;
+        CROP.dxPct = 0;
+        CROP.dyPct = 0;
+        for (const s of CROP.multiSubjects) {
+          s.zoomPct = 100;
+          s.dxPct = 0;
+          s.dyPct = 0;
+        }
+        syncOrientationButtonsUI();
+        updateMultiSubjectUI();
+        syncCropSlidersUI();
+        renderCropPreview();
+      });
+    }
+
+
+    const btn1Sub = document.getElementById("cropMode1SubBtn");
+    const btn2Sub = document.getElementById("cropMode2SubBtn");
+    const btn3Sub = document.getElementById("cropMode3SubBtn");
+    const uploadSlotBtn = document.getElementById("uploadSlotPhotoBtn");
+    const slotFileInput = document.getElementById("slotFileInput");
+
+    if (btn1Sub) btn1Sub.addEventListener("click", () => setMultiSubjectTargetCount(1));
+    if (btn2Sub) btn2Sub.addEventListener("click", () => setMultiSubjectTargetCount(2));
+    if (btn3Sub) btn3Sub.addEventListener("click", () => setMultiSubjectTargetCount(3));
+
+    if (uploadSlotBtn && slotFileInput) {
+      uploadSlotBtn.addEventListener("click", () => {
+        const targetIdx = CROP.activeSubjectIdx >= 0 ? CROP.activeSubjectIdx : 0;
+        slotFileInput.dataset.targetSlot = String(targetIdx);
+        slotFileInput.click();
+      });
+    }
+    if (slotFileInput) {
+      slotFileInput.addEventListener("change", async (e) => {
+        const f = e.target.files && e.target.files[0];
+        slotFileInput.value = "";
+        if (!f) return;
+        const slotIdx = Number(slotFileInput.dataset.targetSlot || 0);
+        await loadSingleSubjectSlotFromFile(f, slotIdx);
+      });
+    }
+
+    // Landing page "Combine 2 / 3 Separate Photos" quick-start buttons
+    const land2Btn = document.getElementById("landingMulti2Btn");
+    const land3Btn = document.getElementById("landingMulti3Btn");
+    const startMultiFromLanding = (count) => {
+      STATE._pendingMultiCountFromLanding = count;
+      const fi = document.getElementById("fileInput");
+      if (fi) fi.click();
+    };
+    if (land2Btn) land2Btn.addEventListener("click", () => startMultiFromLanding(2));
+    if (land3Btn) land3Btn.addEventListener("click", () => startMultiFromLanding(3));
+
+
 
     const maskToggleBtn = document.getElementById("cropMaskToggleBtn");
     const maskKeepBtn = document.getElementById("cropMaskKeepBtn");
@@ -1324,21 +1601,24 @@ const Workflow = (() => {
 
     if (zSlider) {
       zSlider.addEventListener("input", () => {
-        CROP.zoomPct = Number(zSlider.value);
+        const tgt = getActiveSliderTargetInCrop();
+        tgt.zoomPct = Number(zSlider.value);
         syncCropSlidersUI();
         renderCropPreview();
       });
     }
     if (xSlider) {
       xSlider.addEventListener("input", () => {
-        CROP.dxPct = Number(xSlider.value);
+        const tgt = getActiveSliderTargetInCrop();
+        tgt.dxPct = Number(xSlider.value);
         syncCropSlidersUI();
         renderCropPreview();
       });
     }
     if (ySlider) {
       ySlider.addEventListener("input", () => {
-        CROP.dyPct = Number(ySlider.value);
+        const tgt = getActiveSliderTargetInCrop();
+        tgt.dyPct = Number(ySlider.value);
         syncCropSlidersUI();
         renderCropPreview();
       });
@@ -1401,8 +1681,9 @@ const Workflow = (() => {
           return;
         }
 
+        const tgt = getActiveSliderTargetInCrop();
         const delta = e.deltaY < 0 ? 2 : -2;
-        CROP.zoomPct = Math.max(65, Math.min(145, CROP.zoomPct + delta));
+        tgt.zoomPct = Math.max(65, Math.min(145, tgt.zoomPct + delta));
         syncCropSlidersUI();
         renderCropPreview();
       }, { passive: false });
@@ -1426,7 +1707,29 @@ const Workflow = (() => {
           History.beginStroke("crop_mask", null);
           paintCropMaskAtClientPoint(e.clientX, e.clientY);
         } else {
-          CROP.dragStart = { x: e.clientX, y: e.clientY, dxPct: CROP.dxPct, dyPct: CROP.dyPct };
+          // If in Side-by-Side mode, clicking on a specific subject automatically selects it for dragging!
+          if (CROP.multiSubjectMode === "side_by_side" && CROP.multiSubjects.length >= 2 && CROP.activeSubjectIdx >= 0) {
+            const rect = cv.getBoundingClientRect();
+            const cx = (e.clientX - rect.left) * (cv.width / Math.max(1, rect.width));
+            const cy = (e.clientY - rect.top) * (cv.height / Math.max(1, rect.height));
+            const placements = computeSideBySidePlacements(cv.width, cv.height);
+            let hitIdx = -1;
+            for (let i = placements.length - 1; i >= 0; i--) {
+              const pl = placements[i];
+              if (cx >= pl.x && cx <= pl.x + pl.w && cy >= pl.y && cy <= pl.y + pl.h) {
+                hitIdx = i;
+                break;
+              }
+            }
+            if (hitIdx >= 0 && hitIdx !== CROP.activeSubjectIdx) {
+              CROP.activeSubjectIdx = hitIdx;
+              updateMultiSubjectUI();
+              syncCropSlidersUI();
+              renderCropPreview();
+            }
+          }
+          const tgt = getActiveSliderTargetInCrop();
+          CROP.dragStart = { x: e.clientX, y: e.clientY, dxPct: tgt.dxPct, dyPct: tgt.dyPct };
         }
       });
 
@@ -1446,10 +1749,11 @@ const Workflow = (() => {
           paintCropMaskAtClientPoint(e.clientX, e.clientY);
           return;
         }
+        const tgt = getActiveSliderTargetInCrop();
         const dX = ((e.clientX - CROP.dragStart.x) / Math.max(1, rect.width)) * 100;
         const dY = ((e.clientY - CROP.dragStart.y) / Math.max(1, rect.height)) * 100;
-        CROP.dxPct = Math.max(-35, Math.min(35, CROP.dragStart.dxPct + dX));
-        CROP.dyPct = Math.max(-35, Math.min(35, CROP.dragStart.dyPct + dY));
+        tgt.dxPct = Math.max(-35, Math.min(35, CROP.dragStart.dxPct + dX));
+        tgt.dyPct = Math.max(-35, Math.min(35, CROP.dragStart.dyPct + dY));
         syncCropSlidersUI();
         renderCropPreview();
       });
@@ -1459,6 +1763,7 @@ const Workflow = (() => {
           CROP.lastMaskPt = null;
           History.endStroke();
           rebuildCutoutAndTintFromMaskCanvas();
+          extractDetectedMultiSubjects();
           renderCropPreview();
         }
         CROP.isPanningMaskView = false;
@@ -1474,7 +1779,8 @@ const Workflow = (() => {
           const dx = e.touches[0].clientX - e.touches[1].clientX;
           const dy = e.touches[0].clientY - e.touches[1].clientY;
           CROP.pinchStartDist = Math.hypot(dx, dy);
-          CROP.pinchStartZoom = CROP.maskEditMode ? CROP.maskViewZoom : CROP.zoomPct;
+          const tgt = getActiveSliderTargetInCrop();
+          CROP.pinchStartZoom = CROP.maskEditMode ? CROP.maskViewZoom : tgt.zoomPct;
         }
       }, { passive: true });
 
@@ -1488,7 +1794,8 @@ const Workflow = (() => {
             CROP.maskViewZoom = Math.max(1.0, Math.min(6.0, CROP.pinchStartZoom * scale));
             clampMaskViewPan(cv.width, cv.height);
           } else {
-            CROP.zoomPct = Math.max(65, Math.min(145, CROP.pinchStartZoom * scale));
+            const tgt = getActiveSliderTargetInCrop();
+            tgt.zoomPct = Math.max(65, Math.min(145, CROP.pinchStartZoom * scale));
             syncCropSlidersUI();
           }
           renderCropPreview();
@@ -1505,7 +1812,7 @@ const Workflow = (() => {
     const profKey = getActiveProfileKey();
     const newCat = profKey === "car" ? "car" : "portrait";
     if (_lastProfileCategory !== newCat || !STATE.aspectOrientation) {
-      STATE.aspectOrientation = newCat === "car" ? "landscape" : "portrait";
+      STATE.aspectOrientation = newCat === "car" || CROP.multiSubjectMode === "side_by_side" ? "landscape" : "portrait";
     }
     _lastProfileCategory = newCat;
     syncOrientationButtonsUI();

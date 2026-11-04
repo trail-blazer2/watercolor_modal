@@ -120,6 +120,19 @@ function isAnimalPresetOrPhoto() {
   return key.startsWith("animals") || !!STATE.isAnimalPhoto;
 }
 
+// Uniform brush scaler when an Animal or Person painting is in Landscape mode
+// Change STUDIO_CONFIG.LANDSCAPE_PORTRAIT_BRUSH_SCALE (default 0.55) to test different % scales!
+function getLandscapePortraitBrushScale() {
+  if (isCarPresetActive()) return 1.0;
+  const isLandscape =
+    STATE.aspectOrientation === "landscape" ||
+    (STATE.payload &&
+      STATE.payload.base_canvas_size &&
+      STATE.payload.base_canvas_size[0] > STATE.payload.base_canvas_size[1]);
+  if (!isLandscape) return 1.0;
+  return (window.STUDIO_CONFIG && window.STUDIO_CONFIG.LANDSCAPE_PORTRAIT_BRUSH_SCALE) || 0.55;
+}
+
 function ensureSubjectParams(p) {
   const cfg = (STATE.payload && STATE.payload.preset_settings) || {};
   const isCar = isCarPresetActive();
@@ -155,6 +168,8 @@ function ensureGlowParams(p) {
 
 function buildInitialLayerParams(def, cfg) {
   const p = def.prefix;
+  const lbScale = getLandscapePortraitBrushScale();
+
   if (
     def.type === "brush_edge" ||
     def.type === "brush_dots" ||
@@ -164,8 +179,8 @@ function buildInitialLayerParams(def, cfg) {
     return {
       opacity: cfg[`${p}_OPACITY`] ?? 0.6,
       baseOpacity: cfg[`${p}_OPACITY`] ?? 0.6,
-      size: cfg[`${p}_SIZE`] ?? 600,
-      spacing: cfg[`${p}_SPACING`] ?? 200,
+      size: Math.max(25, Math.round((cfg[`${p}_SIZE`] ?? 600) * lbScale)),
+      spacing: Math.max(20, Math.round((cfg[`${p}_SPACING`] ?? 200) * lbScale)),
       jiggle: cfg[`${p}_JIGGLE`] ?? cfg.BRUSH_DIRECTION_JIGGLE ?? 0.6,
       brightness: 100,
       contrast: 100,
@@ -177,8 +192,8 @@ function buildInitialLayerParams(def, cfg) {
     return {
       opacity: cfg.MASK_BRUSH_OPACITY ?? 0.5,
       baseOpacity: cfg.MASK_BRUSH_OPACITY ?? 0.5,
-      size: cfg.MASK_BRUSH_SIZE ?? 900,
-      spacing: cfg.MASK_BRUSH_SPACING ?? 200,
+      size: Math.max(40, Math.round((cfg.MASK_BRUSH_SIZE ?? 900) * lbScale)),
+      spacing: Math.max(25, Math.round((cfg.MASK_BRUSH_SPACING ?? 200) * lbScale)),
       jiggle: cfg.BRUSH_DIRECTION_JIGGLE ?? 0.8,
       brightness: 100,
       contrast: 100,
@@ -193,8 +208,8 @@ function buildInitialLayerParams(def, cfg) {
     return {
       opacity: 1.0,
       baseOpacity: 1.0,
-      size: 300,
-      spacing: 50,
+      size: Math.max(30, Math.round(300 * lbScale)),
+      spacing: Math.max(20, Math.round(50 * lbScale)),
       jiggle: 0.8,
       brightness: 100,
       contrast: 100,
@@ -208,11 +223,11 @@ function buildInitialLayerParams(def, cfg) {
       baseOpacity: 1.0,
       maskDetail: 135,
       edgeThickness: 0,
-      wcBlooms: true,          // 💧 Watercolor Blooms & Washes (Red Audi / Skoda / Dogs)
+      wcBlooms: true,
       wcBloomsIntensity: 75,
-      paintSplatter: true,     // 💦 Interior Paint Splatter & Micro-Droplets
+      paintSplatter: true,
       splatterIntensity: 65,
-      paperGrain: true,        // 📜 Cold-Press Paper Grain & Tooth
+      paperGrain: true,
       paperGrainIntensity: 55,
       brightness: 100,
       contrast: 105,
@@ -225,6 +240,7 @@ function buildInitialLayerParams(def, cfg) {
       baseOpacity: 1.0,
       thickness: 0,
       detailPop: 0,
+      highlightDarken: isCarPresetActive() ? 0 : 100,
       brightness: 100,
       contrast: 100,
       saturation: 100,
@@ -250,11 +266,12 @@ function buildInitialLayerParams(def, cfg) {
     });
   }
   if (def.type === "eye_highlight") {
-    const isPeople = (STATE.payload && STATE.payload.preset_key === "people");
+    const isPeople = STATE.payload && STATE.payload.preset_key === "people";
+    const baseSz = isPeople ? 280 : 380;
     return {
       opacity: isPeople ? 0.3 : 0.5,
       baseOpacity: 1.0,
-      size: isPeople ? 280 : 380,
+      size: Math.max(60, Math.round(baseSz * lbScale)),
       brushFile: "bgbrush.png",
       brightness: 100,
       contrast: 100,
@@ -275,8 +292,12 @@ function buildInitialLayerParams(def, cfg) {
 
 function defaultBrushForLayer(id, cfg) {
   const map = {
-    bg_brush: "bgbrush.png", sharp_brush: "sharpbrush.png", color_brush: "brush2.png",
-    white_dots: "whitedots.png", dark_dots: "darkdots.png", small_dots: "whitedots.png",
+    bg_brush: "bgbrush.png",
+    sharp_brush: "sharpbrush.png",
+    color_brush: "brush2.png",
+    white_dots: "whitedots.png",
+    dark_dots: "darkdots.png",
+    small_dots: "whitedots.png",
     dark_ellipse: "bgbrush.png",
     white_ellipse: cfg.ELLIPSE_BRUSH_MODE === "dark" ? (cfg.ELLIPSE_BRUSH_FILE || "square.png") : "whitebrush.png",
     outer_white: cfg.ELLIPSE_BRUSH_MODE === "dark" ? (cfg.ELLIPSE_BRUSH_FILE || "square.png") : "whitebrush.png",
@@ -291,10 +312,10 @@ const _tempLayerCanvas = document.createElement("canvas");
 const _stack = { id: null, dirty: true, below: null, above: null };
 const _moveFastStack = {
   dirty: true,
-  movableUnder: null,  // Layers 17..8 in Overscan Space
-  subjectGroup: null,  // Layers 7..5 (subject, oil_paint, edge_curve) un-faded in Overscan Space
-  fixedOvals: null,    // Layers 4..2 (dark_ellipse, white_ellipse, outer_white) in Viewport Space
-  movableOver: null,   // Layers 1..0 (small_dots, custom_detail) in Overscan Space
+  movableUnder: null,
+  subjectGroup: null,
+  fixedOvals: null,
+  movableOver: null,
 };
 
 function invalidateStack() { _stack.dirty = true; }
@@ -378,8 +399,6 @@ function applyBottomQuarterFade(tCtx, w, h, fadePercent) {
   tCtx.restore();
 }
 
-// Renders a procedural layer's precomputed strokes via WebGL and returns the shared WebGL canvas
-// (Zero 2D canvas allocation needed for non-selected layers!)
 function renderProceduralStrokesToSharedGL(lyr) {
   if (!lyr || !STATE.payload) return null;
   if (!lyr.cachedStrokes || lyr.strokesDirty) {
@@ -394,6 +413,15 @@ function renderProceduralStrokesToSharedGL(lyr) {
   return drawStrokesWebGL(overW, overH, brushKey, brushImg, lyr.cachedStrokes);
 }
 
+function drawOverscanCanvasSource(targetCtx, src) {
+  if (!src) return;
+  if (src._drawW && src._drawH) {
+    targetCtx.drawImage(src, src._ox || 0, src._oy || 0, src._drawW, src._drawH);
+  } else {
+    targetCtx.drawImage(src, src._ox || 0, src._oy || 0);
+  }
+}
+
 function ensureLayerCanvasRendered(lyr) {
   const def = lyr.def;
   const isProcedural = ["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "mask_blur", "accent"].includes(def.type);
@@ -403,9 +431,9 @@ function ensureLayerCanvasRendered(lyr) {
       lyr.cachedStrokes = buildProceduralStrokesInOverscanSpace(lyr);
       lyr.strokesDirty = false;
     }
-    // Only allocate a persistent 2D baseCanvas for the ONE currently selected layer (or mask_blur)
-    // Non-selected procedural layers draw directly from the shared WebGL canvas during stack rebuild!
-    if (STATE.selectedLayerId === def.id || def.type === "mask_blur") {
+    const [overW, overH] = (STATE.payload && STATE.payload.canvas_size) || [2782, 1860];
+    const hasGL = typeof getGLBrushRenderer === "function" && !!getGLBrushRenderer(overW, overH);
+    if (def.type === "mask_blur" || (!hasGL && STATE.selectedLayerId === def.id)) {
       if (!lyr.baseCanvas) {
         rerenderProceduralLayer(def.id, true);
       }
@@ -415,8 +443,6 @@ function ensureLayerCanvasRendered(lyr) {
       lyr.baseCanvas = null;
     }
   } else if (def.id === "edge_curve" && !lyr.baseCanvas) {
-    const [bw, bh] = STATE.payload.canvas_size;
-    lyr.baseCanvas = createCanvas(bw, bh);
     if (typeof ensureServerRasterLayerDecoded === "function" && (!STATE.serverImages || !STATE.serverImages.edge_curve)) {
       ensureServerRasterLayerDecoded("edge_curve").then(() => {
         rerenderLiveEdgeCurveLayer(false);
@@ -432,7 +458,7 @@ function ensureLayerCanvasRendered(lyr) {
     rerenderLiveGlowLayer(true);
   } else if (def.id === "eye_highlight" && !lyr.baseCanvas) {
     rerenderEyeHighlightLayer(true);
-  } else if (def.id === "cool_brush" && !lyr.baseCanvas) {
+  } else if (def.id === "cool_brush" && !lyr.baseCanvas && !lyr.swooshDrawSpec) {
     if (typeof rerenderCoolSwooshLayer === "function") rerenderCoolSwooshLayer(true);
   }
 }
@@ -459,18 +485,28 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
     targetCtx.save();
     applyOverscanToViewportTransform(targetCtx, vr, true);
     if (p.ccBlend < 100 && STATE.serverImages.subject_raw) {
-      targetCtx.drawImage(STATE.serverImages.subject_raw, 0, 0);
+      drawOverscanCanvasSource(targetCtx, STATE.serverImages.subject_raw);
       if (subMain) {
         targetCtx.save();
         targetCtx.globalAlpha = p.ccBlend / 100;
         targetCtx.globalCompositeOperation = "source-atop";
-        targetCtx.drawImage(subMain, 0, 0);
+        drawOverscanCanvasSource(targetCtx, subMain);
         targetCtx.restore();
       }
     } else if (subMain) {
-      targetCtx.drawImage(subMain, 0, 0);
+      drawOverscanCanvasSource(targetCtx, subMain);
     }
     drawEyeBeautifierPatchesInOverscan(targetCtx);
+    targetCtx.restore();
+    return;
+  }
+
+  if (def.id === "cool_brush" && lyr.swooshDrawSpec && lyr.swooshDrawSpec.canvas) {
+    const sp = lyr.swooshDrawSpec;
+    targetCtx.save();
+    applyOverscanToViewportTransform(targetCtx, vr, movable);
+    targetCtx.transform(sp.m00, sp.m10, sp.m01, sp.m11, sp.tx, sp.ty);
+    targetCtx.drawImage(sp.canvas, 0, 0);
     targetCtx.restore();
     return;
   }
@@ -479,7 +515,7 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
   if (src) {
     targetCtx.save();
     applyOverscanToViewportTransform(targetCtx, vr, movable);
-    targetCtx.drawImage(src, 0, 0);
+    drawOverscanCanvasSource(targetCtx, src);
     if (def.id === "oil_paint") {
       drawEyeBeautifierPatchesInOverscan(targetCtx);
     }
@@ -489,17 +525,17 @@ function drawLayerSourceInViewport(targetCtx, lyr, def, vr) {
   if (def.id === "oil_paint") {
     const cache = getOrBuildOilDetailCache();
     if (cache && cache.oilCrop) {
+      const hiDark = lyr.params.highlightDarken ?? 100;
+      const oilSrc = hiDark === 0 && cache.oilCleanHiCrop ? cache.oilCleanHiCrop : cache.oilCrop;
       targetCtx.save();
       applyOverscanToViewportTransform(targetCtx, vr, movable);
-      targetCtx.drawImage(cache.oilCrop, cache.bx, cache.by);
+      targetCtx.drawImage(oilSrc, cache.bx, cache.by);
       drawEyeBeautifierPatchesInOverscan(targetCtx);
       targetCtx.restore();
       return;
     }
   }
 
-
-  // Memory-saving direct WebGL render for non-selected procedural layers
   if (["brush_edge", "brush_dots", "brush_ellipse", "brush_ellipse_dark", "accent"].includes(def.type)) {
     const glCanvas = renderProceduralStrokesToSharedGL(lyr);
     if (glCanvas) {
@@ -557,7 +593,6 @@ function drawPaperLayerInViewport(targetCtx, vr) {
   }
   targetCtx.restore();
 }
-
 
 function drawLayerInto(ctx, def) {
   if (!def) return;
@@ -638,8 +673,6 @@ function drawLayerInto(ctx, def) {
   ctx.restore();
 }
 
-// Draws a single layer directly in Overscan Space (0..overW, 0..overH) without subjectTransform or bottomFade
-// Used once when building _moveFastStack so moving/scaling the subject is a 4-blit 60 FPS operation!
 function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
   const lyr = STATE.layers[def.id];
   if (!lyr || !lyr.vis) return;
@@ -667,12 +700,25 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
     subMain = renderProceduralStrokesToSharedGL(lyr);
     isDirectGL = true;
   }
+  if (!subMain && def.id === "cool_brush" && lyr.swooshDrawSpec && lyr.swooshDrawSpec.canvas) {
+    const sp = lyr.swooshDrawSpec;
+    if (!hasFilter && !hasPaintOrErase) {
+      targetCtx.save();
+      targetCtx.globalAlpha = Math.min(1, op);
+      targetCtx.transform(sp.m00, sp.m10, sp.m01, sp.m11, sp.tx, sp.ty);
+      targetCtx.drawImage(sp.canvas, 0, 0);
+      targetCtx.restore();
+      return;
+    }
+  }
   if (!subMain && def.id === "oil_paint") {
     const cache = getOrBuildOilDetailCache();
     if (cache && cache.oilCrop) {
+      const hiDark = lyr.params.highlightDarken ?? 100;
+      const oilSrc = hiDark === 0 && cache.oilCleanHiCrop ? cache.oilCleanHiCrop : cache.oilCrop;
       targetCtx.save();
       targetCtx.globalAlpha = Math.min(1, op);
-      targetCtx.drawImage(cache.oilCrop, cache.bx, cache.by);
+      targetCtx.drawImage(oilSrc, cache.bx, cache.by);
       targetCtx.restore();
       drawEyeBeautifierPatchesInOverscan(targetCtx);
       return;
@@ -685,10 +731,10 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
   if (!hasFilter && !hasSubjectBlend && !hasPaintOrErase) {
     targetCtx.save();
     targetCtx.globalAlpha = Math.min(1, effOp);
-    targetCtx.drawImage(subMain, 0, 0);
+    drawOverscanCanvasSource(targetCtx, subMain);
     if (effOp > 1) {
       targetCtx.globalAlpha = Math.min(1, effOp - 1);
-      targetCtx.drawImage(subMain, 0, 0);
+      drawOverscanCanvasSource(targetCtx, subMain);
     }
     targetCtx.restore();
     if (def.id === "subject" || def.id === "oil_paint") {
@@ -701,12 +747,12 @@ function drawLayerInOverscanSpaceUntransformed(targetCtx, def) {
   const t = tmp.getContext("2d");
   t.filter = hasFilter ? `brightness(${p.brightness}%) contrast(${p.contrast}%) saturate(${p.saturation}%)` : "none";
   if (hasSubjectBlend) {
-    t.drawImage(STATE.serverImages.subject_raw, 0, 0);
+    drawOverscanCanvasSource(t, STATE.serverImages.subject_raw);
     t.globalAlpha = p.ccBlend / 100;
-    t.drawImage(subMain, 0, 0);
+    drawOverscanCanvasSource(t, subMain);
     t.globalAlpha = 1;
   } else {
-    t.drawImage(subMain, 0, 0);
+    drawOverscanCanvasSource(t, subMain);
   }
   t.filter = "none";
   if (lyr.paintCanvas) t.drawImage(lyr.paintCanvas, 0, 0);
@@ -745,8 +791,9 @@ function rerenderProceduralLayer(layerId, skipComposite = false) {
     lyr.strokesDirty = false;
   }
 
-  // Only allocate/keep a 2D baseCanvas if this layer is currently selected or is mask_blur!
-  const needsCanvas = lyr.vis && (STATE.selectedLayerId === layerId || def.type === "mask_blur");
+  const [overW, overH] = STATE.payload.canvas_size;
+  const hasGL = typeof getGLBrushRenderer === "function" && !!getGLBrushRenderer(overW, overH);
+  const needsCanvas = lyr.vis && (def.type === "mask_blur" || (!hasGL && STATE.selectedLayerId === layerId));
   if (!needsCanvas) {
     if (lyr.baseCanvas) {
       lyr.baseCanvas.width = 1;
@@ -763,7 +810,6 @@ function rerenderProceduralLayer(layerId, skipComposite = false) {
   const brushImg = STATE.brushImages[brushKey];
   if (!brushImg) return;
 
-  const [overW, overH] = STATE.payload.canvas_size;
   if (!lyr.baseCanvas) {
     lyr.baseCanvas = createCanvas(overW, overH);
   } else if (lyr.baseCanvas.width !== overW || lyr.baseCanvas.height !== overH) {
@@ -777,7 +823,7 @@ function rerenderProceduralLayer(layerId, skipComposite = false) {
 
   if (def.type === "mask_blur" && STATE.serverImages.blur_bg) {
     const glCanvas = drawStrokesWebGL(overW, overH, brushKey, brushImg, strokes);
-    ctx.drawImage(STATE.serverImages.blur_bg, 0, 0);
+    ctx.drawImage(STATE.serverImages.blur_bg, 0, 0, overW, overH);
     if (glCanvas) {
       ctx.save();
       ctx.globalCompositeOperation = "destination-in";
@@ -844,8 +890,8 @@ function ensureMoveFastStackReady() {
   fCtx.clearRect(0, 0, vr.w, vr.h);
   oCtx.clearRect(0, 0, overW, overH);
 
-  // 1. Movable Under Subject (indices 17..8: bg_brush .. shadow)
-  for (let i = LAYER_DEFINITIONS.length - 2; i >= 8; i--) {
+  // 1. Movable Under Subject BELOW Backdrop Window (indices 19..11: bg_brush .. glow)
+  for (let i = LAYER_DEFINITIONS.length - 2; i >= 11; i--) {
     drawLayerInOverscanSpaceUntransformed(uCtx, LAYER_DEFINITIONS[i]);
   }
   // 2. Subject + Oil + EdgeCurve un-faded (indices 7..5)
@@ -864,7 +910,6 @@ function ensureMoveFastStackReady() {
   _moveFastStack.dirty = false;
 }
 
-// Ultra-fast 4-blit compositor used when moving/scaling the subject (0.3 ms/frame on mobile & desktop)
 function compositeFastSubjectMove() {
   ensureMoveFastStackReady();
   const vr = STATE.viewRect || { x: 0, y: 0, w: displayCanvas.width, h: displayCanvas.height };
@@ -873,19 +918,23 @@ function compositeFastSubjectMove() {
   // 1. Fixed Paper Base
   drawPaperLayerInViewport(displayCtx, vr);
 
-  // 2. Movable Under-Subject Brushes + Glow + Drops + Shadow
+  // 2. Movable Under-Subject Brushes + Glow (below Backdrop Window)
   displayCtx.save();
   applyOverscanToViewportTransform(displayCtx, vr, true);
   displayCtx.drawImage(_moveFastStack.movableUnder, 0, 0);
   displayCtx.restore();
 
-  // 3. Optional Backdrop Window
+  // 3. Optional Backdrop Window (sits BELOW cool_brush, colordrop, shadow, and subject!)
   drawBackdropWindowIfEnabled(displayCtx);
+
+  // 3B. Draw cool_brush, colordrop, and shadow ABOVE Backdrop Window
+  for (let i = 10; i >= 8; i--) {
+    drawLayerInto(displayCtx, LAYER_DEFINITIONS[i]);
+  }
 
   // 4. Movable Subject + Oil + EdgeCurve with Fixed Canvas Oval Bottom 25% Fade
   const isCar = isCarPresetActive();
   const subParams = STATE.layers.subject ? ensureSubjectParams(STATE.layers.subject.params) : null;
-  
   const bottomFadePct = isCar ? 0 : (subParams ? (subParams.bottomFade ?? 100) : 0);
 
   if (bottomFadePct > 0.05) {
@@ -942,7 +991,8 @@ function rebuildStack(selId) {
   const selIdx = LAYER_DEFINITIONS.findIndex((d) => d.id === selId);
   for (let i = LAYER_DEFINITIONS.length - 1; i >= 0; i--) {
     const def = LAYER_DEFINITIONS[i];
-    if (def.id === "colordrop") {
+    // Draw Backdrop Window directly BELOW cool_brush (and above glow / washes)
+    if (def.id === "cool_brush") {
       drawBackdropWindowIfEnabled(i >= selIdx ? bCtx : aCtx);
     }
     if (i === selIdx) continue;
@@ -973,7 +1023,6 @@ function compositeAllLayers() {
   displayCtx.drawImage(_stack.above, 0, 0);
 }
 
-// Fast O(1) Spatial Grid for Edge Sampling with fixed integer offset so overscan edges never shift grid buckets
 const _sampleCache = new Map();
 let _gridBuf = new Int32Array(0);
 
@@ -1082,20 +1131,31 @@ function getOrBuildOilDetailCache() {
   oilCrop.getContext("2d").drawImage(STATE.serverImages.oil_paint_full, bx, by, bw, bh, 0, 0, bw, bh);
   applyOilSilhouetteFadeToCrop(oilCrop, bx, by, bw, bh);
 
+  let oilCleanHiCrop = null;
+  if (STATE.serverImages.oil_clean_hi_full) {
+    oilCleanHiCrop = createCanvas(bw, bh);
+    oilCleanHiCrop.getContext("2d").drawImage(STATE.serverImages.oil_clean_hi_full, bx, by, bw, bh, 0, 0, bw, bh);
+    applyOilSilhouetteFadeToCrop(oilCleanHiCrop, bx, by, bw, bh);
+    if (STATE.serverImages.oil_clean_hi_full.tagName === "CANVAS") {
+      STATE.serverImages.oil_clean_hi_full.width = 1;
+      STATE.serverImages.oil_clean_hi_full.height = 1;
+    }
+    STATE.serverImages.oil_clean_hi_full = null;
+  }
+
   const popCanvas = createCanvas(bw, bh);
   const pCtx = popCanvas.getContext("2d");
   pCtx.filter = "contrast(165%) saturate(80%)";
   pCtx.drawImage(oilCrop, 0, 0);
   pCtx.filter = "none";
 
-  // Free the 20.7 MB full-overscan oil_paint_full canvas now that oilCrop (cropped) is built!
   if (STATE.serverImages.oil_paint_full.tagName === "CANVAS") {
     STATE.serverImages.oil_paint_full.width = 1;
     STATE.serverImages.oil_paint_full.height = 1;
   }
   STATE.serverImages.oil_paint_full = null;
 
-  STATE.oilDetailCache = { bx, by, bw, bh, oilCrop, popCanvas };
+  STATE.oilDetailCache = { bx, by, bw, bh, oilCrop, oilCleanHiCrop, popCanvas };
   return STATE.oilDetailCache;
 }
 
@@ -1106,9 +1166,9 @@ function rerenderLiveOilLayer(skipComposite = false) {
   if (!cache) return;
 
   const p = lyr.params;
-  // Memory optimization: when thickness == 0 and detailPop == 0, don't allocate a 20.7 MB baseCanvas!
-  // drawLayerSourceInViewport and drawLayerInOverscanSpaceUntransformed will draw cache.oilCrop at (bx, by) directly!
-  if (p.thickness === 0 && p.detailPop === 0) {
+  const hiDark = p.highlightDarken ?? 100;
+
+  if (p.thickness === 0 && p.detailPop === 0 && (hiDark === 100 || !cache.oilCleanHiCrop || hiDark === 0)) {
     if (lyr.baseCanvas) {
       lyr.baseCanvas.width = 1;
       lyr.baseCanvas.height = 1;
@@ -1119,28 +1179,45 @@ function rerenderLiveOilLayer(skipComposite = false) {
     return;
   }
 
-  const [w, h] = STATE.payload.canvas_size;
-  if (!lyr.baseCanvas || lyr.baseCanvas.width !== w || lyr.baseCanvas.height !== h) {
-    lyr.baseCanvas = createCanvas(w, h);
+  const { bx, by, bw, bh, oilCrop, oilCleanHiCrop, popCanvas } = cache;
+  if (!lyr.baseCanvas || lyr.baseCanvas.width !== bw || lyr.baseCanvas.height !== bh) {
+    if (lyr.baseCanvas) {
+      lyr.baseCanvas.width = 1;
+      lyr.baseCanvas.height = 1;
+    }
+    lyr.baseCanvas = createCanvas(bw, bh);
   }
+  lyr.baseCanvas._ox = bx;
+  lyr.baseCanvas._oy = by;
   const ctx = lyr.baseCanvas.getContext("2d");
-  ctx.clearRect(0, 0, w, h);
+  ctx.clearRect(0, 0, bw, bh);
 
-  const { bx, by, oilCrop, popCanvas } = cache;
-  ctx.drawImage(oilCrop, bx, by);
+  const tHi = Math.max(0, Math.min(1, hiDark / 100));
+  if (oilCleanHiCrop && tHi < 0.999) {
+    ctx.drawImage(oilCleanHiCrop, 0, 0);
+    if (tHi > 0.001) {
+      ctx.save();
+      ctx.globalCompositeOperation = "source-atop";
+      ctx.globalAlpha = tHi;
+      ctx.drawImage(oilCrop, 0, 0);
+      ctx.restore();
+    }
+  } else {
+    ctx.drawImage(oilCrop, 0, 0);
+  }
 
   if (p.thickness > 0) {
     const blurPx = (p.thickness / 100) * 3.5;
     ctx.save();
     ctx.globalCompositeOperation = "source-atop";
     ctx.filter = `blur(${blurPx.toFixed(1)}px) contrast(${100 + p.thickness * 0.25}%)`;
-    ctx.drawImage(oilCrop, bx, by);
+    ctx.drawImage(lyr.baseCanvas, 0, 0, bw, bh, 0, 0, bw, bh);
     ctx.restore();
   } else if (p.thickness < 0 && STATE.serverImages.subject_cc) {
     ctx.save();
     ctx.globalCompositeOperation = "source-atop";
     ctx.globalAlpha = Math.abs(p.thickness) / 100;
-    ctx.drawImage(STATE.serverImages.subject_cc, 0, 0);
+    ctx.drawImage(STATE.serverImages.subject_cc, bx, by, bw, bh, 0, 0, bw, bh);
     ctx.restore();
   }
 
@@ -1148,7 +1225,7 @@ function rerenderLiveOilLayer(skipComposite = false) {
     ctx.save();
     ctx.globalCompositeOperation = "overlay";
     ctx.globalAlpha = (p.detailPop / 100) * 0.55;
-    ctx.drawImage(popCanvas, bx, by);
+    ctx.drawImage(popCanvas, 0, 0);
     ctx.restore();
   }
 
@@ -1169,7 +1246,9 @@ function getOrBuildGlowCache() {
   const c = createCanvas(gw, gh);
   const ctx = c.getContext("2d");
   ctx.drawImage(subImg, 0, 0, gw, gh);
-  const imgData = ctx.getImageData(0, 0, gw, gh).data;
+  const imgData = ctx.getImageData(0, 0, gw, gh);
+  const data = imgData.data;
+  c.width = 1; c.height = 1;
 
   const n = gw * gh;
   const maskAlpha = new Float32Array(n);
@@ -1177,7 +1256,7 @@ function getOrBuildGlowCache() {
   const INF = 1e9;
 
   for (let i = 0; i < n; i++) {
-    const a = imgData[i * 4 + 3];
+    const a = data[i * 4 + 3];
     maskAlpha[i] = a;
     distInf[i] = a >= 250 ? 0 : a > 5 ? (255 - a) / 255.0 : INF;
   }
@@ -1213,16 +1292,12 @@ function getOrBuildGlowCache() {
     }
   }
 
-  const outCanvas = createCanvas(gw, gh);
-  const outCtx = outCanvas.getContext("2d");
-  const outImg = outCtx.createImageData(gw, gh);
-
   STATE.glowCache = {
     cw, ch, gw, gh, scale,
     maskAlpha,
     distPx: distInf,
     ringBuf: new Float32Array(n),
-    outCanvas, outCtx, outImg,
+    outImg: imgData,
   };
   return STATE.glowCache;
 }
@@ -1232,15 +1307,22 @@ function rerenderLiveGlowLayer(skipComposite = false) {
   if (!lyr || !STATE.payload) return;
   const p = ensureGlowParams(lyr.params);
   const [cw, ch] = STATE.payload.canvas_size;
-  if (!lyr.baseCanvas) lyr.baseCanvas = createCanvas(cw, ch);
-
-  const ctx = lyr.baseCanvas.getContext("2d");
-  ctx.clearRect(0, 0, cw, ch);
 
   const cache = getOrBuildGlowCache();
   if (!cache) return;
-  const { gw, gh, scale, maskAlpha, distPx, ringBuf, outCanvas, outCtx, outImg } = cache;
+  const { gw, gh, scale, maskAlpha, distPx, ringBuf, outImg } = cache;
   const n = gw * gh;
+
+  if (!lyr.baseCanvas || lyr.baseCanvas.width !== gw || lyr.baseCanvas.height !== gh) {
+    if (lyr.baseCanvas) {
+      lyr.baseCanvas.width = 1;
+      lyr.baseCanvas.height = 1;
+    }
+    lyr.baseCanvas = createCanvas(gw, gh);
+  }
+  lyr.baseCanvas._drawW = cw;
+  lyr.baseCanvas._drawH = ch;
+  const ctx = lyr.baseCanvas.getContext("2d");
 
   // 1. Exact dilated rim of thickness p.size (matches PIL MaxFilter(glow_width * 2 + 1) - mask)
   const maxDist = Math.max(0.5, p.size * scale);
@@ -1282,8 +1364,7 @@ function rerenderLiveGlowLayer(skipComposite = false) {
     dst[idx + 3] = Math.min(255, Math.round(blurred[i] * baseOp));
   }
 
-  outCtx.putImageData(outImg, 0, 0);
-  ctx.drawImage(outCanvas, 0, 0, gw, gh, 0, 0, cw, ch);
+  ctx.putImageData(outImg, 0, 0);
 
   if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
   if (_stack.id !== "glow") invalidateStack();
@@ -1501,14 +1582,16 @@ const _ellipseGeomCache = new Map();
 function getOrBuildEllipseGeometry(layerId, def, spacing, w, h, offX, offY, edges, cfg) {
   const [baseW, baseH] = (STATE.payload && STATE.payload.base_canvas_size) || [w, h];
   const [padX, padY] = (STATE.payload && STATE.payload.pad) || [0, 0];
-  const key = `${layerId}_${spacing}_${baseW}x${baseH}`;
+  const lbScale = getLandscapePortraitBrushScale();
+  const key = `${layerId}_${spacing}_${baseW}x${baseH}_${lbScale}`;
   let cached = _ellipseGeomCache.get(key);
   if (cached) return cached;
 
   const isOuter = def.id === "outer_white";
   const isDark = def.id === "dark_ellipse";
   const prefix = isDark ? "DARK_ELLIPSE" : isOuter ? "OUTER_WHITE_BRUSH" : "WHITE_BRUSH";
-  const inset = isDark ? 0 : cfg[`${prefix}_ELLIPSE_INSET`] ?? (isOuter ? -200 : -40);
+  const rawInset = isDark ? 0 : cfg[`${prefix}_ELLIPSE_INSET`] ?? (isOuter ? -200 : -40);
+  const inset = Math.round(rawInset * lbScale);
   const falloff = isDark ? 0 : cfg[`${prefix}_OPACITY_FALLOFF`] ?? (isOuter ? 0.0 : 0.8);
   const blendAmt = isDark ? 0 : cfg[`${prefix}_OUTLINE_BLEND`] ?? (isOuter ? 0.0 : 0.25);
   const rotOffset = cfg[`${prefix}_ROTATION_OFFSET`] ?? 180;

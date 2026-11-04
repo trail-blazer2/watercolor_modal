@@ -52,14 +52,16 @@
 
       [_face, _obj] = await Promise.all([
         make(FaceLandmarker, {
-          baseOptions: { modelAssetPath: FACE_MODEL },
+          baseOptions: { modelAssetPath: FACE_MODEL, delegate: "GPU" },
           runningMode: "IMAGE",
           numFaces: 8,
           minFaceDetectionConfidence: 0.52,
           minFacePresenceConfidence: 0.52,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: false,
         }),
-        make(ObjectDetector, {
-          baseOptions: { modelAssetPath: OBJ_MODEL },
+        ObjectDetector.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: OBJ_MODEL, delegate: "CPU" },
           runningMode: "IMAGE",
           scoreThreshold: 0.24,
           maxResults: 15,
@@ -141,6 +143,7 @@
       const ort = await loadScriptOnce(ORT_CDN);
       if (!ort) return null;
       ort.env.wasm.numThreads = 1;
+      ort.env.wasm.proxy = true;
       ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 
       const buf = await fetchCachedAnimalModelBuffer();

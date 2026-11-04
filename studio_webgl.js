@@ -376,131 +376,9 @@ function getOrBuildEdgeCurveCache() {
   const subData = subCtx.getImageData(0, 0, bw, bh).data;
   subC.width = 1; subC.height = 1;
 
-  const nFull = bw * bh;
-  const rawLumFull = new Float32Array(nFull);
-  const insideFull = new Float32Array(nFull);
-  const outerSilFull = new Float32Array(nFull);
-
-  for (let i = 0; i < nFull; i++) {
-    const p = i * 4;
-    const a = subData[p + 3];
-    insideFull[i] = a > 235 ? 1.0 : 0.0;
-    outerSilFull[i] = a < 245 ? 1.0 : 0.0;
-    rawLumFull[i] = 0.299 * subData[p] + 0.587 * subData[p + 1] + 0.114 * subData[p + 2];
-  }
-
-  const den1 = boxBlurFloat32(insideFull, bw, bh, 1);
-  const den2 = boxBlurFloat32(insideFull, bw, bh, 2);
-  const den4 = boxBlurFloat32(insideFull, bw, bh, 4);
-  const den6 = boxBlurFloat32(insideFull, bw, bh, 6);
-  const den10 = boxBlurFloat32(insideFull, bw, bh, 10);
-
-  // 1. Structure-Tensor Guided Pre-Smoothing of Fine Luminance:
-  //    Eliminates single-pixel JPEG stair-steps along diagonal lines (like the headlight border & panel seam)
-  //    BEFORE computing local contrast or uploading to the GPU!
-  const lumPre = normalizedBlurFloat32(rawLumFull, insideFull, bw, bh, 1, den1);
-  const jxx = new Float32Array(nFull);
-  const jyy = new Float32Array(nFull);
-  const jxy = new Float32Array(nFull);
-
-  for (let y = 1; y < bh - 1; y++) {
-    const row = y * bw;
-    for (let x = 1; x < bw - 1; x++) {
-      const i = row + x;
-      const gx = (lumPre[i + 1] - lumPre[i - 1]) * 0.5;
-      const gy = (lumPre[i + bw] - lumPre[i - bw]) * 0.5;
-      jxx[i] = gx * gx;
-      jyy[i] = gy * gy;
-      jxy[i] = gx * gy;
-    }
-  }
-  // Smooth the structure tensor over a 5px radius so the tangent direction is a silky-smooth curve!
-  boxBlurFloat32(boxBlurFloat32(jxx, bw, bh, 3), bw, bh, 2, jxx);
-  boxBlurFloat32(boxBlurFloat32(jyy, bw, bh, 3), bw, bh, 2, jyy);
-  boxBlurFloat32(boxBlurFloat32(jxy, bw, bh, 3), bw, bh, 2, jxy);
-
-  // Advect/smooth rawLumFull 5 steps ALONG the smooth structure-tensor tangent (with sub-pixel bilinear sampling)
-  // so diagonal lines are straightened and de-pixelated while keeping 100% cross-line sharpness!
-  const lumTangentSmooth = new Float32Array(nFull);
-  const sampleBilinear = (buf, fx, fy) => {
-    const x0 = Math.max(0, Math.min(bw - 1, fx | 0));
-    const y0 = Math.max(0, Math.min(bh - 1, fy | 0));
-    const x1 = Math.min(bw - 1, x0 + 1);
-    const y1 = Math.min(bh - 1, y0 + 1);
-    const dx = Math.max(0, fx - x0);
-    const dy = Math.max(0, fy - y0);
-    const r0 = y0 * bw, r1 = y1 * bw;
-    return (
-      buf[r0 + x0] * (1 - dx) * (1 - dy) +
-      buf[r0 + x1] * dx * (1 - dy) +
-      buf[r1 + x0] * (1 - dx) * dy +
-      buf[r1 + x1] * dx * dy
-    );
-  };
-
-  for (let y = 0; y < bh; y++) {
-    const row = y * bw;
-    for (let x = 0; x < bw; x++) {
-      const i = row + x;
-      if (insideFull[i] <= 0) {
-        lumTangentSmooth[i] = rawLumFull[i];
-        continue;
-      }
-      const theta = 0.5 * Math.atan2(2.0 * jxy[i], jxx[i] - jyy[i] + 1e-6);
-      // Tangent vector is perpendicular to the dominant gradient eigenvector
-      const tx = -Math.sin(theta);
-      const ty = Math.cos(theta);
-
-      let sum = lumPre[i] * 0.30;
-      sum += (sampleBilinear(lumPre, x + tx * 1.1, y + ty * 1.1) + sampleBilinear(lumPre, x - tx * 1.1, y - ty * 1.1)) * 0.22;
-      sum += (sampleBilinear(lumPre, x + tx * 2.3, y + ty * 2.3) + sampleBilinear(lumPre, x - tx * 2.3, y - ty * 2.3)) * 0.13;
-      lumTangentSmooth[i] = sum;
-    }
-  }
-  // Light 1px isotropic polish on lumTangentSmooth so B-spline control points have zero high-frequency aliasing
-  const lumFine   = normalizedBlurFloat32(lumTangentSmooth, insideFull, bw, bh, 1, den1);
-  const lumMed    = gaussianBlurNormalized3Pass(lumFine, insideFull, bw, bh, 4, den4, 4, den4, 2, den2);
-  const lumCoarse = gaussianBlurNormalized3Pass(lumFine, insideFull, bw, bh, 10, den10, 6, den6, 4, den4);
-  const lumLocal2 = normalizedBlurFloat32(lumFine, insideFull, bw, bh, 2, den2);
-  const lumLocal6 = normalizedBlurFloat32(lumFine, insideFull, bw, bh, 6, den6);
-  
-
-  // Combine tight 2px contrast (for thin grille slats & fine spokes) + 6px contrast (for panel seams)
-  const diffRaw = new Float32Array(nFull);
-  for (let i = 0; i < nFull; i++) {
-    if (insideFull[i] > 0) {
-      const d2 = lumFine[i] - lumLocal2[i];
-      const d6 = lumFine[i] - lumLocal6[i];
-      diffRaw[i] = d2 * 0.55 + d6 * 0.65;
-    }
-  }
-  const diffSmooth = normalizedBlurFloat32(diffRaw, insideFull, bw, bh, 1, den1);
-
-  let silDistFull = boxBlurFloat32(outerSilFull, bw, bh, 4);
-  silDistFull = boxBlurFloat32(silDistFull, bw, bh, 4);
-
-  const zonePyrFloat = new Float32Array(nFull * 4);
-  const zonePyrBRgba = new Uint8Array(nFull * 4);
-  const inv255 = 1.0 / 255.0;
-
-  for (let i = 0; i < nFull; i++) {
-    const p = i * 4;
-    const a = subData[p + 3];
-    const fade = a > 0 ? Math.max(0, Math.min(1, (0.42 - silDistFull[i]) / 0.34)) : 0.0;
-    const intW = a > 0 ? Math.max(0, Math.min(1, (0.16 - silDistFull[i]) / 0.12)) : 0.0;
-
-    zonePyrFloat[p]     = lumFine[i] * inv255;
-    zonePyrFloat[p + 1] = lumMed[i] * inv255;
-    zonePyrFloat[p + 2] = lumCoarse[i] * inv255;
-    zonePyrFloat[p + 3] = diffSmooth[i] * inv255;
-
-    zonePyrBRgba[p]     = Math.round(fade * 255);
-    zonePyrBRgba[p + 1] = Math.round(intW * 255);
-    zonePyrBRgba[p + 2] = 0;
-    zonePyrBRgba[p + 3] = 255;
-  }
-
-  // 2. Half-res grid for the 3 smooth Zone-Extrapolated Paint buffers
+  // Half-res grid (mw x mh) for ultra-fast ~35ms pyramid + zone paint build!
+  // The RGBA16F bicubic B-spline + 5x3 tangent shader in renderEdgeCurveWebGL
+  // upsamples and tangent-smooths this at full (bw x bh) resolution on the GPU!
   const mw = Math.max(4, bw >> 1);
   const mh = Math.max(4, bh >> 1);
   const smallC = createCanvas(mw, mh);
@@ -512,7 +390,9 @@ function getOrBuildEdgeCurveCache() {
   const rChan = new Float32Array(nHalf);
   const gChan = new Float32Array(nHalf);
   const bChan = new Float32Array(nHalf);
+  const rawLumHalf = new Float32Array(nHalf);
   const insideHalf = new Float32Array(nHalf);
+  const outerSilHalf = new Float32Array(nHalf);
   const darkWHalf = new Float32Array(nHalf);
   const midWHalf = new Float32Array(nHalf);
   const lightWHalf = new Float32Array(nHalf);
@@ -523,13 +403,61 @@ function getOrBuildEdgeCurveCache() {
     rChan[i] = r; gChan[i] = g; bChan[i] = b;
     const ins = a > 235 ? 1.0 : 0.0;
     insideHalf[i] = ins;
+    outerSilHalf[i] = a < 245 ? 1.0 : 0.0;
     const l = 0.299 * r + 0.587 * g + 0.114 * b;
+    rawLumHalf[i] = l;
+
     const dW = l < 72.0 ? Math.min(1.0, (72.0 - l) / 18.0) : 0.0;
     const lW = l > 162.0 ? Math.min(1.0, (l - 162.0) / 18.0) : 0.0;
     const mW = Math.max(0.05, 1.0 - dW - lW);
     darkWHalf[i]  = (dW + 0.02) * ins;
     lightWHalf[i] = (lW + 0.02) * ins;
     midWHalf[i]   = mW * ins;
+  }
+
+  const den1 = boxBlurFloat32(insideHalf, mw, mh, 1);
+  const den2 = boxBlurFloat32(insideHalf, mw, mh, 2);
+  const den3 = boxBlurFloat32(insideHalf, mw, mh, 3);
+  const den5 = boxBlurFloat32(insideHalf, mw, mh, 5);
+
+  const lumFine   = normalizedBlurFloat32(rawLumHalf, insideHalf, mw, mh, 1, den1);
+  const lumMed    = gaussianBlurNormalized3Pass(lumFine, insideHalf, mw, mh, 2, den2, 2, den2, 1, den1);
+  const lumCoarse = gaussianBlurNormalized3Pass(lumFine, insideHalf, mw, mh, 5, den5, 3, den3, 2, den2);
+  const lumLocal1 = normalizedBlurFloat32(lumFine, insideHalf, mw, mh, 1, den1);
+  const lumLocal3 = normalizedBlurFloat32(lumFine, insideHalf, mw, mh, 3, den3);
+
+  const diffRaw = new Float32Array(nHalf);
+  for (let i = 0; i < nHalf; i++) {
+    if (insideHalf[i] > 0) {
+      const d1 = lumFine[i] - lumLocal1[i];
+      const d3 = lumFine[i] - lumLocal3[i];
+      diffRaw[i] = d1 * 0.55 + d3 * 0.65;
+    }
+  }
+  const diffSmooth = normalizedBlurFloat32(diffRaw, insideHalf, mw, mh, 1, den1);
+
+  let silDistHalf = boxBlurFloat32(outerSilHalf, mw, mh, 2);
+  silDistHalf = boxBlurFloat32(silDistHalf, mw, mh, 2);
+
+  const zonePyrFloat = new Float32Array(nHalf * 4);
+  const zonePyrBRgba = new Uint8Array(nHalf * 4);
+  const inv255 = 1.0 / 255.0;
+
+  for (let i = 0; i < nHalf; i++) {
+    const p = i * 4;
+    const a = smData[p + 3];
+    const fade = a > 0 ? Math.max(0, Math.min(1, (0.42 - silDistHalf[i]) / 0.34)) : 0.0;
+    const intW = a > 0 ? Math.max(0, Math.min(1, (0.16 - silDistHalf[i]) / 0.12)) : 0.0;
+
+    zonePyrFloat[p]     = lumFine[i] * inv255;
+    zonePyrFloat[p + 1] = lumMed[i] * inv255;
+    zonePyrFloat[p + 2] = lumCoarse[i] * inv255;
+    zonePyrFloat[p + 3] = diffSmooth[i] * inv255;
+
+    zonePyrBRgba[p]     = Math.round(fade * 255);
+    zonePyrBRgba[p + 1] = Math.round(intW * 255);
+    zonePyrBRgba[p + 2] = 0;
+    zonePyrBRgba[p + 3] = 255;
   }
 
   const darkPaintRgba  = buildZoneExtrapolatedPaintRgba(rChan, gChan, bChan, darkWHalf,  insideHalf, mw, mh, 1, 3);
@@ -896,8 +824,8 @@ function renderEdgeCurveWebGL(cache, p) {
     ec.texDarkPaint  = createGLTexRGBA8(gl, mw, mh, cache.darkPaintRgba,  true, false);
     ec.texMidPaint   = createGLTexRGBA8(gl, mw, mh, cache.midPaintRgba,   true, false);
     ec.texLightPaint = createGLTexRGBA8(gl, mw, mh, cache.lightPaintRgba, true, false);
-    ec.texPyrA       = createGLTexRGBA16F(gl, bw, bh, cache.zonePyrFloat);
-    ec.texPyrB       = createGLTexRGBA8(gl, bw, bh, cache.zonePyrBRgba,   true, false);
+    ec.texPyrA       = createGLTexRGBA16F(gl, mw, mh, cache.zonePyrFloat);
+    ec.texPyrB       = createGLTexRGBA8(gl, mw, mh, cache.zonePyrBRgba,   true, false);
 
     const wcInfo = uploadRepeatImageTex(gl, STATE.brushImages && STATE.brushImages["watercolortexture.png"], ec.texOrig);
     ec.texWc = wcInfo.tex;
@@ -942,7 +870,7 @@ function renderEdgeCurveWebGL(cache, p) {
   gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, ec.texWc);
   gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, ec.texPaper);
 
-  gl.uniform2f(ec.uC_step, 1.0 / bw, 1.0 / bh);
+  gl.uniform2f(ec.uC_step, 1.0 / mw, 1.0 / mh);
   gl.uniform2f(ec.uC_wcScale, bw / Math.max(1.0, ec.wcW * 0.78), bh / Math.max(1.0, ec.wcH * 0.78));
   gl.uniform2f(ec.uC_paperScale, bw / Math.max(1.0, ec.paperW * 0.85), bh / Math.max(1.0, ec.paperH * 0.85));
   gl.uniform1f(ec.uC_detail, detailNorm);
@@ -958,8 +886,19 @@ function renderEdgeCurveWebGL(cache, p) {
 // across the subject (like the white/colored droplets on the Skoda, Red Audi & Two Dogs!)
 function getOrBuildSubjectSplatterStrokes(cache) {
   if (cache.splatterData) return cache.splatterData;
+  if (
+    STATE._sharedSplatterData &&
+    STATE._sharedSplatterData.bw === cache.bw &&
+    STATE._sharedSplatterData.bh === cache.bh
+  ) {
+    cache.splatterData = STATE._sharedSplatterData;
+    return cache.splatterData;
+  }
+
   const { bw, bh, subData } = cache;
-  const rng = new PythonRandom(((STATE.payload && STATE.payload.preset_settings && STATE.payload.preset_settings.RANDOM_SEED) || 42) + 919);
+  const rng = new PythonRandom(
+    ((STATE.payload && STATE.payload.preset_settings && STATE.payload.preset_settings.RANDOM_SEED) || 42) + 919
+  );
 
   const whiteDrops = [];
   const darkDrops = [];
@@ -973,50 +912,56 @@ function getOrBuildSubjectSplatterStrokes(cache) {
     return [subData[p], subData[p + 1], subData[p + 2]];
   };
 
-  // 1. Interior Watercolor Bloom Washes (soft color-matched blotches like on the Red Audi & Dogs)
+  // Fixed-consumption RNG loop so silhouette differences never shift subsequent droplet coordinates
   const numWashes = 42;
   for (let i = 0; i < numWashes * 2 && colorWashes.length < numWashes; i++) {
     const x = rng.uniform(bw * 0.06, bw * 0.94);
     const y = rng.uniform(bh * 0.06, bh * 0.94);
+    const szFrac = rng.uniform(0.16, 0.36);
+    const rot = rng.uniform(0, 360);
+    const op = rng.uniform(0.16, 0.30);
     const col = sampleSubjectColor(x, y);
     if (!col) continue;
-    // Boost saturation & slightly shift brightness so the wash reads like a wet watercolor glaze
     const lum = 0.299 * col[0] + 0.587 * col[1] + 0.114 * col[2];
     const satMult = 1.35;
     const brMult = i % 2 === 0 ? 1.16 : 0.82;
     const rgb = col.map((c) => Math.max(0, Math.min(255, Math.round((lum + (c - lum) * satMult) * brMult))));
-    const sz = Math.round(Math.min(bw, bh) * rng.uniform(0.16, 0.36));
-    colorWashes.push({ x, y, size: sz, rot: rng.uniform(0, 360), rgb, op: rng.uniform(0.16, 0.30) });
+    const sz = Math.round(Math.min(bw, bh) * szFrac);
+    colorWashes.push({ x, y, size: sz, rot, rgb, op });
   }
 
-  // 2. Crisp White & Tinted Micro-Droplets (whitedots.png — like the white paint specks on the Skoda & Red Audi)
   const numWhite = 28;
   for (let i = 0; i < numWhite * 2 && whiteDrops.length < numWhite; i++) {
     const x = rng.uniform(bw * 0.05, bw * 0.95);
     const y = rng.uniform(bh * 0.05, bh * 0.95);
+    const szFrac = rng.uniform(0.12, 0.32);
+    const rot = rng.uniform(0, 360);
+    const op = rng.uniform(0.38, 0.72);
     const col = sampleSubjectColor(x, y);
     if (!col) continue;
-    // 65% pure white/cream droplets, 35% light-tinted subject pigment droplets
     const rgb = i % 3 === 0
       ? col.map((c) => Math.min(255, Math.round(c + (255 - c) * 0.62)))
       : [252, 250, 246];
-    const sz = Math.round(Math.min(bw, bh) * rng.uniform(0.12, 0.32));
-    whiteDrops.push({ x, y, size: sz, rot: rng.uniform(0, 360), rgb, op: rng.uniform(0.38, 0.72) });
+    const sz = Math.round(Math.min(bw, bh) * szFrac);
+    whiteDrops.push({ x, y, size: sz, rot, rgb, op });
   }
 
-  // 3. Dark / Deep-Pigment Splatter Specks (darkdots.png — like the dark watercolor specks on the Skoda & Dogs)
   const numDark = 18;
   for (let i = 0; i < numDark * 2 && darkDrops.length < numDark; i++) {
     const x = rng.uniform(bw * 0.05, bw * 0.95);
     const y = rng.uniform(bh * 0.05, bh * 0.95);
+    const szFrac = rng.uniform(0.18, 0.42);
+    const rot = rng.uniform(0, 360);
+    const op = rng.uniform(0.22, 0.45);
     const col = sampleSubjectColor(x, y);
     if (!col) continue;
     const rgb = col.map((c) => Math.round(c * 0.32));
-    const sz = Math.round(Math.min(bw, bh) * rng.uniform(0.18, 0.42));
-    darkDrops.push({ x, y, size: sz, rot: rng.uniform(0, 360), rgb, op: rng.uniform(0.22, 0.45) });
+    const sz = Math.round(Math.min(bw, bh) * szFrac);
+    darkDrops.push({ x, y, size: sz, rot, rgb, op });
   }
 
-  cache.splatterData = { colorWashes, whiteDrops, darkDrops };
+  cache.splatterData = { bw, bh, colorWashes, whiteDrops, darkDrops };
+  STATE._sharedSplatterData = cache.splatterData;
   return cache.splatterData;
 }
 
@@ -1026,14 +971,34 @@ function rerenderLiveEdgeCurveLayer(skipComposite = false) {
   const cache = getOrBuildEdgeCurveCache();
   if (!cache) return;
 
-  const [cw, ch] = STATE.payload.canvas_size;
   const p = lyr.params;
 
   const glCanvas = renderEdgeCurveWebGL(cache, p);
   if (glCanvas) {
+    if (!lyr.baseCanvas || lyr.baseCanvas.width !== cache.bw || lyr.baseCanvas.height !== cache.bh) {
+      if (lyr.baseCanvas) {
+        lyr.baseCanvas.width = 1;
+        lyr.baseCanvas.height = 1;
+      }
+      lyr.baseCanvas = createCanvas(cache.bw, cache.bh);
+    }
+    lyr.baseCanvas._ox = cache.bx;
+    lyr.baseCanvas._oy = cache.by;
+
     const ctx = lyr.baseCanvas.getContext("2d");
-    ctx.clearRect(0, 0, cw, ch);
-    ctx.drawImage(glCanvas, cache.bx, cache.by);
+    ctx.clearRect(0, 0, cache.bw, cache.bh);
+    ctx.drawImage(glCanvas, 0, 0);
+
+    // Apply active White Balance & HDR Shadow Recovery to the Edge Curve layer on GPU (~0.8ms)!
+    if ((STATE.whiteBalanceEnabled || STATE.hdrShadowsEnabled) && window.InstantWhiteBalance && window.InstantWhiteBalance.applyToSubRect) {
+      const wbStr = STATE.whiteBalanceEnabled ? ((STATE.whiteBalanceStrength ?? 80) / 100.0) : 0.0;
+      const hdrStr = STATE.hdrShadowsEnabled ? ((STATE.hdrShadowsStrength ?? 55) / 100.0) : 0.0;
+      const lumBlur = STATE._wbBaseSaved ? STATE._wbBaseSaved.lumBlurCrop : null;
+      window.InstantWhiteBalance.applyToSubRect(
+        lyr.baseCanvas, 0, 0, cache.bw, cache.bh,
+        lumBlur, wbStr, hdrStr, STATE._wbProtectBlue ?? 0.0, STATE._wbGain || [1.0, 1.0, 1.0]
+      );
+    }
 
     const splatData = getOrBuildSubjectSplatterStrokes(cache);
     const bloomOn = p.wcBlooms !== undefined ? !!p.wcBlooms : true;
@@ -1050,7 +1015,7 @@ function rerenderLiveEdgeCurveLayer(skipComposite = false) {
         const wC = drawStrokesWebGL(cache.bw, cache.bh, "brush2.png", STATE.brushImages["brush2.png"], splatData.colorWashes);
         if (wC) {
           ctx.globalAlpha = Math.min(1.0, bloomMult * 0.85);
-          ctx.drawImage(wC, cache.bx, cache.by);
+          ctx.drawImage(wC, 0, 0);
         }
       }
 
@@ -1059,14 +1024,14 @@ function rerenderLiveEdgeCurveLayer(skipComposite = false) {
           const dC = drawStrokesWebGL(cache.bw, cache.bh, "darkdots.png", STATE.brushImages["darkdots.png"], splatData.darkDrops);
           if (dC) {
             ctx.globalAlpha = Math.min(1.0, splatMult * 0.90);
-            ctx.drawImage(dC, cache.bx, cache.by);
+            ctx.drawImage(dC, 0, 0);
           }
         }
         if (STATE.brushImages["whitedots.png"]) {
           const whC = drawStrokesWebGL(cache.bw, cache.bh, "whitedots.png", STATE.brushImages["whitedots.png"], splatData.whiteDrops);
           if (whC) {
             ctx.globalAlpha = Math.min(1.0, splatMult);
-            ctx.drawImage(whC, cache.bx, cache.by);
+            ctx.drawImage(whC, 0, 0);
           }
         }
       }

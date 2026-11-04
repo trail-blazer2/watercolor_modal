@@ -113,8 +113,10 @@ function bindUIEvents() {
     resetLayerToOriginal(STATE.selectedLayerId);
   });
 
-  document.getElementById("exportPngBtn").addEventListener("click", () => exportImage("png"));
-  document.getElementById("exportJpgBtn").addEventListener("click", () => exportImage("jpeg"));
+  const expPngBtn = document.getElementById("exportPngBtn");
+  if (expPngBtn) expPngBtn.addEventListener("click", () => exportImage("png"));
+  document.getElementById("exportJpgBtn").addEventListener("click", () => openExportMenuModal());
+  bindExportModalEvents();
 
   document.querySelectorAll("[data-mobile-panel]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -398,6 +400,10 @@ function renderSlidersForLayer(lyr) {
       p.detailPop = val;
       scheduleOilRerender();
     });
+    addSlider(container, "Highlight Darken (Moody Depth)", p.highlightDarken ?? 100, 0, 100, "%", (val) => {
+      p.highlightDarken = val;
+      scheduleOilRerender();
+    });
   }
 
   if (def.id === "edge_curve") {
@@ -543,7 +549,7 @@ function renderSlidersForLayer(lyr) {
 
 function addSubjectOverlayAndWindowControls(container, def, p) {
 
-  // 1. Smart Neutral / Sky-Cast White Balance Toggle + Slider (Affects Subject + ALL Brush Layers!)
+  // 1. Smart Neutral / Sky-Cast White Balance Toggle + Slider (Instant < 4ms GPU update + Undo/Redo!)
   const wbRow = document.createElement("div");
   wbRow.className = "control-row";
   const wbLbl = document.createElement("label");
@@ -557,6 +563,7 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
   const syncWbBtn = () => {
     const isOn = !!STATE.whiteBalanceEnabled;
     p.whiteBalanceEnabled = isOn;
+    p.whiteBalanceStrength = STATE.whiteBalanceStrength ?? 80;
     wbBtn.className = isOn ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
     wbBtn.textContent = isOn
       ? "⚖️ Neutralize White/Grey/Black: ON"
@@ -565,29 +572,73 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
   };
   syncWbBtn();
 
-  let _wbDebounce = 0;
-  const triggerLiveWhiteBalanceUpdate = () => {
-    if (window.InstantWhiteBalance && typeof window.InstantWhiteBalance.applyLive === "function") {
-      window.InstantWhiteBalance.applyLive();
-    }
+  let _wbRaf = 0;
+  const triggerLiveToneAndWBUpdate = () => {
+    if (_wbRaf) return;
+    _wbRaf = requestAnimationFrame(() => {
+      _wbRaf = 0;
+      if (window.InstantWhiteBalance && typeof window.InstantWhiteBalance.applyLive === "function") {
+        window.InstantWhiteBalance.applyLive();
+      }
+    });
   };
 
   wbBtn.addEventListener("click", () => {
     History.paramBegin();
     STATE.whiteBalanceEnabled = !STATE.whiteBalanceEnabled;
     syncWbBtn();
+    triggerLiveToneAndWBUpdate();
     History.paramCommit();
-    triggerLiveWhiteBalanceUpdate();
   });
   wbRow.appendChild(wbBtn);
 
-  addSlider(wbSub, "Neutralize Cast Strength", STATE.whiteBalanceStrength ?? 25, 10, 100, "%", (val) => {
+  addSlider(wbSub, "Neutralize Cast Strength", STATE.whiteBalanceStrength ?? 80, 10, 100, "%", (val) => {
     STATE.whiteBalanceStrength = val;
     p.whiteBalanceStrength = val;
-    triggerLiveWhiteBalanceUpdate();
+    triggerLiveToneAndWBUpdate();
   });
   wbRow.appendChild(wbSub);
   container.appendChild(wbRow);
+
+  // 1B. Photoshop-Style Shadow Recovery (HDR Shadow Lift) — OFF by default!
+  const hdrRow = document.createElement("div");
+  hdrRow.className = "control-row";
+  const hdrLbl = document.createElement("label");
+  hdrLbl.innerHTML = `<span>HDR Shadow Recovery (Reveal Dark Details)</span>`;
+  hdrRow.appendChild(hdrLbl);
+
+  const hdrBtn = document.createElement("button");
+  const hdrSub = document.createElement("div");
+  hdrSub.style.marginTop = "8px";
+
+  const syncHdrBtn = () => {
+    const isOn = !!STATE.hdrShadowsEnabled;
+    p.hdrShadowsEnabled = isOn;
+    p.hdrShadowsStrength = STATE.hdrShadowsStrength ?? 55;
+    hdrBtn.className = isOn ? "btn btn-sm btn-primary full-width" : "btn btn-sm btn-outline full-width";
+    hdrBtn.textContent = isOn
+      ? "☀️ Shadow Recovery (HDR Lift): ON"
+      : "☀️ Shadow Recovery (HDR Lift): OFF";
+    hdrSub.classList.toggle("hidden", !isOn);
+  };
+  syncHdrBtn();
+
+  hdrBtn.addEventListener("click", () => {
+    History.paramBegin();
+    STATE.hdrShadowsEnabled = !STATE.hdrShadowsEnabled;
+    syncHdrBtn();
+    triggerLiveToneAndWBUpdate();
+    History.paramCommit();
+  });
+  hdrRow.appendChild(hdrBtn);
+
+  addSlider(hdrSub, "Shadow Lift Strength", STATE.hdrShadowsStrength ?? 55, 5, 100, "%", (val) => {
+    STATE.hdrShadowsStrength = val;
+    p.hdrShadowsStrength = val;
+    triggerLiveToneAndWBUpdate();
+  });
+  hdrRow.appendChild(hdrSub);
+  container.appendChild(hdrRow);
 
   // 2. Eye-Edge White Highlight Brush Toggle + Opacity Slider (Animals & People)
   if (!isCarPresetActive() && STATE.layers && STATE.layers.eye_highlight) {
@@ -741,11 +792,14 @@ function addSubjectOverlayAndWindowControls(container, def, p) {
 
     wheelBtn.addEventListener("click", async () => {
       wheelBtn.disabled = true;
+      History.paramBegin();
       const nextState = !(STATE.wheelTurnEnabled !== false);
+      p.wheelTurned = nextState;
       try {
         await window.toggleSteeredWheelInStudio(nextState);
         syncWheelBtn();
       } finally {
+        History.paramCommit();
         wheelBtn.disabled = false;
       }
     });
@@ -1537,18 +1591,174 @@ function updateCursorPreview() {
   brushCursor.style.height = `${Math.max(4, size)}px`;
 }
 
-function exportImage(fmt = "jpeg") {
+function formatByteSize(bytes) {
+  if (bytes >= 1024 * 1024) {
+    return `~${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `~${Math.max(50, Math.round(bytes / 1024))} KB`;
+}
+
+function bindExportModalEvents() {
+  const modal = document.getElementById("exportModal");
+  if (!modal || modal.dataset.bound) return;
+  modal.dataset.bound = "1";
+
+  const closeBtn = document.getElementById("closeExportModalBtn");
+  const cancelBtn = document.getElementById("cancelExportBtn");
+  const confirmBtn = document.getElementById("confirmDownloadJpgBtn");
+  const fullCard = document.getElementById("expOptFullCard");
+  const prevCard = document.getElementById("expOptPreviewCard");
+  const radios = modal.querySelectorAll('input[name="exportQualityRadio"]');
+
+  const syncCardSelection = () => {
+    const checkedVal = modal.querySelector('input[name="exportQualityRadio"]:checked')?.value || "full_200ppi";
+    if (fullCard) {
+      fullCard.style.border = checkedVal === "full_200ppi" ? "2px solid var(--gold)" : "1px solid var(--line-strong)";
+      fullCard.style.background = checkedVal === "full_200ppi" ? "var(--gold-soft)" : "var(--panel)";
+    }
+    if (prevCard) {
+      prevCard.style.border = checkedVal === "preview_120ppi" ? "2px solid var(--gold)" : "1px solid var(--line-strong)";
+      prevCard.style.background = checkedVal === "preview_120ppi" ? "var(--gold-soft)" : "var(--panel)";
+    }
+  };
+
+  radios.forEach((r) => r.addEventListener("change", syncCardSelection));
+
+  const closeModal = () => modal.classList.add("hidden");
+  if (closeBtn) closeBtn.addEventListener("click", closeModal);
+  if (cancelBtn) cancelBtn.addEventListener("click", closeModal);
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) closeModal();
+  });
+
+  if (confirmBtn) {
+    confirmBtn.addEventListener("click", async () => {
+      const choice = modal.querySelector('input[name="exportQualityRadio"]:checked')?.value || "full_200ppi";
+      confirmBtn.disabled = true;
+      const origTxt = confirmBtn.textContent;
+      confirmBtn.textContent = "⏳ Rendering Print JPG...";
+      try {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        if (choice === "full_200ppi") {
+          await exportHighResPrintJpg(1.85, 0.94);
+        } else {
+          await exportHighResPrintJpg(1.0, 0.88);
+        }
+        closeModal();
+      } finally {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = origTxt;
+      }
+    });
+  }
+}
+
+function openExportMenuModal() {
   if (!STATE.payload) return;
   cancelPendingSchedules();
   invalidateStack();
   if (STATE.activeTool === "mask") setActiveTool("pan");
   compositeAllLayers();
-  const mime = fmt === "png" ? "image/png" : "image/jpeg";
-  const ext = fmt === "png" ? "png" : "jpg";
-  const dataUrl = displayCanvas.toDataURL(mime, 0.96);
+
+  const modal = document.getElementById("exportModal");
+  if (!modal) {
+    exportImage("jpeg");
+    return;
+  }
+
+  const w = displayCanvas.width;
+  const h = displayCanvas.height;
+  const fullScale = 1.85; // ~200 PPI print resolution (e.g. 3296 x 2330 px)
+  const fullW = Math.round(w * fullScale);
+  const fullH = Math.round(h * fullScale);
+
+  const fullDimEl = document.getElementById("expFullDimLabel");
+  const prevDimEl = document.getElementById("expPreviewDimLabel");
+  if (fullDimEl) fullDimEl.textContent = `${fullW} × ${fullH} px · ~200 PPI Print Quality (High-Res Subject & Brushes)`;
+  if (prevDimEl) prevDimEl.textContent = `${w} × ${h} px · ~120 PPI Standard Quality (Fast Share)`;
+
+  // Measure actual JPEG entropy of current displayCanvas to give an accurate file-size estimate!
+  try {
+    const sampleDataUrl = displayCanvas.toDataURL("image/jpeg", 0.88);
+    const previewBytes = Math.round((sampleDataUrl.length - 23) * 0.75);
+    // 1.85x scale at q=0.94 is ~3.6x the byte size of 1.0x at q=0.88
+    const fullBytes = Math.round(previewBytes * 3.65);
+
+    const fullEstEl = document.getElementById("expFullSizeEst");
+    const prevEstEl = document.getElementById("expPreviewSizeEst");
+    if (fullEstEl) fullEstEl.textContent = formatByteSize(fullBytes);
+    if (prevEstEl) prevEstEl.textContent = formatByteSize(previewBytes);
+  } catch (_) {}
+
+  modal.classList.remove("hidden");
+}
+
+async function exportHighResPrintJpg(scaleMult = 1.85, jpegQuality = 0.94) {
+  if (!STATE.payload) return;
+  cancelPendingSchedules();
+  invalidateStack();
+  if (STATE.activeTool === "mask") setActiveTool("pan");
+  compositeAllLayers();
+
+  let dataUrl;
+  if (scaleMult <= 1.01) {
+    dataUrl = displayCanvas.toDataURL("image/jpeg", jpegQuality);
+  } else {
+    const w = displayCanvas.width;
+    const h = displayCanvas.height;
+    const outW = Math.round(w * scaleMult);
+    const outH = Math.round(h * scaleMult);
+
+    // Create temporary high-res print canvas ONLY during export, then free it immediately!
+    const hiCanvas = createCanvas(outW, outH);
+    const hiCtx = hiCanvas.getContext("2d");
+    hiCtx.imageSmoothingEnabled = true;
+    hiCtx.imageSmoothingQuality = "high";
+    hiCtx.drawImage(displayCanvas, 0, 0, outW, outH);
+
+    // Overlay native high-resolution paper grain at 1:1 print texels so the 200 PPI print has crisp paper tooth!
+    const paperTile = STATE.brushImages && STATE.brushImages["papertexture.png"];
+    const cfg = STATE.payload.preset_settings || {};
+    if (paperTile && !cfg.DARK_BACKGROUND_ENABLED && STATE.layers.bg_paper && STATE.layers.bg_paper.vis) {
+      const tw = paperTile.naturalWidth || paperTile.width || 512;
+      const th = paperTile.naturalHeight || paperTile.height || 512;
+      hiCtx.save();
+      hiCtx.globalCompositeOperation = "multiply";
+      hiCtx.globalAlpha = 0.14 * (STATE.layers.bg_paper.params.opacity ?? 1.0);
+      for (let y = 0; y < outH; y += th) {
+        for (let x = 0; x < outW; x += tw) {
+          hiCtx.drawImage(paperTile, x, y);
+        }
+      }
+      hiCtx.restore();
+    }
+
+    dataUrl = hiCanvas.toDataURL("image/jpeg", jpegQuality);
+    hiCanvas.width = 1;
+    hiCanvas.height = 1;
+  }
+
   const a = document.createElement("a");
   a.href = dataUrl;
-  a.download = `watercolor_${STATE.payload.preset_key}_${Date.now()}.${ext}`;
+  const tag = scaleMult > 1.01 ? "print_200ppi" : "preview_120ppi";
+  a.download = `watercolor_${STATE.payload.preset_key}_${tag}_${Date.now()}.jpg`;
+  a.click();
+}
+
+function exportImage(fmt = "jpeg") {
+  if (fmt === "jpeg") {
+    openExportMenuModal();
+    return;
+  }
+  if (!STATE.payload) return;
+  cancelPendingSchedules();
+  invalidateStack();
+  if (STATE.activeTool === "mask") setActiveTool("pan");
+  compositeAllLayers();
+  const dataUrl = displayCanvas.toDataURL("image/png");
+  const a = document.createElement("a");
+  a.href = dataUrl;
+  a.download = `watercolor_${STATE.payload.preset_key}_${Date.now()}.png`;
   a.click();
 }
 
