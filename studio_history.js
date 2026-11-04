@@ -207,9 +207,44 @@ let transformGesture = null;
 
   function applyParamEffects(layerId, keys) {
     const has = (...names) => keys.some((k) => names.includes(k));
-    if (has("brushFile", "spacing", "size", "jiggle")) rerenderProceduralLayer(layerId, true);
-    if (layerId === "oil_paint" && has("thickness", "detailPop")) rerenderLiveOilLayer(true);
-    if (layerId === "edge_curve" && has("maskDetail", "edgeThickness")) rerenderLiveEdgeCurveLayer(true);
+    const lyr = STATE.layers[layerId];
+
+    if (has("brushFile", "spacing", "size", "jiggle")) {
+      if (layerId === "glow") rerenderLiveGlowLayer(true);
+      else if (layerId === "eye_highlight" && typeof rerenderEyeHighlightLayer === "function") rerenderEyeHighlightLayer(true);
+      else rerenderProceduralLayer(layerId, true);
+    }
+    if (layerId === "glow" && has("colorMode", "glowColor", "size")) {
+      rerenderLiveGlowLayer(true);
+    }
+    if (layerId === "oil_paint" && has("thickness", "detailPop", "highlightDarken")) {
+      rerenderLiveOilLayer(true);
+    }
+    if (layerId === "edge_curve" && has("maskDetail", "edgeThickness", "wcBlooms", "wcBloomsIntensity", "paintSplatter", "splatterIntensity", "paperGrain", "paperGrainIntensity")) {
+      rerenderLiveEdgeCurveLayer(true);
+    }
+    if (layerId === "cool_brush" && has("sizeTrim", "dxTrim", "gapTrim", "angTrim", "facingOverride") && typeof rerenderCoolSwooshLayer === "function") {
+      rerenderCoolSwooshLayer(true);
+    }
+    if (layerId === "subject" && lyr) {
+      if (has("whiteBalanceEnabled", "whiteBalanceStrength", "hdrShadowsEnabled", "hdrShadowsStrength")) {
+        STATE.whiteBalanceEnabled = !!lyr.params.whiteBalanceEnabled;
+        STATE.whiteBalanceStrength = lyr.params.whiteBalanceStrength ?? 80;
+        STATE.hdrShadowsEnabled = !!lyr.params.hdrShadowsEnabled;
+        STATE.hdrShadowsStrength = lyr.params.hdrShadowsStrength ?? 55;
+        if (window.InstantWhiteBalance && typeof window.InstantWhiteBalance.applyLive === "function") {
+          window.InstantWhiteBalance.applyLive(true);
+        }
+      }
+      if (has("wheelTurned") && typeof applyWheelPatchToSubjectLayers === "function") {
+        applyWheelPatchToSubjectLayers(!!lyr.params.wheelTurned, true);
+      }
+      if (has("wcTexture") && STATE.layers.edge_curve && STATE.layers.edge_curve.vis) {
+        rerenderLiveEdgeCurveLayer(true);
+      }
+    }
+    if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+    invalidateStack();
   }
 
   function swapEntry(e) {
@@ -230,28 +265,34 @@ let transformGesture = null;
         t.cv = current;
         if (e.key === "mask") syncMaskOverlayRect(t.x, t.y, t.w, t.h);
       }
-      return true;
-    }
-
-    if (e.type === "preset") {
-      const sel = document.getElementById("presetSelect");
-      const currentPreset = (STATE.payload && STATE.payload.preset_key) || (sel ? sel.value : "animals");
-      const targetPreset = e.presetKey;
-      e.presetKey = currentPreset;
-      if (sel) sel.value = targetPreset;
-      runModalGeneration(false, true, true);
+      if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+      invalidateStack();
       return true;
     }
 
     if (e.type === "subject_transform") {
-      const current = { ...STATE.subjectTransform };
+      if (!STATE.subjectTransform) return false;
+      const cur = { ...STATE.subjectTransform };
       STATE.subjectTransform = { ...e.snap };
-      e.snap = current;
+      e.snap = cur;
       if (typeof syncMoveSubjectUI === "function") syncMoveSubjectUI();
-      if (typeof scheduleSubjectMoveUpdate === "function") scheduleSubjectMoveUpdate();
+      if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
+      invalidateStack();
+      compositeAllLayers();
       return true;
     }
-    
+
+    if (e.type === "preset") {
+      const presetSelect = document.getElementById("presetSelect");
+      if (!presetSelect || !STATE.payload) return false;
+      const curPreset = STATE.payload.preset_key || presetSelect.value;
+      const targetPreset = e.presetKey;
+      e.presetKey = curPreset;
+      presetSelect.value = targetPreset;
+      runModalGeneration(Boolean(STATE.maskEditedByUser), true, true);
+      return true;
+    }
+
     const lyr = STATE.layers[e.layerId];
     if (!lyr) return false;
 
@@ -267,6 +308,8 @@ let transformGesture = null;
       const current = lyr.vis;
       lyr.vis = e.value;
       e.value = current;
+      if (lyr.vis) ensureLayerCanvasRendered(lyr);
+      if (typeof invalidateMoveFastStack === "function") invalidateMoveFastStack();
       invalidateStack();
       return true;
     }
@@ -284,6 +327,7 @@ let transformGesture = null;
     }
     return false;
   }
+
 
   function showResult(e) {
     if (e.type === "preset" || e.type === "subject_transform") return;
